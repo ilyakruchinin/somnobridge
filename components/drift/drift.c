@@ -43,6 +43,15 @@ esp_err_t drift_time_begin(uint32_t request_id, uint64_t t1_utc_us,
                            uint32_t source_epoch, int64_t m2_us)
 {
     if (!request_id) return ESP_ERR_INVALID_ARG;
+    /* §10.4 caches pending exchanges for ≤5 s. Expire them first, or a
+     * peer that reuses a request_id after that window is refused
+     * forever with INVALID_STATE (the entry only frees when all five
+     * slots fill and the oldest is evicted).                          */
+    for (int i = 0; i < 5; i++) {
+        if (s_pend[i].used && m2_us > s_pend[i].deadline_us) {
+            s_pend[i].used = false;
+        }
+    }
     if (pend_find(request_id)) return ESP_ERR_INVALID_STATE;
     drift_pending_t *p = NULL;
     int64_t oldest = INT64_MAX;

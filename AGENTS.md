@@ -69,6 +69,29 @@ NOT trust it to tell you whether the firmware works:
   writing `ev->passkey.params.numcmp` is a no-op and the proc then stalls to
   the 30 s SMP timeout.
 
+## Querying a live device (`scripts/ble_query.py`)
+
+Host-side diagnostic for a bonded SomnoPal (needs `python3-dbus` +
+`python3-gi`; the device must be bonded already):
+
+```bash
+./scripts/ble_query.py                      # status + catalog + days + drift
+./scripts/ble_query.py --status --catalog
+./scripts/ble_query.py --days 14 --day 20240103
+./scripts/ble_query.py --ls 'A:\'           # live card listing
+./scripts/ble_query.py --drift-auto         # newest day's last file
+./scripts/ble_query.py --time-sync 5        # run+commit a §8.1 anchor
+./scripts/ble_query.py --evidence           # replay the evidence journal
+./scripts/ble_query.py --json               # raw JSON
+```
+
+It speaks the §10.1 framing over the D-Bus GATT API and reassembles
+fragments itself. `--time-sync` performs N request/reply exchanges and
+commits the lowest-RTT one (device ack shows `accepted`/`reason`/anchors),
+which is the fastest way to confirm the drift machinery end to end.
+Measured RTT includes host D-Bus/Python overhead, so treat it as an
+upper bound — on-device processing shows up separately.
+
 ## Host tests
 
 Pure-logic modules compile with plain `cc` against stub ESP headers:

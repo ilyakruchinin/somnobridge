@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+# SomnoPal — host-side BLE query tool (status / catalog / drift / time sync)
+# Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
+# GPLv3+ — see LICENSE and NOTICE.
+#
+# Talks to a bonded SomnoPal over BlueZ's D-Bus API.
+#
+# Why D-Bus and not bluetoothctl: this bluez build's CLI `write` command
+# returns org.bluez.Error.NotSupported for every variant and never reaches
+# the device.  org.bluez.GattCharacteristic1.WriteValue works — it is what
+# SomnoTrace uses.
+#
+# Examples:
+#   ./scripts/ble_query.py                       # status+catalog+days+drift
+#   ./scripts/ble_query.py --time-sync 5         # run+commit a §8.1 anchor
+#   ./scripts/ble_query.py --days 14 --day 20240103
+#   ./scripts/ble_query.py --drift 'A:\DATALOG\20240103' 20240103_231500_CSL.edf
+#   ./scripts/ble_query.py --evidence            # replay the evidence journal
+#   ./scripts/ble_query.py --json                # raw JSON instead of tables
+
+import argparse
+import json
+import struct
+import sys
+import time
+
+import dbus
+import dbus.mainloop.glib
+from gi.repository import GLib
+
+SVC_UUID = "8ba7d100-6e4b-4bb4-9f1d-7306766e6f50"
+CTRL_UUID = "8ba7d101-6e4b-4bb4-9f1d-7306766e6f50"
+DATA_UUID = "8ba7d102-6e4b-4bb4-9f1d-7306766e6f50"
+
+# blep_kind_t (components/ble_api/include/ble_proto.h)
+K_JSON_REQ, K_JSON_RESP, K_FILE_BYTES, K_ACK, K_ABORT, \
+    K_TIME_REQ, K_TIME_REPLY, K_TIME_COMMIT, K_EV_BYTES = range(1, 10)
+
+FLAG_START, FLAG_END = 0x0001, 0x0002
+HDR = struct.Struct("<BBHIQ")           # 16-byte packed LE header
+HDR_LEN = HDR.size
+
+DEFAULT_ADDR = "8C:FD:49:93:74:76"
+TIMESTAMP_ALLOWANCE_US = 5000           # §8.1 provisional 5 ms
+RTT_MAX_US = 250000
+SRC_UNC_MAX_US = 100000
+
+
+def frame(kind, rid, offset, flags, payload=b""):
+    return HDR.pack(1, kind, flags, rid, offset) + payload
+
+
+class SomnoPal:
+    """Minimal BlueZ GATT client for the SomnoPal vendor service."""
+
+    def __init__(self, address, verbose=False):
+        self.addr = address.upper()
+        self.verbose = verbose
+        self.bus = dbus.SystemBus()
+        self.dev_path = None
+        self.ctrl_path = self.data_path = None
+        self._ctrl = self._data = None
+        self._rx = {}                   # rid -> bytearray (JSON reassembly)
+        self._done = {}                 # rid -> decoded JSON string
+        self._time_reply = {}           # rid -> raw TIME_REPLY payload
+        self._stream = bytearray()      # evidence/file bytes
+        self._stream_end = None         # STREAM_END JSON
+        self._stream_rid = None
+        self._stream_bytes = 0
+        self._stream_open = False
+        self._ack_pending = False
+        # rotate the request_id base per run so a retry never collides
+        # with a still-cached exchange from a previous invocation
+        self._rid = int(time.time()) & 0xFFFFF0
+
+    # ---------- plumbing ----------
+
+    def log(self, *a):
+        if self.verbose:
+            print("[ble]", *a, file=sys.stderr)
+
+    def _pump(self, seconds):
+        """Dispatch queued D-Bus signals for up to `seconds`."""
+        ctx = GLib.MainContext.default()
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            while ctx.pending():
+                ctx.iteration(False)
+            time.sleep(0.002)
+
+    def _managed(self):
+        om = dbus.Interface(self.bus.get_object("org.bluez", "/"),
+                            "org.freedesktop.DBus.ObjectManager")
+        return om.GetManagedObjects()
+
+    def _props(self, path):
+        return dbus.Interface(self.bus.get_object("org.bluez", path),
+                              "org.freedesktop.DBus.Properties")
+
+    def _get(self, path, iface, name, default=None):
+        try:
+            return self._props(path).Get(iface, name)
+        except dbus.exceptions.DBusException:
+            return default
+
+    def _find(self, objects, iface, uuid):
+        for path, ifaces in objects.items():
+            if iface in ifaces and \
+               str(ifaces[iface].get("UUID", "")).lower() == uuid:
+                return path
+        return None
+
+    # ---------- connect / subscribe ----------
+
+    def connect(self, timeout=20.0):
+        objects = self._managed()
+        for path, ifaces in objects.items():
+            d = ifaces.get("org.bluez.Device1")
+            if d and str(d.get("Address", "")).upper() == self.addr:
+                self.dev_path = path
+                break
+        if not self.dev_path:
+            raise RuntimeError(
+                f"{self.addr} not known to BlueZ — scan first "
+                f"(bluetoothctl scan le) or check the address")
+
+        if not self._get(self.dev_path, "org.bluez.Device1", "Connected"):
+            self.log("connecting...")
+            dbus.Interface(self.bus.get_object("org.bluez", self.dev_path),
+                           "org.bluez.Device1").Connect()
+
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            self._pump(0.1)
+            if self._get(self.dev_path, "org.bluez.Device1",
+                         "ServicesResolved"):
+                break
+        else:
+            raise RuntimeError("ServicesResolved never became true")
+
+        objects = self._managed()
+        svc = self._find(objects, "org.bluez.GattService1", SVC_UUID)
+        if not svc:
+            raise RuntimeError("SomnoPal service not found after connect")
+        for path, ifaces in objects.items():
+            c = ifaces.get("org.bluez.GattCharacteristic1")
+            if not c or str(c.get("Service", "")) != svc:
+                continue
+            u = str(c.get("UUID", "")).lower()
+            if u == CTRL_UUID:
+                self.ctrl_path = path
+            elif u == DATA_UUID:
+                self.data_path = path
+        if not self.ctrl_path:
+            raise RuntimeError("control characteristic not found")
+
+        self.bus.add_signal_receiver(
+            self._on_value, signal_name="PropertiesChanged",
+            dbus_interface="org.freedesktop.DBus.Properties")
+        self._ctrl = dbus.Interface(self.bus.get_object("org.bluez",
+                                                        self.ctrl_path),
+                                    "org.bluez.GattCharacteristic1")
+        if self.data_path:
+            self._data = dbus.Interface(
+                self.bus.get_object("org.bluez", self.data_path),
+                "org.bluez.GattCharacteristic1")
+        self.log("connected; ctrl", self.ctrl_path)
+
+    def subscribe(self):
+        self._ctrl.StartNotify()
+        if self._data:
+            self._data.StartNotify()
+        self._pump(0.5)
+
+    # ---------- inbound ----------
+
+    def _on_value(self, interface, changed, invalidated):
+        if "Value" not in changed:
+            return
+        data = bytes(bytearray(changed["Value"]))
+        if len(data) < HDR_LEN:
+            return
+        ver, kind, flags, rid, off = HDR.unpack(data[:HDR_LEN])
+        if ver != 1:
+            return
+        payload = data[HDR_LEN:]
+
+        if kind == K_JSON_RESP:
+            buf = self._rx.setdefault(rid, bytearray())
+            if off > len(buf):
+                buf.extend(b"\x00" * (off - len(buf)))
+            buf[off:off + len(payload)] = payload
+            if flags & FLAG_END:
+                self._done[rid] = bytes(buf).decode("utf-8", "replace")
+                self._rx.pop(rid, None)
+        elif kind == K_TIME_REPLY:
+            # t4 = receipt of the *complete* reply (§8.1) — stamp it here,
+            # not after the pump loop, or host polling inflates the RTT.
+            self._time_reply[rid] = (payload, time.time_ns() // 1000)
+        elif kind in (K_FILE_BYTES, K_EV_BYTES):
+            if off > len(self._stream):
+                self._stream.extend(b"\x00" * (off - len(self._stream)))
+            self._stream[off:off + len(payload)] = payload
+            self._stream_bytes = max(self._stream_bytes, off + len(payload))
+            # Do NOT write from inside the signal handler: a blocking
+            # D-Bus call here stalls dispatch and loses signals. Flag it
+            # and let the stream loop send the credit update instead.
+            self._ack_pending = True
+
+    # ---------- outbound ----------
+
+    def _write(self, path, obj, blob):
+        value = dbus.Array([dbus.Byte(b) for b in blob], signature="y")
+        opts = dbus.Dictionary({"offset": dbus.UInt16(0),
+                                "type": "request"}, signature="sv")
+        obj.WriteValue(value, opts)
+
+    def _ack(self, rid, offset, window_bytes=None):
+        mtu = int(self._get(self.ctrl_path, "org.bluez.GattCharacteristic1",
+                            "MTU", 247) or 247)
+        pay = max(mtu - 3 - HDR_LEN, 20)
+        window = window_bytes if window_bytes is not None else 8 * pay
+        blob = frame(K_ACK, rid, offset, 0, struct.pack("<I", window))
+        self._write(self.ctrl_path, self._ctrl, blob)
+
+    def _next_rid(self):
+        self._rid = (self._rid % 0xFFFFFF) + 1
+        return self._rid
+
+    def request(self, op, args=None, timeout=15.0):
+        rid = self._next_rid()
+        doc = {"op": op}
+        if args:
+            doc["args"] = args
+        blob = frame(K_JSON_REQ, rid, 0, FLAG_START | FLAG_END,
+                     json.dumps(doc, separators=(",", ":")).encode())
+        self._write(self.ctrl_path, self._ctrl, blob)
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            self._pump(0.05)
+            if rid in self._done:
+                return json.loads(self._done.pop(rid))
+        raise TimeoutError(f"{op}: no response in {timeout:.0f}s")
+
+    # ---------- §8.1 time exchange ----------
+
+    def time_exchange(self, unc_us=1000, epoch=1, rounds=5, timeout=2.0,
+                      gap=0.15):
+        """rounds x (TIME_REQUEST -> TIME_REPLY), then commit the best.
+
+        TIME_REPLY is an ATT indication, so a new request sent before the
+        previous one is confirmed gets no reply (NimBLE EBUSY) — hence the
+        gap. The commit must land within 5 s of the chosen exchange (§8.1)
+        so a missing reply must fail fast, not stall the whole round.
+        """
+        results = []
+        for i in range(rounds):
+            if i:
+                self._pump(gap)
+            rid = self._next_rid()
+            t1 = time.time_ns() // 1000
+            self._write(self.ctrl_path, self._ctrl,
+                        frame(K_TIME_REQ, rid, 0, FLAG_START | FLAG_END,
+                              struct.pack("<QII", t1, unc_us, epoch)))
+            end = time.monotonic() + timeout
+            while time.monotonic() < end and rid not in self._time_reply \
+                    and rid not in self._done:
+                self._pump(0.005)
+            if rid in self._done:      # device answered with a JSON error
+                results.append({"rid": rid, "ok": False,
+                                "why": self._done.pop(rid)[:120]})
+                continue
+            raw = self._time_reply.pop(rid, None)
+            if raw is None:
+                results.append({"rid": rid, "ok": False,
+                                "why": "no reply"})
+                continue
+            raw, t4 = raw
+            if len(raw) < 28:      # §10.4: t1,m2,m3 (u64) + epoch (u32)
+                results.append({"rid": rid, "ok": False,
+                                "why": f"malformed TIME_REPLY ({len(raw)} B, "
+                                       f"need 28)"})
+                continue
+            t1r, m2, m3, ep = struct.unpack("<QQQI", raw[:28])
+            rtt = (t4 - t1r) - (m3 - m2)
+            results.append({
+                "rid": rid, "ok": True, "t1": t1r, "t4": t4,
+                "m2": m2, "m3": m3, "epoch": ep, "rtt_us": rtt,
+                "proc_us": m3 - m2,
+                "unc_us": unc_us + max(rtt, 0) // 2 + TIMESTAMP_ALLOWANCE_US,
+                "usable": 0 <= rtt <= RTT_MAX_US and unc_us <= SRC_UNC_MAX_US,
+            })
+
+        usable = [r for r in results if r.get("usable")]
+        if not usable:
+            return {"exchanges": results, "committed": None,
+                    "why": "no usable exchange (rtt<=250ms required)"}
+
+        best = min(usable, key=lambda r: r["rtt_us"])
+        commit = frame(K_TIME_COMMIT, best["rid"], 0, FLAG_START | FLAG_END,
+                       struct.pack("<QQI", best["t1"], best["t4"],
+                                   best["epoch"]))
+        self._write(self.ctrl_path, self._ctrl, commit)
+        end = time.monotonic() + timeout
+        ack = None
+        while time.monotonic() < end and best["rid"] not in self._done:
+            self._pump(0.05)
+        if best["rid"] in self._done:
+            ack = json.loads(self._done.pop(best["rid"]))
+        return {"exchanges": results, "committed": best, "ack": ack}
+
+    # ---------- evidence stream ----------
+
+    def evidence(self, timeout=45.0):
+        rid = self._next_rid()
+        self._stream = bytearray()
+        self._stream_bytes = 0
+        self._stream_end = None
+        self._stream_open = False
+        self._ack_pending = False
+        self._stream_rid = rid
+        self._write(self.ctrl_path, self._ctrl,
+                    frame(K_JSON_REQ, rid, 0, FLAG_START | FLAG_END,
+                          json.dumps({"op": "GET_EVIDENCE"}).encode()))
+        # STREAM_BEGIN arrives as a JSON response; credit must follow or
+        # the device's streamer waits forever (§10.3).
+        begin = None
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            self._pump(0.02)
+            if rid in self._done:
+                begin = json.loads(self._done.pop(rid))
+                break
+        if not begin or not begin.get("ok"):
+            return {"begin": begin, "raw": b"", "end": None}
+        self._stream_open = True
+        self._ack(rid, 0)
+        while time.monotonic() < end:
+            self._pump(0.02)
+            if self._ack_pending:
+                self._ack_pending = False
+                self._ack(rid, self._stream_bytes)
+            if rid in self._done:          # STREAM_END
+                self._stream_end = json.loads(self._done.pop(rid))
+                break
+        self._stream_open = False
+        return {"begin": begin, "raw": bytes(self._stream),
+                "end": self._stream_end}
+
+    def close(self):
+        try:
+            self._ctrl.StopNotify()
+            if self._data:
+                self._data.StopNotify()
+        except dbus.exceptions.DBusException:
+            pass
+
+
+# ---------- formatting ----------
+
+def hr(title):
+    print(f"\n=== {title} ===")
+
+
+def fmt_ms(v):
+    return "null" if v is None else f"{v} ms"
+
+
+def fmt_iv(iv):
+    return "null" if not iv else f"[{iv[0]}, {iv[1]}] ms"
+
+
+def print_status(r):
+    res = r.get("result", {})
+    hr("GET_STATUS")
+    print(f"  fw {res.get('fw')} proto {res.get('proto')}   "
+          f"security={res.get('security')} mode={res.get('mode')}")
+    print(f"  sta_connected={res.get('sta_connected')} rssi={res.get('rssi')} "
+          f"paired={res.get('paired')} ble_connected={res.get('ble_connected')}")
+    t = res.get("therapy", {})
+    print(f"  therapy: state={t.get('state')} stale={t.get('stale')} "
+          f"reason={t.get('reason')} confidence={t.get('confidence')}")
+    print(f"           expected_append={t.get('expected_append_ms')} ms  "
+          f"out_timeout={t.get('out_timeout_ms')} ms  "
+          f"transfer_allowed={t.get('transfer_allowed')}")
+    b = res.get("budget", {})
+    print(f"  budget: active_8h={b.get('active_8h')} "
+          f"backoff={b.get('backoff_ms')} ms cap={b.get('cap')}")
+
+
+def print_catalog(r):
+    res = r.get("result", {})
+    hr("GET_CATALOG_STATUS")
+    print(f"  state={res.get('state')} folders={res.get('folders_total')} "
+          f"catalog_complete={res.get('catalog_complete')} "
+          f"hot_ready={res.get('hot_ready')}")
+    print(f"  incomplete={res.get('incomplete_count')} "
+          f"psram={res.get('psram_used')} hot_days={res.get('hot_days')}")
+
+
+def print_days(r):
+    res = r.get("result", {})
+    days = res.get("days", [])
+    hr("LIST_RECENT_DAYS")
+    print(f"  {len(days)} day(s), newest first: "
+          f"{', '.join(days[:12])}{' ...' if len(days) > 12 else ''}")
+    print(f"  catalog_complete={res.get('catalog_complete')} "
+          f"hot_ready={res.get('hot_ready')}")
+
+
+def print_day(r, day):
+    res = r.get("result", {})
+    files = res.get("files", [])
+    hr(f"LIST_DAY {day}")
+    print(f"  {len(files)} file(s), scan_age_us={res.get('scan_age_us')}")
+    for f in files[:20]:
+        print(f"    {f.get('name'):<32} {f.get('size'):>10} B  ts={f.get('ts')}")
+    if len(files) > 20:
+        print(f"    ... {len(files) - 20} more")
+
+
+def print_ls(r, directory):
+    hr(f"LIST_DIRECTORY {directory}")
+    if not r.get("ok"):
+        print(f"  card error: {r.get('error')}")
+        return
+    res = r.get("result", {})
+    files = res.get("files", [])
+    print(f"  {len(files)} entr(ies)")
+    for f in files[:25]:
+        print(f"    {f.get('name'):<32} {f.get('size'):>10} B  ts={f.get('ts')}")
+
+
+def print_drift(r):
+    res = r.get("result", {})
+    hr("GET_DRIFT")
+    if not r.get("ok"):
+        print(f"  unavailable: {r.get('error')}")
+        return
+    files = res.get("files", [])
+    print(f"  estimate_state={res.get('estimate_state')} "
+          f"observation_closed={res.get('observation_closed')} "
+          f"evidence_available={res.get('evidence_available')}")
+    print(f"  files: {', '.join(f.get('name', '?') for f in files) or '-'}")
+    print(f"  session_start_as10={res.get('session_start_as10')}")
+    print(f"  session_start_true_ms = {fmt_ms(res.get('session_start_true_ms'))}"
+          f"   interval {fmt_iv(res.get('start_interval_ms'))}")
+    print(f"  clock_drift_ms        = {fmt_ms(res.get('clock_drift_ms'))}"
+          f"   interval {fmt_iv(res.get('drift_interval_ms'))}")
+    print(f"  flush_period_ms       = {fmt_ms(res.get('flush_period_ms'))}"
+          f"   interval {fmt_iv(res.get('flush_period_interval_ms'))}")
+    print(f"  timer_rate_ppm        = {res.get('timer_rate_ppm')}")
+    print(f"  beacon layout: record_duration_s={res.get('record_duration_s')} "
+          f"record_bytes={res.get('record_bytes')} "
+          f"complete_records={res.get('complete_records')}")
+    print(f"  model_id={res.get('model_id')}  record_key={res.get('record_key')}")
+    flags = res.get("flags") or []
+    print(f"  flags: {', '.join(flags) if flags else '(none)'}")
+    print("  note: clock_drift_ms is NTP-minus-device start; null until an "
+          "anchor exists (§8.1)")
+
+
+def print_time_sync(r):
+    hr("TIME SYNC (§8.1)")
+    for i, ex in enumerate(r.get("exchanges", []), 1):
+        if not ex.get("ok"):
+            print(f"  #{i} rid={ex['rid']} FAILED ({ex.get('why')})")
+            continue
+        print(f"  #{i} rid={ex['rid']} rtt={ex['rtt_us'] / 1000:.2f} ms  "
+              f"on-device={ex['proc_us'] / 1000:.2f} ms  "
+              f"unc=±{ex['unc_us'] / 1000:.2f} ms  "
+              f"{'usable' if ex['usable'] else 'REJECTED'}")
+    best = r.get("committed")
+    if not best:
+        print(f"  committed: none — {r.get('why')}")
+        return
+    print(f"  committed rid={best['rid']} "
+          f"(rtt={best['rtt_us'] / 1000:.2f} ms, unc=±{best['unc_us'] / 1000:.2f} ms)")
+    ack = r.get("ack")
+    if not ack:
+        print("  device ack: MISSING")
+        return
+    a = ack.get("result", {})
+    print(f"  device ack: accepted={a.get('accepted')} reason={a.get('reason')} "
+          f"uncertainty_us={a.get('uncertainty_us')} anchors={a.get('anchors')}")
+
+
+def print_evidence(r):
+    hr("GET_EVIDENCE")
+    begin = r.get("begin") or {}
+    res = begin.get("result", {})
+    print(f"  begin: journal_seq={res.get('journal_seq')} "
+          f"oldest_seq={res.get('oldest_seq')} truncated={res.get('truncated')}")
+    raw = r.get("raw", b"")
+    print(f"  {len(raw)} payload byte(s)")
+    text = raw.decode("utf-8", "replace")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"    {line[:120]}")
+            continue
+        kind = rec.get("k") or rec.get("type") or "?"
+        rest = {k: v for k, v in rec.items() if k not in ("k", "type")}
+        print(f"    [{kind}] {json.dumps(rest, separators=(',', ':'))[:140]}")
+    end = r.get("end") or {}
+    e = end.get("result", {})
+    print(f"  end: ok={e.get('ok')} bytes={e.get('actual_bytes')} "
+          f"gaps={e.get('gaps')} sha256={str(e.get('sha256'))[:16]}...")
+
+
+# ---------- main ----------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Query a bonded SomnoPal over BLE (BlueZ D-Bus).",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--address", default=DEFAULT_ADDR,
+                    help=f"BLE address (default {DEFAULT_ADDR})")
+    ap.add_argument("--status", action="store_true", help="GET_STATUS")
+    ap.add_argument("--catalog", action="store_true", help="GET_CATALOG_STATUS")
+    ap.add_argument("--days", type=int, nargs="?", const=14, default=None,
+                    metavar="N", help="LIST_RECENT_DAYS (default 14)")
+    ap.add_argument("--day", metavar="YYYYMMDD", help="LIST_DAY for a day")
+    ap.add_argument("--ls", metavar="DIR",
+                    help="LIST_DIRECTORY — live card listing, e.g. 'A:\\'")
+    ap.add_argument("--drift", nargs=2, metavar=("DIR", "NAME"),
+                    help="GET_DRIFT for an explicit file")
+    ap.add_argument("--drift-auto", action="store_true",
+                    help="GET_DRIFT for the newest day's last file")
+    ap.add_argument("--time-sync", type=int, nargs="?", const=5, default=None,
+                    metavar="N",
+                    help="run N exchanges and commit the best anchor (§8.1)")
+    ap.add_argument("--evidence", action="store_true",
+                    help="replay the evidence journal (GET_EVIDENCE)")
+    ap.add_argument("--json", action="store_true", help="print raw JSON")
+    ap.add_argument("--timeout", type=float, default=15.0)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    if not any([args.status, args.catalog, args.days is not None, args.day,
+                args.drift, args.drift_auto, args.time_sync is not None,
+                args.evidence]):
+        args.status = args.catalog = args.drift_auto = True
+        args.days = 14
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    dev = SomnoPal(args.address, verbose=args.verbose)
+    try:
+        dev.connect()
+        dev.subscribe()
+
+        if args.status:
+            r = dev.request("GET_STATUS", timeout=args.timeout)
+            print(json.dumps(r, indent=2)) if args.json else print_status(r)
+
+        if args.catalog:
+            r = dev.request("GET_CATALOG_STATUS", timeout=args.timeout)
+            print(json.dumps(r, indent=2)) if args.json else print_catalog(r)
+
+        days = []
+        if args.days is not None:
+            r = dev.request("LIST_RECENT_DAYS", {"days": args.days},
+                            timeout=args.timeout)
+            print(json.dumps(r, indent=2)) if args.json else print_days(r)
+            days = r.get("result", {}).get("days", [])
+
+        if args.day:
+            r = dev.request("LIST_DAY", {"day": args.day},
+                            timeout=args.timeout)
+            print(json.dumps(r, indent=2)) if args.json else print_day(r, args.day)
+
+        if args.ls:
+            r = dev.request("LIST_DIRECTORY", {"directory": args.ls},
+                            timeout=args.timeout)
+            print(json.dumps(r, indent=2)) if args.json else print_ls(r, args.ls)
+
+        target = None
+        if args.drift:
+            target = (args.drift[0], args.drift[1])
+        elif args.drift_auto:
+            if not days:
+                r = dev.request("LIST_RECENT_DAYS", {"days": 14},
+                                timeout=args.timeout)
+                days = r.get("result", {}).get("days", [])
+            if days:
+                day = days[0]
+                r = dev.request("LIST_DAY", {"day": day}, timeout=args.timeout)
+                files = r.get("result", {}).get("files", [])
+                if files:
+                    target = (f"A:\\DATALOG\\{day}", files[-1]["name"])
+                else:
+                    print(f"\n(no files listed for {day} — drift needs a "
+                          f"tracked file)")
+            else:
+                print("\n(no days in catalog — card not scanned yet)")
+        if target:
+            r = dev.request("GET_DRIFT", {"directory": target[0],
+                                          "name": target[1]},
+                            timeout=args.timeout)
+            print(json.dumps(r, indent=2)) if args.json else print_drift(r)
+
+        if args.time_sync is not None:
+            r = dev.time_exchange(rounds=args.time_sync)
+            print(json.dumps(r, indent=2)) if args.json else print_time_sync(r)
+
+        if args.evidence:
+            r = dev.evidence(timeout=args.timeout * 3)
+            print(json.dumps(r, indent=2, default=str)) if args.json \
+                else print_evidence(r)
+    finally:
+        dev.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

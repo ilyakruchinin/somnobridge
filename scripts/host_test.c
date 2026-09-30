@@ -336,6 +336,35 @@ static void test_framing(void)
                      (const uint8_t *)"zz", 2, false, true);
     CHECK(!blep_reasm_feed(&r, f2, sizeof(blep_hdr_t) + 2, 0, &rid),
           "hole rejected");
+
+    /* Multi-fragment stream at a real ATT budget: the emitted chunk
+     * size must match the offset the caller advances by, or bytes go
+     * missing between fragments (the whole payload is the budget the
+     * builder takes — header included).                              */
+    {
+        uint8_t src[500];
+        for (int i = 0; i < 500; i++) src[i] = (uint8_t)(i * 7 + 3);
+        uint16_t budget = 244;                 /* ATT MTU 247 - 3     */
+        uint16_t room = budget - sizeof(blep_hdr_t);
+        uint8_t f[260];
+        size_t off = 0;
+        blep_reasm_init(&r);
+        bool done = false;
+        while (off < sizeof(src)) {
+            size_t chunk = sizeof(src) - off;
+            if (chunk > room) chunk = room;
+            uint16_t fl = blep_build_frame(f, budget, BLEP_JSON_REQUEST, 9,
+                                           off, src + off, (uint16_t)chunk,
+                                           off == 0,
+                                           off + chunk >= sizeof(src));
+            CHECK(fl == sizeof(blep_hdr_t) + chunk, "chunk fits budget");
+            done = blep_reasm_feed(&r, f, fl, 0, &rid);
+            off += chunk;
+        }
+        CHECK(done, "stream completes");
+        CHECK(r.len == sizeof(src) && !memcmp(r.buf, src, sizeof(src)),
+              "multi-fragment payload byte-exact");
+    }
 }
 
 /* ---------------- drift anchors + fit ---------------- */
@@ -364,6 +393,16 @@ static void test_drift(void)
     drift_time_reply_tsp(3, 320);
     ar = drift_time_commit(3, 3050000, host_now_us, &unc);
     CHECK(ar == ANCHOR_EPOCH, "epoch change -> new segment");
+
+    /* §10.4 caches a pending exchange for ≤5 s: reusing its id after
+     * that must start a fresh exchange, not fail INVALID_STATE.      */
+    CHECK(drift_time_begin(4, 4000000, 10000, 43, 1000) == ESP_OK,
+          "begin 4");
+    CHECK(drift_time_begin(4, 4000000, 10000, 43, 1500) ==
+          ESP_ERR_INVALID_STATE, "same id inside window rejected");
+    CHECK(drift_time_begin(4, 4000000, 10000, 43,
+                           1000 + 6LL * 1000 * 1000) == ESP_OK,
+          "expired pending entry does not block id reuse");
 
     drift_session_t s;
     drift_sess_begin(&s, 0, 0);

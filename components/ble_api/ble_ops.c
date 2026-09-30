@@ -58,18 +58,24 @@ static uint16_t send_json_response(uint32_t rid, const char *json,
                                    size_t len)
 {
     uint16_t mtu = ble_svc_att_mtu();
-    uint16_t pay = mtu > 3 + sizeof(blep_hdr_t)
-                     ? mtu - 3 - sizeof(blep_hdr_t) : 0;
-    if (!pay) {
+    /* blep_build_frame takes the whole ATT payload budget (header +
+     * payload included), so subtract only the 3-byte ATT opcode and
+     * handle cost — subtracting the header here too would make the
+     * builder clamp each fragment 16 bytes short while the stream
+     * offset still advanced by the full chunk (silent data loss).   */
+    uint16_t budget = mtu > 3 ? (uint16_t)(mtu - 3) : 0;
+    uint16_t room = budget > sizeof(blep_hdr_t)
+                      ? (uint16_t)(budget - sizeof(blep_hdr_t)) : 0;
+    if (!room) {
         return 0;
     }
     size_t off = 0;
     uint8_t frame[256];
     while (off < len || (off == 0 && len == 0)) {
         size_t n = len - off;
-        if (n > pay) n = pay;
+        if (n > room) n = room;
         bool first = off == 0, last = off + n >= len;
-        uint16_t fl = blep_build_frame(frame, pay, BLEP_JSON_RESPONSE,
+        uint16_t fl = blep_build_frame(frame, budget, BLEP_JSON_RESPONSE,
                                        rid, off,
                                        (const uint8_t *)json + off, n,
                                        first, last);
@@ -109,7 +115,41 @@ static void send_ok(uint32_t rid, const char *op, const char *inner_json)
     }
     msg[h + il] = '}';
     msg[total] = '\0';
-    send_json_response(rid, msg, total);
+    send_json_response(rid, msg, total);    free(msg);
+}
+
+/* The final STREAM_END carries the transfer verdict (byte count and
+ * SHA-256). It is an ATT indication, and NimBLE refuses a new
+ * indication while the previous one is still unconfirmed (EBUSY) —
+ * which is easy to hit when the stream follows hard on STREAM_BEGIN.
+ * Dropping it would leave the peer without any verdict, so retry.   */
+static void send_stream_end(uint32_t rid, const char *op,
+                            const char *inner_json)
+{
+    char hdr[80];
+    int h = snprintf(hdr, sizeof(hdr), "{\"op\":\"%s\",\"ok\":true,"
+                     "\"result\":", op);
+    size_t il = inner_json ? strlen(inner_json) : 0;
+    size_t total = (size_t)h + il + 1;
+    char *msg = malloc(total + 1);
+    if (!msg) {
+        return;
+    }
+    memcpy(msg, hdr, (size_t)h);
+    if (inner_json) {
+        memcpy(msg + h, inner_json, il);
+    }
+    msg[h + il] = '}';
+    msg[total] = '\0';
+    for (int i = 0; i < 20; i++) {
+        if (send_json_response(rid, msg, total) == total) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (i == 19) {
+            ESP_LOGW("ble", "STREAM_END indication undelivered");
+        }
+    }
     free(msg);
 }
 
@@ -455,14 +495,23 @@ static bool stream_sink(const uint8_t *d, size_t n, void *ctx)
             }
         }
         size_t take = n - off;
-        uint16_t mtu_pay = ble_svc_att_mtu() - 3 - sizeof(blep_hdr_t);
-        if (take > mtu_pay) take = mtu_pay;
+        /* budget = whole ATT payload (header + payload); the chunk
+         * must not exceed the builder's room, or the frame silently
+         * carries fewer bytes than s_stream.sent advances by.       */
+        uint16_t mtu = ble_svc_att_mtu();
+        uint16_t budget = mtu > 3 ? (uint16_t)(mtu - 3) : 0;
+        uint16_t room = budget > sizeof(blep_hdr_t)
+                          ? (uint16_t)(budget - sizeof(blep_hdr_t)) : 0;
+        if (!room) {
+            return false;
+        }
+        if (take > room) take = room;
         if (take > s_stream.window) take = s_stream.window;
 
         uint8_t frame[260];
         bool last = (off + take >= n);
         uint16_t fl = blep_build_frame(
-            frame, mtu_pay, BLEP_FILE_BYTES, s_stream.request_id,
+            frame, budget, BLEP_FILE_BYTES, s_stream.request_id,
             s_stream.sent, d + off, take,
             s_stream.sent == 0, last);
         if (!ble_svc_send_bytes(frame, fl)) {
@@ -568,7 +617,7 @@ static void ble_stream_task(void *arg)
                 jrn_truncated() ? "true" : "false",
                 transport_ok ? "true" : "false",
                 transport_ok ? "ok" : "journal_error");
-            send_ok(s_stream.request_id, "STREAM_END", end);
+            send_stream_end(s_stream.request_id, "STREAM_END", end);
             s_stream.active = false;
             s_stream.is_evidence = false;
             continue;
@@ -637,7 +686,7 @@ static void ble_stream_task(void *arg)
                 completion ? "true" : "false",
                 (int)therapy_status()->state,
                 completion ? "true" : "false", reason);
-            send_ok(s_stream.request_id, "STREAM_END", end);
+            send_stream_end(s_stream.request_id, "STREAM_END", end);
         }
         s_stream.active = false;
         continue;
@@ -671,17 +720,21 @@ static void on_time_request(uint32_t rid, const uint8_t *pl, uint16_t n)
         send_error(rid, "TIME_REQUEST", EC_BAD_REQUEST);
         return;
     }
-    uint8_t buf[24];
+    /* §10.4: t1:u64, m2:u64, m3:u64, echoed epoch:u32 = 28 bytes.
+     * The epoch must follow m3 — writing it at offset 20 (as if the
+     * reply were 24 bytes) overwrites m3's high dword and destroys
+     * the RTT computation on the peer.                              */
+    uint8_t buf[28];
     memcpy(buf, &t1, 8);
     memcpy(buf + 8, &m2, 8);
     int64_t m3 = esp_timer_get_time();   /* just before first fragment */
     memcpy(buf + 16, &m3, 8);
-    memcpy(buf + 20, &epoch, 4);
+    memcpy(buf + 24, &epoch, 4);
     drift_time_reply_tsp(rid, m3);
     uint8_t frame[64];
     uint16_t fl = blep_build_frame(frame, sizeof(frame),
                                    BLEP_TIME_REPLY, rid, 0,
-                                   buf, 24, true, true);
+                                   buf, sizeof(buf), true, true);
     ble_svc_control_indicate(frame, fl);
 }
 
