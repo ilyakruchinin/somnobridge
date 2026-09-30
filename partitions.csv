@@ -1,0 +1,14 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# ESP32-S3-GEEK, 16 MiB flash.
+#  - nvs:      default partition (settings blob + NimBLE bond store)
+#  - phy_init: WiFi RF calibration
+#  - factory:  application (4 MiB, generous headroom)
+#  - evidence: NVS subtype, 2 MiB ring journal of timing evidence
+#  - metadata: NVS subtype, 1 MiB for drift records + load_budget ledger
+# All three NVS partitions are opened with nvs_flash_secure_init* when the
+# device is provisioned (HMAC-based NVS encryption, spec §4.2).
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x400000,
+evidence, data, nvs,     ,         0x200000,
+metadata, data, nvs,     ,         0x100000,

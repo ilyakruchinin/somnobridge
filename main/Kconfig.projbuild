@@ -1,0 +1,13 @@
+menu "SomnoPal"
+
+    config SOMNOPAL_DEV_UNPROTECTED
+        bool "Allow unprotected NVS in development builds"
+        default n
+        help
+            When enabled, SomnoPal falls back to plain (unencrypted) NVS
+            when the eFuse HMAC key for NVS encryption is not provisioned,
+            and displays "DEVELOPMENT — STORAGE UNPROTECTED" at runtime.
+            Must be OFF for production: a missing key then fails closed
+            with SECURITY_NOT_PROVISIONED (spec §4.2).
+
+endmenu

@@ -1,0 +1,53 @@
+/*
+ * SomnoPal — BLE service (spec §3, §10)
+ * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
+ * GPLv3+ — see LICENSE and NOTICE.
+ */
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+esp_err_t ble_svc_init(void);
+void      ble_svc_advertise(void);
+
+/** Open the 120-s physical pairing window (§3.1). Only callable from
+ * the app after a button press; denied if a peer is already bonded. */
+esp_err_t ble_svc_open_pairing(void);
+void      ble_svc_close_pairing(void);
+bool      ble_svc_pairing_open(void);
+/** Enforce window/attempt expiry — call ~1 Hz from the app loop. */
+void      ble_svc_pairing_tick(int64_t now_us);
+
+bool      ble_svc_peer_bonded(void);
+bool      ble_svc_connected(void);
+bool      ble_svc_authorized(void);   /* encrypted + bonded + identity  */
+
+/** Forget the authorized peer: disconnect + erase bond + app record. */
+void      ble_svc_forget_peer(void);
+
+/** Request one NTP-style exchange round from the peer (§8.1). */
+void      ble_svc_ping_time(void);
+
+/* Show pairing PIN state on the LCD via board helpers. */
+void      ble_svc_show_pin(uint32_t passkey);
+void      ble_svc_hide_pin(void);
+
+/* streaming control used by ble_ops */
+void      ble_svc_stream_abort(uint32_t request_id, const char *why);
+bool      ble_svc_send_bytes(const uint8_t *data, uint16_t len);
+bool      ble_svc_control_indicate(const uint8_t *data, uint16_t len);
+
+/* connection props for the streaming sender */
+uint16_t  ble_svc_att_mtu(void);
+uint16_t  ble_svc_conn_handle(void);
+
+#ifdef __cplusplus
+}
+#endif

@@ -1,0 +1,68 @@
+# SomnoPal — ESP32-S3-GEEK base configuration
+#
+# This defaults file is the DEVELOPMENT profile: it enables the unprotected
+# (plain) NVS path so firmware can boot on boards without a burned eFuse
+# HMAC key. Production builds must set CONFIG_SOMNOPAL_DEV_UNPROTECTED=n,
+# in which case a missing HMAC key yields SECURITY_NOT_PROVISIONED and
+# credentials are never written unencrypted (spec §4.2).
+
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Custom partitions: evidence + metadata NVS rings (see partitions.csv)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Quad PSRAM — the GEEK ships ESP32-S3R2 (2 MiB Quad-SPI, 3.3 V;
+# esptool reports it as "Embedded PSRAM 2MB (AP_3v3)"). Octal mode is
+# for S3R8/R16V parts and would crash psram init before console.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# BLE: NimBLE host, single connection, Secure Connections, persistent bonds
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_BT_NIMBLE_SM_SC=y
+
+# WiFi: keep credentials in RAM only — sp_config NVS blob is the authority
+CONFIG_ESP_WIFI_NVS_ENABLED=n
+
+# NVS encryption via eFuse-backed HMAC scheme (no nvs_keys partition needed).
+# Firmware checks the eFuse key is provisioned BEFORE calling secure init;
+# it must never auto-burn a key (spec §4.2).
+CONFIG_NVS_ENCRYPTION=y
+CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y
+CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=0
+
+# Watchdog / brownout (spec §13.1)
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=3
+CONFIG_ESP_BROWNOUT_DET=y
+
+# Timing granularity for the poll scheduler
+CONFIG_FREERTOS_HZ=1000
+
+# app_main orchestrates NVS/LCD/portal work; default 3584 is too tight once
+# init + 1 Hz tick paths stack up.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# Console on the native USB-Serial/JTAG (same /dev/ttyACM0 used for
+# flashing+monitor). UART0 (GPIO43/44) is not wired to USB on the GEEK.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Logging
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Development-only: allow plain NVS + warning banner when no eFuse key is
+# provisioned. Must be off for production.
+CONFIG_SOMNOPAL_DEV_UNPROTECTED=y

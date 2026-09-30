@@ -1,0 +1,17 @@
+SomnoPal
+Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
+
+SomnoPal is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version.
+
+ADDITIONAL TERM (GPLv3 Section 7(b)): Redistributions of this work, in
+source or binary form, must preserve the attribution:
+
+    "SomnoPal, originally created by Ilya Kruchinin
+     (https://github.com/ilyakruchinin)."
+
+SomnoPal is a separate firmware project from SomnoTrace. It is designed
+to interoperate with SomnoTrace over BLE, but it is not a fork of and is
+not derived from SomnoTrace source code.
