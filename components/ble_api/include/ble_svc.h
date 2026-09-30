@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -41,6 +42,9 @@ void      ble_svc_hide_pin(void);
 /* true while the PIN screen is displayed — the app's status tick must
  * not redraw rows over it                                       */
 bool      ble_svc_pin_visible(void);
+/* App loop drains a pending PIN-screen draw (LCD is app-task-owned);
+ * returns true once per show_pin, code buffer filled when it does.  */
+bool      ble_svc_pin_take_request(char *code, size_t len);
 
 /* streaming control used by ble_ops */
 void      ble_svc_stream_abort(uint32_t request_id, const char *why);

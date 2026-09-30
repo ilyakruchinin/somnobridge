@@ -116,6 +116,14 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "SomnoPal boot");
 
+    /* DIAG: quiet chatty drivers so NimBLE SM trace survives the UART */
+    esp_log_level_set("spi_master", ESP_LOG_WARN);
+    esp_log_level_set("nvs", ESP_LOG_WARN);
+    esp_log_level_set("wifi", ESP_LOG_WARN);
+    esp_log_level_set("wifi_init", ESP_LOG_WARN);
+    esp_log_level_set("phy_init", ESP_LOG_WARN);
+    esp_log_level_set("event", ESP_LOG_WARN);
+
     esp_err_t err = board_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "board_init failed: %s", esp_err_to_name(err));
@@ -246,6 +254,11 @@ void app_main(void)
             netw_refresh_rssi();
             if (ble_svc_pin_visible()) {
                 s_pin_up = true;        /* PIN screen owns the LCD    */
+                char code[8];
+                if (ble_svc_pin_take_request(code, sizeof(code))) {
+                    lcd_ui_pin_screen("BLE PAIRING", code,
+                                      "TYPE PIN IN APP");
+                }
             } else {
                 if (s_pin_up) {         /* PIN closed — repaint chrome */
                     s_pin_up = false;

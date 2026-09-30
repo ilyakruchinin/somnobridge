@@ -10,4 +10,12 @@ menu "SomnoPal"
             Must be OFF for production: a missing key then fails closed
             with SECURITY_NOT_PROVISIONED (spec §4.2).
 
+    config SOMNOPAL_DIAG_FIXED_PASSKEY
+        bool "DIAG: fixed 424242 pairing passkey"
+        default n
+        help
+            Development only: pairs with a fixed passkey so an automated
+            agent can complete pairing without reading the LCD. Never
+            enable in production.
+
 endmenu

@@ -65,3 +65,14 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # Development-only: allow plain NVS + warning banner when no eFuse key is
 # provisioned. Must be off for production.
 CONFIG_SOMNOPAL_DEV_UNPROTECTED=y
+# LESC P-256 math at -Og takes tens of seconds and overruns the 30 s SMP
+# proc timer — compile performance, keep assertions.
+# CONFIG_COMPILER_OPTIMIZATION_DEBUG is not set
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# NimBLE host task runs SMP crypto: keep mbedTLS — tinycrypt's RNG path
+# issues a synchronous HCI rand from the host task and self-deadlocks;
+# mbedTLS CTR_DRBG is seeded at init and is fast enough at -O2.
+CONFIG_BT_NIMBLE_CRYPTO_STACK_MBEDTLS=y
+CONFIG_NIMBLE_CRYPTO_STACK_MBEDTLS=y
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
+# CONFIG_SOMNOPAL_DIAG_FIXED_PASSKEY is not set

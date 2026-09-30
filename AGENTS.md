@@ -32,6 +32,43 @@ NOT re-sample strap pins — a chip that entered download mode stays in
 the physical RST button to boot the app. LCD pins: CS=10 MOSI=11 SCLK=12
 DC=8 RST=9 BL=7; BOOT button = GPIO0.
 
+**Never keep another process reading `/dev/ttyACM0` while flashing.** A
+background `cat`/serial reader steals esptool's stub responses and the write
+dies mid-stream with `Serial data stream stopped` / `Packet content transfer
+stopped` — easy to misdiagnose as a bad cable or crash loop. Use bounded reads
+(`timeout N cat ...`) and make sure nothing holds the port before `flash`.
+
+## BLE pairing / GATT testing (host side)
+
+`bluetoothctl` is unreliable for exercising the control characteristic — do
+NOT trust it to tell you whether the firmware works:
+
+- **`bluetoothctl`'s `write` command returns `org.bluez.Error.NotSupported`
+  for every variant** (`<data>`, `<data> 0`, `<data> 0 request`, ...) even when
+  the characteristic advertises `write`. It never reaches the device. Use the
+  D-Bus API instead — this is what SomnoTrace does:
+
+  ```bash
+  gdbus call --system --dest org.bluez --object-path <CHAR_PATH> \
+    --method org.bluez.GattCharacteristic1.WriteValue \
+    "[0x01,0x01,0x03,0x00,0x01,0x00,...]" \
+    "{'offset': <uint16 0>, 'type': <'request'>}"
+  ```
+
+- **BlueZ caches the GATT database for bonded peers** in
+  `/var/lib/bluetooth/<adapter>/<device>/attributes` (separate from the bond
+  keys in `info`). A cache written during an interrupted discovery can contain
+  services only and a bogus `EndGroupHandle=65535`; BlueZ then silently rejects
+  writes with `NotSupported` and never contacts the device. Delete the file
+  (bond survives) and `systemctl restart bluetooth` to force rediscovery.
+
+- `bluetoothctl` exits as soon as stdin closes, so `printf ... | bluetoothctl`
+  never streams scan results — keep stdin open (coproc + `sleep`).
+
+- Pairing requires the passkey be handed to SM via `ble_sm_inject_io()`;
+  writing `ev->passkey.params.numcmp` is a no-op and the proc then stalls to
+  the 30 s SMP timeout.
+
 ## Host tests
 
 Pure-logic modules compile with plain `cc` against stub ESP headers:

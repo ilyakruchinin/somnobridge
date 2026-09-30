@@ -42,7 +42,7 @@ static int build_url(char *out, size_t cap, const char *endpoint,
         ezp_urlencode(q2_val, e2, sizeof(e2));
     }
     return snprintf(out, cap,
-                    "http://%lu.%lu.%lu.%lu/%s?%s=%s%s%s%s",
+                    "http://%lu.%lu.%lu.%lu/%.16s?%.16s=%.500s%s%.16s%s",
                     (unsigned long)(s_card_ip >> 24),
                     (unsigned long)(s_card_ip >> 16) & 255,
                     (unsigned long)(s_card_ip >> 8) & 255,
@@ -102,7 +102,7 @@ esp_err_t ezs_list_dir(const char *canon_dir,
         return ESP_ERR_INVALID_ARG;
     }
 
-    char url[600];
+    char url[1152];
     build_url(url, sizeof(url), "dir", "dir", canon_dir, NULL, NULL);
 
     obs->req_start_us = esp_timer_get_time();
@@ -207,7 +207,7 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
         return ESP_ERR_INVALID_ARG;
     }
 
-    char fdir[320], url[900];
+    char fdir[320], url[1152];
     canon_to_fdir(canon_dir, fdir, sizeof(fdir));
     build_url(url, sizeof(url), "download",
               "fname", name, "fdir", fdir);
@@ -299,7 +299,7 @@ esp_err_t ezs_probe_header(const char *canon_dir, const char *name,
         return ESP_ERR_INVALID_ARG;   /* §8.2: only ≤16 KiB files    */
     }
 
-    char fdir[320], url[900];
+    char fdir[320], url[1152];
     canon_to_fdir(canon_dir, fdir, sizeof(fdir));
     build_url(url, sizeof(url), "download",
               "fname", name, "fdir", fdir);

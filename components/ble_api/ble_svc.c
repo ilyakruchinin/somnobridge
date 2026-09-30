@@ -18,6 +18,7 @@
 #include "esp_random.h"
 #include "host/ble_att.h"
 #include "host/ble_hs.h"
+#include "host/ble_sm.h"
 #include "host/ble_uuid.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -52,6 +53,8 @@ static uint16_t s_ctrl_handle, s_data_handle;
 static bool     s_ctrl_sub, s_data_sub;
 static bool     s_pairing_open;
 static bool     s_pin_on_screen;
+static bool     s_pin_draw_pending;
+static char     s_pin_code[8];
 static int64_t  s_pairing_deadline_us;
 static int64_t  s_pairing_attempt_us;
 static int      s_pairing_fails;
@@ -141,8 +144,17 @@ static int access_gate(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     }
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        return ble_ops_on_write(conn_handle,
-                                ctxt->om->om_data, ctxt->om->om_len);
+        /* om_data/om_len cover only the first mbuf segment — flatten
+         * the chain (bounded by negotiated ATT MTU)                 */
+        uint16_t olen = ctxt->om ? OS_MBUF_PKTLEN(ctxt->om) : 0;
+        uint8_t buf[544];
+        if (olen > sizeof(buf)) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        if (os_mbuf_copydata(ctxt->om, 0, olen, buf) != 0) {
+            return BLE_ATT_ERR_INVALID_PDU;
+        }
+        return ble_ops_on_write(conn_handle, buf, olen);
     }
     return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
 }
@@ -153,7 +165,13 @@ static int gap_event(struct ble_gap_event *ev, void *arg);
 
 static uint32_t gen_passkey(void)
 {
+#ifdef CONFIG_SOMNOPAL_DIAG_FIXED_PASSKEY
+    /* DIAG: fixed PIN so an automated agent can answer without waiting
+     * for the LCD/log. Never set in production.                      */
+    return 424242;
+#else
     return esp_random() % 1000000;   /* six digits incl. leading zeros */
+#endif
 }
 
 static int on_passkey(struct ble_gap_event *ev, void *arg)
@@ -175,7 +193,18 @@ static int on_passkey(struct ble_gap_event *ev, void *arg)
     }
     if (ev->passkey.params.action == BLE_SM_IOACT_DISP) {
         uint32_t pk = gen_passkey();
-        ev->passkey.params.numcmp = pk;   /* display value             */
+        /* The displayed passkey must be handed back to SM via
+         * ble_sm_inject_io — the proc blocks on ADVANCE_ON_IO until
+         * proc->tk is filled (writing params.numcmp is a no-op).     */
+        struct ble_sm_io io = {
+            .action  = BLE_SM_IOACT_DISP,
+            .passkey = pk,
+        };
+        int rc = ble_sm_inject_io(ev->passkey.conn_handle, &io);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "inject_io failed rc=%d", rc);
+            return BLE_HS_EINVAL;
+        }
         ble_svc_show_pin(pk);             /* stamps s_pairing_attempt  */
         return 0;
     }
@@ -262,6 +291,8 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
         } else if (s_pairing_open) {
             /* failed pairing attempt counts toward the 3-try limit
              * and a stalled attempt expires after 60 s (§3.1)        */
+            ESP_LOGW(TAG, "enc_change fail status=%u",
+                     ev->enc_change.status);
             s_pairing_fails++;
             if (s_pairing_fails >= 3) {
                 ESP_LOGW(TAG, "3 pairing failures — closing window");
@@ -277,6 +308,7 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
         /* already bonded peer re-pairing: allow silently (same bond),
          * strangers never reach this (we refuse below). */
+        ESP_LOGI(TAG, "repeat_pairing event");
         struct ble_gap_conn_desc d;
         if (ble_gap_conn_find(ev->repeat_pairing.conn_handle, &d) == 0) {
             if (s_have_peer) {
@@ -414,21 +446,39 @@ bool ble_svc_send_bytes(const uint8_t *data, uint16_t len)
 
 void ble_svc_show_pin(uint32_t passkey)
 {
-    char pin[8];
-    snprintf(pin, sizeof(pin), "%06lu", (unsigned long)passkey);
-    lcd_ui_pin_screen("BLE PAIRING", pin, "TYPE PIN IN APP");
+    /* runs in the NimBLE host task — never touch the LCD here: the app
+     * task owns all screen traffic (single s_rowbuf + done semaphore).
+     * Record the code and let the app loop render it next tick.       */
+    snprintf(s_pin_code, sizeof(s_pin_code), "%06lu",
+             (unsigned long)passkey);
     s_pairing_attempt_us = esp_timer_get_time();
     s_pin_on_screen = true;
+    s_pin_draw_pending = true;
 }
-void ble_svc_hide_pin(void) { s_pin_on_screen = false; }
+void ble_svc_hide_pin(void)
+{
+    s_pin_on_screen = false;
+    s_pin_draw_pending = false;
+}
 bool ble_svc_pin_visible(void) { return s_pin_on_screen; }
+
+bool ble_svc_pin_take_request(char *code, size_t len)
+{
+    if (!s_pin_draw_pending) {
+        return false;
+    }
+    s_pin_draw_pending = false;
+    strncpy(code, s_pin_code, len);
+    code[len - 1] = '\0';
+    return true;
+}
 
 /* ---------------- init ---------------- */
 
 static void on_sync(void)
 {
     ble_svc_advertise();
-    if (settings_load_peer(NULL, NULL) == ESP_OK) {
+    if (settings_has_peer()) {
         s_have_peer = true;
     }
 }

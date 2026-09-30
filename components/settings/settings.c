@@ -345,7 +345,9 @@ esp_err_t settings_load_peer(uint8_t *id_addr_type, uint8_t addr[6])
     if (id_addr_type) {
         *id_addr_type = buf[0];
     }
-    memcpy(addr, buf + 1, 6);
+    if (addr) {
+        memcpy(addr, buf + 1, 6);
+    }
     return ESP_OK;
 }
 
