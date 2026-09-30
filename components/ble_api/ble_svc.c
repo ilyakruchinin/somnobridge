@@ -51,6 +51,7 @@ static uint16_t s_mtu = 23;
 static uint16_t s_ctrl_handle, s_data_handle;
 static bool     s_ctrl_sub, s_data_sub;
 static bool     s_pairing_open;
+static bool     s_pin_on_screen;
 static int64_t  s_pairing_deadline_us;
 static int64_t  s_pairing_attempt_us;
 static int      s_pairing_fails;
@@ -415,10 +416,12 @@ void ble_svc_show_pin(uint32_t passkey)
 {
     char pin[8];
     snprintf(pin, sizeof(pin), "%06lu", (unsigned long)passkey);
-    lcd_ui_pin_screen("BLE PAIRING", pin, "TYPE PIN IN SOMNOTRACE");
+    lcd_ui_pin_screen("BLE PAIRING", pin, "TYPE PIN IN APP");
     s_pairing_attempt_us = esp_timer_get_time();
+    s_pin_on_screen = true;
 }
-void ble_svc_hide_pin(void) { /* UI task will repaint status */ }
+void ble_svc_hide_pin(void) { s_pin_on_screen = false; }
+bool ble_svc_pin_visible(void) { return s_pin_on_screen; }
 
 /* ---------------- init ---------------- */
 

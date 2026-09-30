@@ -38,6 +38,9 @@ void      ble_svc_ping_time(void);
 /* Show pairing PIN state on the LCD via board helpers. */
 void      ble_svc_show_pin(uint32_t passkey);
 void      ble_svc_hide_pin(void);
+/* true while the PIN screen is displayed — the app's status tick must
+ * not redraw rows over it                                       */
+bool      ble_svc_pin_visible(void);
 
 /* streaming control used by ble_ops */
 void      ble_svc_stream_abort(uint32_t request_id, const char *why);

@@ -28,6 +28,11 @@ static const char *TAG = "somnopal";
 /* set by the setup portal when new config is committed (setup_portal.c) */
 volatile bool portal_saved_flag;
 
+/* while the BLE PIN screen is up the status tick must not redraw rows —
+ * set on ble_svc_pin_visible(), cleared (with a chrome repaint) once the
+ * pairing attempt ends                                            */
+static bool s_pin_up;
+
 static void on_wifi_link(bool up, uint32_t ip)
 {
     (void)ip;                        /* cb passes our STA addr        */
@@ -89,21 +94,22 @@ static void ui_tick(void)
 {
     const therapy_status_t *t = therapy_status();
     const netw_status_t *n = netw_status();
-    lcd_ui_rowf(3, 0, "WIFI:%s RSSI:%d",
-                n->sta_connected ? "UP " : "DOWN", n->rssi);
+    lcd_ui_rowf(3, 0, "WIFI:%s %ddBm",
+                n->sta_connected ? "UP" : "DOWN", n->rssi);
     lcd_ui_rowf(4, 0, "BLE:%s%s",
                 ble_svc_connected() ? "CONN" : "---",
                 ble_svc_authorized() ? " AUTH" : "");
-    lcd_ui_rowf(5, 0, "THERAPY:%s%s",
+    lcd_ui_rowf(5, 0, "THER:%s%s",
                 t->state == THERAPY_IN ? "IN " :
                 t->state == THERAPY_OUT ? "OUT" : "???",
                 t->therapy_stale ? " STALE" : "");
-    lcd_ui_rowf(6, 0, "ANCHORS:%d CAT:%d/%s",
-                drift_anchor_count(), cat_folder_count(),
-                cat_catalog_complete() ? "FULL" : "PART");
-    lcd_ui_rowf(7, 0, "LOAD8H:%lu BKOFF:%lums",
+    lcd_ui_rowf(6, 0, "CAT:%d %s A:%d",
+                cat_folder_count(),
+                cat_catalog_complete() ? "FULL" : "PART",
+                drift_anchor_count());
+    lcd_ui_rowf(7, 0, "L8H:%lu BK:%lus",
                 (unsigned long)sched_active_8h(),
-                (unsigned long)sched_backoff_ms());
+                (unsigned long)(sched_backoff_ms() / 1000));
 }
 
 void app_main(void)
@@ -124,7 +130,7 @@ void app_main(void)
     sp_settings_t cfg;
     bool provisioned = err == ESP_OK && settings_load(&cfg) == ESP_OK &&
                        cfg.magic_valid;
-    lcd_ui_rowf(2, 0, "CFG:%s SEC:%s",
+    lcd_ui_rowf(2, 0, "CFG:%s SEC:%.3s",
                 provisioned ? "OK" : "NONE", settings_security_label());
 
     /* 2. evidence journal (may run degraded without security cfg)     */
@@ -163,7 +169,7 @@ void app_main(void)
     if (err == ESP_OK) {
         ble_svc_advertise();
         if (!ble_svc_peer_bonded()) {
-            lcd_ui_row(10, "PRESS BTN TO PAIR", 0);
+            lcd_ui_row(10, "PRESS BTN: PAIR", 0);
         }
     } else {
         ESP_LOGE(TAG, "ble_svc_init failed");
@@ -205,7 +211,7 @@ void app_main(void)
                 run_portal_action(pend);
             } else if (!ble_svc_peer_bonded()) {
                 if (ble_svc_open_pairing() == ESP_OK) {
-                    lcd_ui_row(11, "PAIR 120S — PIN ->", 1);
+                    lcd_ui_row(11, "PAIRING 120S", 1);
                 }
             }
         }
@@ -225,7 +231,7 @@ void app_main(void)
         if (portal_saved_flag && netw_mode() == NETW_MODE_AP) {
             portal_saved_flag = false;
             if (settings_load(&cfg) == ESP_OK && cfg.magic_valid) {
-                lcd_ui_row(11, "SAVED — JOINING", 1);
+                lcd_ui_row(11, "SAVED - JOINING", 1);
                 netw_leave_ap();
                 netw_enter_sta(&cfg);
                 provisioned = true;
@@ -238,9 +244,14 @@ void app_main(void)
             jrn_tick(now);         /* 60-s evidence batch flush        */
             ble_svc_pairing_tick(now);   /* 120-s window / 60-s try   */
             netw_refresh_rssi();
-            if (netw_mode() != NETW_MODE_AP &&
-                !ble_svc_pairing_open() &&          /* keep PIN shown  */
-                !(ble_svc_connected() && !ble_svc_authorized())) {
+            if (ble_svc_pin_visible()) {
+                s_pin_up = true;        /* PIN screen owns the LCD    */
+            } else {
+                if (s_pin_up) {         /* PIN closed — repaint chrome */
+                    s_pin_up = false;
+                    lcd_ui_clear();
+                    lcd_ui_headline("SOMNOPAL");
+                }
                 ui_tick();
             }
         }

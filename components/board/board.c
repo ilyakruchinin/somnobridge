@@ -15,12 +15,36 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "board";
 
 static esp_lcd_panel_handle_t s_panel;
+static SemaphoreHandle_t s_color_done;
 static int64_t s_btn_down_us = -1;
+
+/* draw_bitmap() only queues the SPI transaction — the pixel buffer must
+ * stay valid until this ISR fires. lcd_ui uses one static row buffer, so
+ * every draw waits for the previous transfer to drain before returning. */
+static bool lcd_color_done(esp_lcd_panel_io_handle_t io,
+                           esp_lcd_panel_io_event_data_t *edata,
+                           void *user_ctx)
+{
+    (void)io; (void)edata; (void)user_ctx;
+    BaseType_t hp = pdFALSE;
+    if (s_color_done) {
+        xSemaphoreGiveFromISR(s_color_done, &hp);
+    }
+    return hp == pdTRUE;
+}
+
+void board_lcd_wait_done(void)
+{
+    if (s_color_done) {
+        xSemaphoreTake(s_color_done, pdMS_TO_TICKS(2000));
+    }
+}
 
 /* Debounce/hold timing (spec §2.1) */
 #define BTN_DEBOUNCE_US     (30 * 1000)
@@ -64,6 +88,7 @@ esp_err_t board_init(void)
     ESP_RETURN_ON_ERROR(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO),
                         TAG, "spi bus");
 
+    s_color_done = xSemaphoreCreateBinary();
     esp_lcd_panel_io_spi_config_t io_cfg = {
         .cs_gpio_num = BOARD_PIN_LCD_CS,
         .dc_gpio_num = BOARD_PIN_LCD_DC,
@@ -72,6 +97,7 @@ esp_err_t board_init(void)
         .trans_queue_depth = 8,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
+        .on_color_trans_done = lcd_color_done,
     };
     esp_lcd_panel_io_handle_t io;
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi(SPI2_HOST, &io_cfg, &io),
@@ -91,8 +117,11 @@ esp_err_t board_init(void)
     esp_lcd_panel_reset(s_panel);
     esp_lcd_panel_init(s_panel);
     /* Native portrait scan: 135x240 window at (52,40) in panel RAM,
-     * mirrored on both axes, colors inverted (board vendor config). */
-    esp_lcd_panel_mirror(s_panel, true, true);
+     * no mirroring, colors inverted. On this unit the un-mirrored
+     * scan is a 180-degree-rotated view of the nominal orientation:
+     * row 0 sits at the USB end and text reads normally with the
+     * device held USB-connector-up. */
+    esp_lcd_panel_mirror(s_panel, false, false);
     esp_lcd_panel_invert_color(s_panel, true);
     esp_lcd_panel_disp_on_off(s_panel, true);
 
@@ -102,6 +131,7 @@ esp_err_t board_init(void)
         static uint16_t black[240 * 16];
         for (int y = 0; y < 320; y += 16) {
             esp_lcd_panel_draw_bitmap(s_panel, 0, y, 240, y + 16, black);
+            board_lcd_wait_done();
         }
     }
     esp_lcd_panel_set_gap(s_panel, 52, 40);

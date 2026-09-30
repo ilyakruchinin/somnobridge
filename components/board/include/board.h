@@ -44,7 +44,7 @@ extern "C" {
 #define BOARD_LCD_HRES       135   /* panel is 240x135, rotated: width=135 */
 #define BOARD_LCD_VRES       240   /* rotated portrait: height=240         */
 #define BOARD_LCD_ROWS        15   /* 240 / 16 px font                     */
-#define BOARD_LCD_COLS        22   /* 135 / 6 px font pitch                */
+#define BOARD_LCD_COLS        16   /* 135 / 8 px font pitch (font8x16)     */
 
 typedef enum {
     BOARD_BTN_NONE = 0,
@@ -84,6 +84,10 @@ void lcd_ui_footer(const char *text);
 
 /* Full-screen two-line centre display (PINs, passwords). */
 void lcd_ui_pin_screen(const char *title, const char *code, const char *hint);
+
+/* Block until the last queued SPI color transfer has drained — callers
+ * that reuse a pixel buffer must wait before rewriting it. */
+void board_lcd_wait_done(void);
 
 #ifdef __cplusplus
 }

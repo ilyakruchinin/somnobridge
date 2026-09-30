@@ -31,6 +31,7 @@ void lcd_ui_clear(void)
     for (int y = 0; y < BOARD_LCD_VRES; y += FONT_H) {
         esp_lcd_panel_draw_bitmap(board_lcd_panel(), 0, y,
                                   BOARD_LCD_HRES, y + FONT_H, s_rowbuf);
+        board_lcd_wait_done();
     }
 }
 
@@ -67,6 +68,9 @@ void lcd_ui_row(int row, const char *text, int invert)
     int y = row * FONT_H;
     esp_lcd_panel_draw_bitmap(board_lcd_panel(), 0, y,
                               BOARD_LCD_HRES, y + FONT_H, s_rowbuf);
+    /* draw_bitmap queues the DMA — don't let the next row rewrite
+     * s_rowbuf while the SPI transfer is still reading it          */
+    board_lcd_wait_done();
 }
 
 int lcd_ui_rowf(int row, int invert, const char *fmt, ...)
