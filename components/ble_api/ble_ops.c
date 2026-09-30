@@ -54,8 +54,42 @@ static TaskHandle_t s_ble_task;
 
 /* ---------------- JSON helpers ---------------- */
 
-static uint16_t send_json_response(uint32_t rid, const char *json,
-                                   size_t len)
+/* Append `in` at *o as a JSON string body, escaping \ and ".
+ * Card paths are Windows-style ("A:\DATALOG\20260930") so raw
+ * backslashes would otherwise make the response invalid JSON. */
+static void json_append_escaped(char *buf, size_t cap, size_t *o,
+                                const char *in)
+{
+    for (; in && *in && *o + 3 < cap; in++) {
+        unsigned char c = (unsigned char)*in;
+        if (c == '\\' || c == '"') {
+            buf[(*o)++] = '\\';
+        }
+        buf[(*o)++] = (char)c;
+    }
+    buf[*o] = '\0';
+}
+
+/* Outbound JSON responses are handed to a worker task rather than sent
+ * inline. Every fragment is an ATT indication, and NimBLE will not free
+ * its tx buffers until the peer confirms each one — those confirmations
+ * are processed by the NimBLE host task's own event loop. Waiting
+ * inside the host task (where op handlers run) can therefore never let
+ * a confirmation land: vTaskDelay yields the CPU but does not re-enter
+ * that loop, so anything past the few fragments that fit in the tx
+ * queue is dropped. From a separate task the wait works.            */
+
+typedef struct {
+    uint32_t rid;
+    size_t   len;
+    char    *json;                 /* heap copy                        */
+} tx_msg_t;
+
+static QueueHandle_t s_txq;
+static TaskHandle_t  s_tx_task;
+
+/* Fragment + send one JSON message. Safe only off the host task. */
+static uint16_t send_json_now(uint32_t rid, const char *json, size_t len)
 {
     uint16_t mtu = ble_svc_att_mtu();
     /* blep_build_frame takes the whole ATT payload budget (header +
@@ -79,12 +113,50 @@ static uint16_t send_json_response(uint32_t rid, const char *json,
                                        rid, off,
                                        (const uint8_t *)json + off, n,
                                        first, last);
-        if (!ble_svc_control_indicate(frame, fl)) {
-            return off;
+        int tries = 0;
+        while (!ble_svc_control_indicate(frame, fl)) {
+            if (!ble_svc_authorized()) {
+                return off;
+            }
+            if (++tries >= 250) {            /* ~5 s */
+                ESP_LOGW("ble", "indicate stalled at off=%u/%u",
+                         (unsigned)off, (unsigned)len);
+                return off;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
         off += n;
     }
     return off;
+}
+
+/* Queue a JSON response for the BLE worker task. */
+static void send_json_response(uint32_t rid, const char *json, size_t len)
+{
+    if (!s_txq || !json) {
+        return;
+    }
+    tx_msg_t m = { .rid = rid, .len = len, .json = malloc(len + 1) };
+    if (!m.json) {
+        return;
+    }
+    memcpy(m.json, json, len);
+    m.json[len] = '\0';
+    if (xQueueSend(s_txq, &m, 0) != pdTRUE) {
+        ESP_LOGW("ble", "tx queue full — response dropped");
+        free(m.json);
+    }
+}
+
+static void ble_tx_task(void *arg)
+{
+    tx_msg_t m;
+    for (;;) {
+        if (xQueueReceive(s_txq, &m, portMAX_DELAY) == pdTRUE) {
+            send_json_now(m.rid, m.json, m.len);
+            free(m.json);
+        }
+    }
 }
 
 static void send_error(uint32_t rid, const char *op, const char *code)
@@ -141,14 +213,10 @@ static void send_stream_end(uint32_t rid, const char *op,
     }
     msg[h + il] = '}';
     msg[total] = '\0';
-    for (int i = 0; i < 20; i++) {
-        if (send_json_response(rid, msg, total) == total) {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-        if (i == 19) {
-            ESP_LOGW("ble", "STREAM_END indication undelivered");
-        }
+    /* runs on the stream task, so the synchronous send (with its
+     * confirmation wait) is safe here — see send_json_now */
+    if (send_json_now(rid, msg, total) != total) {
+        ESP_LOGW("ble", "STREAM_END indication undelivered");
     }
     free(msg);
 }
@@ -334,16 +402,24 @@ static void op_list_dir(uint32_t rid, cJSON *args)
     size_t cap = 96 + (size_t)n * 160;
     char *buf = malloc(cap);
     if (!buf) { free(ents); send_error(rid, OP_LIST_DIRECTORY, EC_RESOURCE_LIMIT); return; }
-    int o = snprintf(buf, cap, "{\"directory\":\"%s\",\"files\":[", canon);
-    for (int i = 0; i < n && o < (int)cap - 200; i++) {
+    size_t o = (size_t)snprintf(buf, cap, "{\"directory\":\"");
+    json_append_escaped(buf, cap, &o, canon);
+    o += (size_t)snprintf(buf + o, cap - o, "\",\"files\":[");
+    for (int i = 0; i < n && o < cap - 200; i++) {
         if (ents[i].is_dir) continue;
-        o += snprintf(buf + o, cap - o,
-            "{\"name\":\"%s\",\"size\":\"%llu\",\"ts\":%s%s%s}%s",
-            ents[i].name, (unsigned long long)ents[i].size,
-            ents[i].has_timestamp ? "\"" : "",
-            ents[i].has_timestamp ? ents[i].timestamp_raw : "null",
-            ents[i].has_timestamp ? "\"" : "",
-            ",");
+        o += (size_t)snprintf(buf + o, cap - o, "{\"name\":\"");
+        json_append_escaped(buf, cap, &o, ents[i].name);
+        o += (size_t)snprintf(buf + o, cap - o,
+                              "\",\"size\":\"%llu\",\"ts\":",
+                              (unsigned long long)ents[i].size);
+        if (ents[i].has_timestamp) {
+            o += (size_t)snprintf(buf + o, cap - o, "\"");
+            json_append_escaped(buf, cap, &o, ents[i].timestamp_raw);
+            o += (size_t)snprintf(buf + o, cap - o, "\"");
+        } else {
+            o += (size_t)snprintf(buf + o, cap - o, "null");
+        }
+        o += (size_t)snprintf(buf + o, cap - o, "},");
     }
     if (o > 0 && buf[o-1] == ',') o--;      /* trim trailing comma */
     snprintf(buf + o, cap - o, "]}");
@@ -453,13 +529,21 @@ static void op_get_file(uint32_t rid, cJSON *args)
         }
     }
 
-    /* STREAM_BEGIN */
-    char begin[512];
-    snprintf(begin, sizeof(begin),
-        "{\"stream_type\":\"file\",\"directory\":\"%s\",\"name\":\"%s\","
-        "\"expected_size\":\"%llu\",\"cached_size_at_start\":\"%llu\","
+    /* STREAM_BEGIN (heap: this runs on the NimBLE host task, whose
+     * stack must stay small) */
+    char *begin = malloc(640);
+    if (!begin) {
+        send_error(rid, OP_GET_FILE, EC_RESOURCE_LIMIT);
+        return;
+    }
+    size_t bo = (size_t)snprintf(begin, 640,
+        "{\"stream_type\":\"file\",\"directory\":\"");
+    json_append_escaped(begin, 640, &bo, canon);
+    bo += (size_t)snprintf(begin + bo, 640 - bo, "\",\"name\":\"");
+    json_append_escaped(begin, 640, &bo, nv->valuestring);
+    snprintf(begin + bo, 640 - bo,
+        "\",\"expected_size\":\"%llu\",\"cached_size_at_start\":\"%llu\","
         "\"content_length\":\"%llu\",\"source_before\":{\"size\":\"%llu\",\"ts\":%s%s%s}}",
-        canon, nv->valuestring,
         (unsigned long long)s_stream.src_size,
         (unsigned long long)s_stream.src_size,
         (unsigned long long)s_stream.src_size,
@@ -476,6 +560,7 @@ static void op_get_file(uint32_t rid, cJSON *args)
     strncpy(s_stream.name, nv->valuestring, sizeof(s_stream.name)-1);
     strncpy(s_stream.day, day, CAT_DAY_STR-1);
     send_ok(rid, "STREAM_BEGIN", begin);   /* piggybacks rid          */
+    free(begin);
 
     /* initial credit comes as the first ACK (offset 0 + window) — the
      * task below waits for it then drives ezs_download.            */
@@ -794,6 +879,8 @@ static void op_get_drift(uint32_t rid, cJSON *args)
     if (ls) {
         /* fall through to refit+serialize below                     */
     } else {
+        ESP_LOGW("ble", "GET_DRIFT: no session (live=%d closed=%d)",
+                 (int)drift_live_is(), (int)drift_last_closed());
         /* nothing observed this boot — serve the latest record that
          * survived in metadata NVS, else report unavailable          */
         char *stored = malloc(8192);
@@ -823,15 +910,22 @@ static void op_get_drift(uint32_t rid, cJSON *args)
     drift_record_t rec;
     drift_build_record(ls, &rec);
     snprintf(rec.record_key, sizeof(rec.record_key), "cur");
-    char files[256];
-    snprintf(files, sizeof(files),
-             "[{\"dir\":\"%s\",\"name\":\"%s\"}]",
-             dv->valuestring, nv->valuestring);
+    char *files = malloc(512);
+    if (!files) {
+        send_error(rid, OP_GET_DRIFT, EC_RESOURCE_LIMIT);
+        return;
+    }
+    size_t fo = (size_t)snprintf(files, 512, "[{\"dir\":\"");
+    json_append_escaped(files, 512, &fo, dv->valuestring);
+    fo += (size_t)snprintf(files + fo, 512 - fo, "\",\"name\":\"");
+    json_append_escaped(files, 512, &fo, nv->valuestring);
+    snprintf(files + fo, 512 - fo, "\"}]");
     char *buf = malloc(4096);
     if (!buf) { send_error(rid, OP_GET_DRIFT, EC_RESOURCE_LIMIT); return; }
     drift_record_json(&rec, files, NULL, buf, 4096);
     send_ok(rid, OP_GET_DRIFT, buf);
     free(buf);
+    free(files);
 }
 
 /* ---------------- write dispatch ---------------- */
@@ -913,6 +1007,11 @@ int ble_ops_on_subscribe(uint16_t conn, uint16_t attr, bool sub)
 esp_err_t ble_ops_init(void)
 {
     blep_reasm_init(&s_reasm);
+    s_txq = xQueueCreate(8, sizeof(tx_msg_t));
+    if (!s_txq) {
+        return ESP_ERR_NO_MEM;
+    }
+    xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 6, &s_tx_task);
     xTaskCreate(ble_stream_task, "ble_stream", 6144, NULL, 8,
                 &s_ble_task);
     return ESP_OK;

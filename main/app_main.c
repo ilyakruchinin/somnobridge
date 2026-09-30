@@ -14,6 +14,7 @@
 #include "drift.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -114,7 +115,8 @@ static void ui_tick(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "SomnoPal boot");
+    ESP_LOGI(TAG, "SomnoPal boot (reset reason %d)",
+             (int)esp_reset_reason());
 
     /* DIAG: quiet chatty drivers so NimBLE SM trace survives the UART */
     esp_log_level_set("spi_master", ESP_LOG_WARN);
@@ -185,7 +187,7 @@ void app_main(void)
     }
 
     /* 6. card worker task — the only HTTP owner (spec §13.1)         */
-    xTaskCreate(card_task, "card", 8192, NULL, 5, NULL);
+    xTaskCreate(card_task, "card", 16384, NULL, 5, NULL);
 
     esp_task_wdt_add(NULL);
 

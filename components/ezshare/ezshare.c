@@ -17,6 +17,8 @@
 #define HTTP_TOTAL_MS           5000   /* listings; GET uses its own   */
 #define BODY_CHUNK_CAP          4096
 
+static const char *TAG = "ezshare";
+
 static uint32_t      s_card_ip;
 static ezw_range_cap_t s_range = EZW_RANGE_UNKNOWN;
 
@@ -65,7 +67,8 @@ static void canon_to_fdir(const char *canon, char *out, size_t cap)
     }
 }
 
-static esp_http_client_handle_t open_get(const char *url, bool is_file)
+static esp_http_client_handle_t open_get(const char *url, bool is_file,
+                                         ezw_obs_t *obs)
 {
     esp_http_client_config_t cfg = {
         .url = url,
@@ -78,12 +81,27 @@ static esp_http_client_handle_t open_get(const char *url, bool is_file)
     };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (!c) {
+        obs->transport = ESP_FAIL;
         return NULL;
     }
     /* Request freshness; card may ignore — we never rely on it (§11.2). */
     esp_http_client_set_header(c, "Cache-Control", "no-cache");
     esp_http_client_set_header(c, "Pragma", "no-cache");
     if (esp_http_client_open(c, 0) != ESP_OK) {
+        esp_http_client_cleanup(c);
+        obs->transport = ESP_FAIL;
+        return NULL;
+    }
+    /* esp_http_client_open() only *sends* the request: response->
+     * status_code stays 0 until the response headers are read, and
+     * esp_http_client_get_status_code() merely returns that field. Not
+     * reading them here makes every request look like a transport
+     * failure (status 0), so the card is never usable — the real status
+     * is what §11.2 decisions are built on.                          */
+    int64_t hdr = esp_http_client_fetch_headers(c);
+    obs->http_status = esp_http_client_get_status_code(c);
+    if (hdr < 0 || obs->http_status <= 0) {
+        obs->transport = hdr < 0 ? ESP_FAIL : ESP_OK;
         esp_http_client_cleanup(c);
         return NULL;
     }
@@ -106,7 +124,7 @@ esp_err_t ezs_list_dir(const char *canon_dir,
     build_url(url, sizeof(url), "dir", "dir", canon_dir, NULL, NULL);
 
     obs->req_start_us = esp_timer_get_time();
-    esp_http_client_handle_t c = open_get(url, false);
+    esp_http_client_handle_t c = open_get(url, false, obs);
     if (!c) {
         obs->resp_end_us = esp_timer_get_time();
         obs->transport = ESP_FAIL;
@@ -156,6 +174,23 @@ esp_err_t ezs_list_dir(const char *canon_dir,
     }
     obs->transport = ESP_OK;
     obs->parse = ezs_parse_dir(body, entries, n_out);
+    if (obs->parse != EZS_OK) {
+        /* Real card firmware varies; the body is the only way to see
+         * what grammar was actually returned (metadata only, no data). */
+        char snip[201];
+        for (size_t base = 0; base < got; base += sizeof(snip) - 1) {
+            size_t n = got - base < sizeof(snip) - 1 ? got - base
+                                                     : sizeof(snip) - 1;
+            for (size_t i = 0; i < n; i++) {
+                unsigned char ch = (unsigned char)body[base + i];
+                snip[i] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '.';
+            }
+            snip[n] = '\0';
+            ESP_LOGW(TAG, "body[%lu]: %s", (unsigned long)base, snip);
+        }
+        ESP_LOGW(TAG, "parse err=%d (%lu B)", obs->parse,
+                 (unsigned long)got);
+    }
     free(body);
     return obs->parse == EZS_OK ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
@@ -174,7 +209,7 @@ esp_err_t ezs_client_version(char *buf, size_t cap, ezw_obs_t *obs)
              (unsigned long)s_card_ip & 255);
 
     obs->req_start_us = esp_timer_get_time();
-    esp_http_client_handle_t c = open_get(url, false);
+    esp_http_client_handle_t c = open_get(url, false, obs);
     if (!c) {
         obs->resp_end_us = esp_timer_get_time();
         return ESP_FAIL;
@@ -213,7 +248,7 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
               "fname", name, "fdir", fdir);
 
     obs->req_start_us = esp_timer_get_time();
-    esp_http_client_handle_t c = open_get(url, true);
+    esp_http_client_handle_t c = open_get(url, true, obs);
     if (!c) {
         obs->resp_end_us = esp_timer_get_time();
         return ESP_FAIL;
@@ -322,6 +357,14 @@ esp_err_t ezs_probe_header(const char *canon_dir, const char *name,
         if (esp_http_client_open(c, 0) != ESP_OK) {
             esp_http_client_cleanup(c);
             obs->resp_end_us = esp_timer_get_time();
+            obs->transport = ESP_FAIL;
+            return ESP_FAIL;
+        }
+        /* headers must be read before the status code means anything  */
+        if (esp_http_client_fetch_headers(c) < 0) {
+            esp_http_client_cleanup(c);
+            obs->resp_end_us = esp_timer_get_time();
+            obs->transport = ESP_FAIL;
             return ESP_FAIL;
         }
         obs->http_status = esp_http_client_get_status_code(c);

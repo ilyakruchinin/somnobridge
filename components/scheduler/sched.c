@@ -205,6 +205,8 @@ static void estim_on_growth(const char *day, const cat_file_t *grown,
         drift_live_begin(SESS_CACHE_BOUND_US, SESS_JITTER_US,
                          day, grown->name);
         ls = drift_live();
+        ESP_LOGI(TAG, "estim: opened session day=%s beacon=%s live=%d",
+                 day, grown->name, (int)drift_live_is());
     }
     char bday[CAT_DAY_STR], bname[96];
     const char *bn = drift_live_beacon(bday, bname);
@@ -241,15 +243,39 @@ static void estim_on_growth(const char *day, const cat_file_t *grown,
             s_prev_est = now_est;
         }
     }
-    /* one early probe while the file is still small enough (§8.2)    */
-    if (!ls->header_known && !drift_live_probe_used() &&
-        grown->size <= PROBE_BUF_BYTES &&
-        strstr(grown->name, ".edf") != NULL) {
-        drift_live_probe_mark();
-        sched_job_t pj = { .kind = JOB_PROBE, .prio = 2 };
-        strncpy(pj.dir, day, JOB_DIR_MAX - 1);
-        strncpy(pj.name, grown->name, JOB_NAME_MAX - 1);
-        sched_submit(&pj);
+    /* One early probe per observed file set (§8.2). Every file in a
+     * session shares the EDF layout, so probe the smallest listed
+     * candidate ≤16 KiB rather than the beacon itself — the beacon is
+     * whatever grows first and is usually the largest file (BRP).    */
+    if (!ls->header_known && !drift_live_probe_used()) {
+        int n = cat_day_entries(day, NULL, 0);
+        if (n > 0) {
+            cat_file_t *files = malloc((size_t)n * sizeof(cat_file_t));
+            if (files) {
+                cat_day_entries(day, files, n);
+                const cat_file_t *best = NULL;
+                for (int i = 0; i < n; i++) {
+                    if (!strstr(files[i].name, ".edf") ||
+                        files[i].size == 0 ||
+                        files[i].size > PROBE_BUF_BYTES) {
+                        continue;
+                    }
+                    if (!best || files[i].size < best->size) {
+                        best = &files[i];
+                    }
+                }
+                if (best) {
+                    drift_live_probe_mark();
+                    sched_job_t pj = { .kind = JOB_PROBE, .prio = 2 };
+                    strncpy(pj.dir, day, JOB_DIR_MAX - 1);
+                    strncpy(pj.name, best->name, JOB_NAME_MAX - 1);
+                    sched_submit(&pj);
+                    ESP_LOGI(TAG, "probe queued: %s (%llu B)", best->name,
+                             (unsigned long long)best->size);
+                }
+                free(files);
+            }
+        }
     }
 }
 
@@ -322,6 +348,10 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
         } else {
             s_round_failed = true;
             obs_success(false);
+            ESP_LOGW(TAG, "list %s failed: http=%d transport=%d parse=%d "
+                     "body=%lu", "A:\\DATALOG", r->obs.http_status,
+                     r->obs.transport, r->obs.parse,
+                     (unsigned long)r->obs.body_bytes);
         }
         break;
     }
@@ -343,12 +373,18 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
                 therapy_on_growth(now);   /* relevant write (§7.1)     */
                 estim_on_growth(j->dir, &grown, &r->obs);  /* §8.3     */
             }
+            ESP_LOGI(TAG, "day %s: %d listed, changed=%d grown=%s",
+                     j->dir, r->n_entries, (int)changed,
+                     grown.name[0] ? grown.name : "-");
             ledger_add(therapy_status()->state != THERAPY_OUT, now);
             obs_success(true);
         } else {
             s_round_failed = true;
             cat_mark_folder_stale(j->dir);
             obs_success(false);
+            ESP_LOGW(TAG, "day %s failed: http=%d transport=%d parse=%d",
+                     j->dir, r->obs.http_status, r->obs.transport,
+                     r->obs.parse);
         }
         break;
     }
@@ -362,13 +398,10 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
         break;
     }
     case JOB_PROBE: {
-        /* bounded header read of the beacon file (§8.2): bytes
-         * [0, listed_size) capped at 16 KiB, once per file set.       */
+        /* bounded header read of one file in the observed set (§8.2):
+         * bytes [0, listed_size) capped at 16 KiB, once per file set. */
         drift_session_t *ls = drift_live();
-        char bday[CAT_DAY_STR], bname[96];
-        if (!ls || ls->header_known ||
-            !drift_live_beacon(bday, bname) ||
-            strcmp(j->name, bname) != 0) {
+        if (!ls || ls->header_known) {
             r->err = ESP_ERR_INVALID_STATE;
             break;
         }
@@ -407,6 +440,10 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
                 ESP_LOGW(TAG, "probe: not parseable EDF (%u B)",
                          (unsigned)got);
             }
+        } else {
+            ESP_LOGW(TAG, "probe %s failed: http=%d transport=%d got=%u",
+                     j->name, r->obs.http_status, r->obs.transport,
+                     (unsigned)got);
         }
         free(buf);
         obs_success(r->err == ESP_OK);

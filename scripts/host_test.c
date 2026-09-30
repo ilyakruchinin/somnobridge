@@ -128,15 +128,25 @@ static int fails;
 
 /* ---------------- EZShare parser ---------------- */
 
-/* grammar per ezs_parse.h:
- *   <a href="download?fname=N&fdir=D">N</a>  timestamp  size
- *   <a href="dir?dir=D">N/</a>               timestamp  <DIR>          */
+/* grammar per the live card (see ezs_parse.c):
+ *   <ts>  <size|<DIR>>  <a href="...">name</a>
+ * timestamp fields are space padded, <DIR> arrives entity-escaped and
+ * the link text is padded — all captured from a real EZShare card.   */
 static const char *k_listing =
-    "<html><body><pre>\r\n"
-    "<a href=\"dir?dir=..%5CDATALOG%5C20240101\">20240101/</a>"
-    "              2024-01-01 12:00:00 <DIR>\r\n"
-    "<a href=\"download?fname=STR.edf&fdir=..\">STR.edf</a>"
-    "              2024-01-02 03:04:05 1234\r\n"
+    "<html><body><h1>Directory Index of A:\\DATALOG</h1><pre>\r\n"
+    "   2026- 8-14    4: 8:32         &lt;DIR&gt;   "
+    "<a href=\"dir?dir=A:%5CDATALOG%5C20240101\"> 20240101</a>\r\n"
+    "   2026- 8-14    4: 8:32         &lt;DIR&gt;   "
+    "<a href=\"dir?dir=A:\"> ..</a>\r\n"
+    "   2024- 1- 2    3: 4: 5             1234   "
+    "<a href=\"download?fname=STR.edf&fdir=..\">STR.edf</a>\r\n"
+    "   2026- 9-30   13:57:44           1KB   "
+    "<a href=\"http://192.168.4.1/download?file=DATALOG%5C20240101%5C202609~1.EDF\">"
+    " STR.edf</a>\r\n"
+    "   2026- 9-30   14: 9:52          72KB   "
+    "<a href=\"http://192.168.4.1/download?file=DATALOG%5C20240101%5C202609~5.EDF\">"
+    " 20240101_235752_BRP.edf</a>\r\n"
+    "Total Entries: 4.Total Size: 73KB.\r\n"
     "</pre></body></html>";
 
 static void test_parser(void)
@@ -144,13 +154,20 @@ static void test_parser(void)
     ezs_entry_t e[8];
     int n = 0;
     CHECK(ezs_parse_dir(k_listing, e, &n) == EZS_OK, "valid listing");
-    CHECK(n == 2, "two entries");
-    if (n == 2) {
-        int fi = e[0].is_dir ? 1 : 0;    /* index of the FILE row     */
-        CHECK(e[fi].size == 1234 && !strcmp(e[fi].name, "STR.edf"),
-              "file row size/name");
-        CHECK(e[fi].has_timestamp, "file timestamp kept");
-        CHECK(e[1 - fi].is_dir, "dir row flagged");
+    CHECK(n == 4, "four entries (nav row skipped)");
+    if (n == 4) {
+        /* row 0 = dir; row 1 = documented ?fname= form (raw bytes);
+         * rows 2-3 = the real card: absolute href, ?file=, KB-rounded
+         * size and the alias carried in the link text */
+        CHECK(e[0].is_dir && !strcmp(e[0].name, "20240101"),
+              "dir row + trimmed name");
+        CHECK(!strcmp(e[1].name, "STR.edf") && e[1].size == 1234,
+              "fname= form keeps raw bytes");
+        CHECK(!strcmp(e[2].name, "STR.edf") && e[2].size == 1024,
+              "?file= form: KB size + alias from link text");
+        CHECK(!strcmp(e[3].name, "20240101_235752_BRP.edf") &&
+              e[3].size == 72 * 1024, "72KB row");
+        CHECK(e[2].has_timestamp, "file timestamp kept");
     }
 
     const char *login = "<html><form action=\"/login\"></form></html>";
@@ -164,7 +181,8 @@ static void test_parser(void)
     CHECK(ezs_parse_dir(trunc, e, &n) != EZS_OK, "truncated rejected");
 
     const char *evil =
-        "<pre><a href=\"http://evil/x\">x.bin</a> 2024-01-01 00:00:00 10</pre>";
+        "<pre> 2024-01-01 00:00:00 10 "
+        "<a href=\"http://evil/x\">x.bin</a></pre>";
     CHECK(ezs_parse_dir(evil, e, &n) != EZS_OK, "external link rejected");
 }
 

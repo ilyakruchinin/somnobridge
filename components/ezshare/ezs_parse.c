@@ -96,18 +96,173 @@ bool ezs_is_valid_day(const char *name)
 
 /* ---------------- row scanner ---------------- */
 /*
- * Row shapes we accept inside <pre> (from SomnoTrace's files-over-http.md):
- *   dir : <a href="dir?dir=A:\DATALOG\20260713">20260713</a>  ts  <DIR>
- *   file: <a href="download?fname=X&fdir=Y">NAME</a>  ts  SIZE
- * Timestamps may be "-" or absent entirely.
+ * Row shape emitted by the actual EZShare card firmware (captured from
+ * a live card, §11.2 "expected syntax comes from evidence"):
+ *
+ *     <ts>   <size | <DIR>>   <a href="...">name</a>
+ *
+ * e.g.
+ *    2026- 8-14    4: 8:32         &lt;DIR&gt;   <a href="dir?dir=A:%5CDATALOG%5C20260814"> 20260814</a>
+ *    2026- 9-30    5: 5: 0             20480   <a href="download?fname=X&fdir=..">X</a>
+ *
+ * Notes that matter: the metadata precedes the anchor (the reverse of
+ * the layout the docs illustrated), the timestamp fields are space
+ * padded, <DIR> arrives entity-escaped, and the link text is padded.
+ * The trailing "Total Entries:" summary line carries no anchor and is
+ * structure, not a row.
  */
 
-typedef struct {
-    const char *p;        /* cursor into body                      */
-    bool        eof;      /* ran off the end                       */
-} scan_t;
+/* Parse the metadata prefix before the anchor: timestamp + size/<DIR>. */
+static ezs_err_t meta_parse(const char *m, ezs_entry_t *e)
+{
+    e->has_timestamp = false;
+    e->timestamp_raw[0] = '\0';
+    e->is_dir = false;
+    e->size = 0;
 
-/* Find next '<a href="..."' inside pre body; returns link text span. */
+    const char *dir = strstr(m, "<DIR>");        /* already decoded    */
+    const char *endp = m + strlen(m);
+    while (endp > m && isspace((unsigned char)endp[-1])) {
+        endp--;
+    }
+    const char *tok = endp;                      /* last token         */
+    while (tok > m && !isspace((unsigned char)tok[-1])) {
+        tok--;
+    }
+
+    size_t tl;
+    if (dir) {
+        e->is_dir = true;
+        tl = (size_t)(dir - m);
+    } else {
+        /* size token: digits with an optional K/M/G[..B] suffix — the
+         * card rounds file sizes for display ("1KB", "72KB")          */
+        uint64_t sz = 0;
+        int nd = 0;
+        const char *q = tok;
+        while (q < endp && isdigit((unsigned char)*q)) {
+            sz = sz * 10 + (uint64_t)(*q - '0');
+            if (++nd > 19) {
+                return EZS_ERR_MALFORMED;        /* > uint64 range     */
+            }
+            q++;
+        }
+        if (nd == 0) {
+            return EZS_ERR_MALFORMED;
+        }
+        unsigned shift = 0;
+        if (q < endp) {
+            char u = (char)toupper((unsigned char)*q);
+            if (u == 'K') {
+                shift = 10;
+            } else if (u == 'M') {
+                shift = 20;
+            } else if (u == 'G') {
+                shift = 30;
+            } else {
+                return EZS_ERR_MALFORMED;
+            }
+            q++;
+            if (q < endp && toupper((unsigned char)*q) == 'B') {
+                q++;
+            }
+        }
+        if (q != endp || sz > (UINT64_MAX >> shift)) {
+            return EZS_ERR_MALFORMED;
+        }
+        e->size = sz << shift;
+        tl = (size_t)(tok - m);
+    }
+
+    while (tl > 0 && isspace((unsigned char)m[tl - 1])) {
+        tl--;
+    }
+    if (tl > 0) {
+        size_t n = tl < sizeof(e->timestamp_raw) - 1
+                     ? tl : sizeof(e->timestamp_raw) - 1;
+        memcpy(e->timestamp_raw, m, n);
+        e->timestamp_raw[n] = '\0';
+        e->has_timestamp = true;                 /* raw text (§11.2)   */
+    }
+    return EZS_OK;
+}
+
+/* Resolve an href to its request path. Relative links are used as-is;
+ * absolute ones are accepted only when the authority is an IPv4
+ * literal (the card sits on the local AP and links itself that way).
+ * Anything with a hostname/userinfo is external -> NULL (§11.1).      */
+static const char *href_path(const char *href)
+{
+    const char *p = href;
+    if (!strncmp(p, "http://", 7)) {
+        p += 7;
+    } else if (!strncmp(p, "https://", 8)) {
+        p += 8;
+    } else {
+        return href;                 /* relative: path already       */
+    }
+    int oct = 0, dig = 0;
+    const char *q = p;
+    for (; *q && *q != '/' && *q != ':'; q++) {
+        if (*q == '.') {
+            if (!dig) {
+                return NULL;
+            }
+            oct++;
+            dig = 0;
+        } else if (isdigit((unsigned char)*q)) {
+            dig++;
+        } else {
+            return NULL;             /* hostname / userinfo -> out   */
+        }
+    }
+    if (oct != 3 || !dig) {
+        return NULL;
+    }
+    if (*q == ':') {                 /* optional port                */
+        q++;
+        while (isdigit((unsigned char)*q)) {
+            q++;
+        }
+    }
+    return *q == '/' ? q : NULL;
+}
+
+/* classify an href: dir?dir=... / download?file|fname=... / other */
+static bool href_is_dir(const char *href)
+{
+    const char *p = href_path(href);
+    return p && (!strncmp(p, "dir?", 4) || !strncmp(p, "/dir?", 5));
+}
+static bool href_is_download(const char *href)
+{
+    const char *p = href_path(href);
+    return p && (!strncmp(p, "download?", 9) ||
+                 !strncmp(p, "/download?", 10));
+}
+
+/* Extract fname= value from a download href (already entity-decoded). */
+static bool href_fname(const char *href, char *out, size_t cap)
+{
+    const char *f = strstr(href, "fname=");
+    if (!f) {
+        return false;
+    }
+    f += 6;
+    const char *a = strchr(f, '&');
+    size_t n = a ? (size_t)(a - f) : strlen(f);
+    if (n == 0 || n >= cap) {
+        return false;
+    }
+    memcpy(out, f, n);
+    out[n] = '\0';
+    return true;
+}
+
+
+/* Locate the <pre> listing block; returns its start, sets end.
+ * *end_out is NULL when the closing tag is missing — a truncated body
+ * must be rejected, not silently accepted as a short listing (§11.2). */
 static const char *find_pre(const char *body, const char **end_out)
 {
     const char *pre = strstr(body, "<pre>");
@@ -121,9 +276,6 @@ static const char *find_pre(const char *body, const char **end_out)
     const char *end = strstr(pre, "</pre>");
     if (!end) {
         end = strstr(pre, "</PRE>");
-    }
-    if (!end) {
-        end = body + strlen(body);   /* tolerate missing close tag */
     }
     *end_out = end;
     return pre;
@@ -171,121 +323,26 @@ static const char *link_text(const char *p, const char *end,
         return NULL;
     }
     decode_entities(gt, lt - gt, out, cap);
-    /* strip trailing slash from dir display name */
+    /* this card pads link text with spaces ("> 20260814</a>") — trim
+     * before use or dir names arrive with a leading space            */
     size_t n = strlen(out);
+    size_t s = 0;
+    while (s < n && isspace((unsigned char)out[s])) {
+        s++;
+    }
+    while (n > s && isspace((unsigned char)out[n - 1])) {
+        n--;
+    }
+    if (s) {
+        memmove(out, out + s, n - s);
+    }
+    out[n - s] = '\0';
+    /* strip trailing slash from dir display name */
+    n -= s;
     if (n > 0 && out[n-1] == '/') {
         out[n-1] = '\0';
     }
     return lt;                       /* resume scan after '<'      */
-}
-
-/* Parse trailing timestamp + size after link text end. */
-static ezs_err_t row_tail(const char *p, const char *end,
-                          ezs_entry_t *e, const char **next)
-{
-    /* skip whitespace to the rest of the row */
-    while (p < end && isspace((unsigned char)*p)) {
-        p++;
-    }
-    /* timestamp token(s): "YYYY-MM-DD HH:MM:SS" or "-" or digits.
-     * Take the first space-delimited token, then, if it looks like a
-     * date, optionally the following time token. */
-    const char *tok = p;
-    while (p < end && !isspace((unsigned char)*p) && *p != '<') {
-        p++;
-    }
-    size_t tl = p - tok;
-    e->has_timestamp = false;
-    e->timestamp_raw[0] = '\0';
-
-    if (tl >= 8) {                   /* looks like a date          */
-        char tmp[EZS_STAMP_MAX];
-        size_t n = tl < sizeof(tmp)-1 ? tl : sizeof(tmp)-1;
-        memcpy(tmp, tok, n); tmp[n] = '\0';
-        /* append " HH:MM:SS" if the next token looks like a time   */
-        const char *q = p;
-        while (q < end && isspace((unsigned char)*q)) q++;
-        if (q + 8 <= end && isdigit((unsigned char)q[0]) &&
-            q[2] == ':' && q[5] == ':') {
-            size_t m = n + 1 + 8;
-            if (m < sizeof(tmp)) {
-                tmp[n] = ' ';
-                memcpy(tmp + n + 1, q, 8);
-                tmp[m] = '\0';
-                q += 8;
-            }
-            p = q;
-        }
-        strncpy(e->timestamp_raw, tmp, sizeof(e->timestamp_raw)-1);
-        e->timestamp_raw[sizeof(e->timestamp_raw)-1] = '\0';
-        e->has_timestamp = true;
-    }
-
-    /* size or <DIR> */
-    while (p < end && isspace((unsigned char)*p)) p++;
-    if (p < end && *p == '<') {
-        const char *gt = memchr(p, '>', end - p);
-        if (!gt) {
-            return EZS_ERR_TRUNCATED;
-        }
-        /* <DIR> marker */
-        if (gt - p >= 4 && !strncmp(p, "<DIR>", 5)) {
-            e->is_dir = true;
-            e->size = 0;
-            p = gt + 1;
-            *next = p;
-            return EZS_OK;
-        }
-        /* other tag mid-row -> malformed */
-        return EZS_ERR_MALFORMED;
-    }
-    /* digits = size */
-    uint64_t sz = 0;
-    int nd = 0;
-    while (p < end && isdigit((unsigned char)*p)) {
-        sz = sz * 10 + (*p - '0');
-        if (++nd > 19) {
-            return EZS_ERR_MALFORMED;   /* > uint64 range          */
-        }
-        p++;
-    }
-    if (nd == 0) {
-        return EZS_ERR_MALFORMED;
-    }
-    e->is_dir = false;
-    e->size = sz;
-    *next = p;
-    return EZS_OK;
-}
-
-/* classify an href: dir?dir=... / download?fname=..&fdir=.. / other */
-static bool href_is_dir(const char *href)
-{
-    return strncmp(href, "dir?", 4) == 0 ||
-           strncmp(href, "/dir?", 5) == 0;
-}
-static bool href_is_download(const char *href)
-{
-    return strncmp(href, "download?", 9) == 0 ||
-           strncmp(href, "/download?", 10) == 0;
-}
-
-/* Extract fname= value from a download href (already entity-decoded). */
-static bool href_fname(const char *href, char *out, size_t cap)
-{
-    const char *f = strstr(href, "fname=");
-    if (!f) {
-        return false;
-    }
-    f += 6;
-    const char *a = strchr(f, '&');
-    size_t n = a ? (size_t)(a - f) : strlen(f);
-    if (n == 0 || n >= cap) {
-        return false;
-    }
-    memcpy(out, f, n);
-    out[n] = '\0';
-    return true;
 }
 
 ezs_err_t ezs_parse_dir(const char *body,
@@ -300,46 +357,56 @@ ezs_err_t ezs_parse_dir(const char *body,
     if (!pre) {
         return EZS_ERR_NOT_LISTING;
     }
+    if (!end) {
+        return EZS_ERR_TRUNCATED;    /* no </pre> -> partial response */
+    }
 
     const char *p = pre;
     while (p < end) {
-        /* advance to next anchor tag */
-        const char *a = strstr(p, "<a ");
-        if (!a || a >= end) {
-            /* only whitespace may follow the last row */
-            while (p < end && isspace((unsigned char)*p)) {
-                p++;
-            }
-            if (p < end) {
-                return EZS_ERR_MALFORMED;
-            }
-            break;
+        /* rows are line-oriented on this firmware */
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        const char *le = nl ? nl : end;
+        const char *line = p;
+        p = nl ? nl + 1 : end;
+
+        while (line < le && isspace((unsigned char)*line)) {
+            line++;
         }
-        p = a;
+        while (le > line && isspace((unsigned char)le[-1])) {
+            le--;
+        }
+
+        /* locate the anchor on this line; lines without one are page
+         * structure (e.g. the "Total Entries:" summary), not rows   */
+        const char *a = NULL;
+        for (const char *q = line; q + 2 < le; q++) {
+            if (q[0] == '<' && (q[1] == 'a' || q[1] == 'A') &&
+                isspace((unsigned char)q[2])) {
+                a = q;
+                break;
+            }
+        }
+        if (!a) {
+            continue;
+        }
 
         char href[256], lname[EZS_NAME_MAX];
-        if (href_value(p, end, href, sizeof(href)) < 0) {
+        if (href_value(a, le, href, sizeof(href)) < 0) {
             return EZS_ERR_MALFORMED;
         }
-        const char *lt = link_text(p, end, lname, sizeof(lname));
-        if (!lt) {
+        if (!link_text(a, le, lname, sizeof(lname))) {
             return EZS_ERR_MALFORMED;
         }
-        /* lt points at the '<' of the closing </a>; the timestamp/size
-         * tail begins after that tag's '>'                           */
-        const char *close_end = memchr(lt, '>', end - lt);
-        if (!close_end) {
-            return EZS_ERR_TRUNCATED;
-        }
+
+        char meta[128];
+        decode_entities(line, (size_t)(a - line), meta, sizeof(meta));
 
         ezs_entry_t e;
         memset(&e, 0, sizeof(e));
-        const char *next;
-        ezs_err_t r = row_tail(close_end + 1, end, &e, &next);
+        ezs_err_t r = meta_parse(meta, &e);
         if (r != EZS_OK) {
             return r;
         }
-        p = next;
 
         /* navigation rows */
         if (!strcmp(lname, ".") || !strcmp(lname, "..")) {
@@ -354,8 +421,14 @@ ezs_err_t ezs_parse_dir(const char *body,
         }
         e.is_dir = is_dir;
         if (is_file) {
+            /* the card links files as ?file=<8.3 short name> and puts
+             * the exact alias in the link text, so fall back to that;
+             * an explicit fname= wins when a variant provides one    */
             if (!href_fname(href, e.name, sizeof(e.name))) {
-                return EZS_ERR_MALFORMED;
+                if (!lname[0]) {
+                    return EZS_ERR_MALFORMED;
+                }
+                strncpy(e.name, lname, sizeof(e.name) - 1);
             }
         } else {
             strncpy(e.name, lname, sizeof(e.name) - 1);

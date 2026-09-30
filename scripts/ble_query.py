@@ -237,7 +237,9 @@ class SomnoPal:
         self._write(self.ctrl_path, self._ctrl, blob)
         end = time.monotonic() + timeout
         while time.monotonic() < end:
-            self._pump(0.05)
+            # fine-grained pump: the device serialises indications and
+            # waits for our ATT confirmation, so confirm promptly
+            self._pump(0.005)
             if rid in self._done:
                 return json.loads(self._done.pop(rid))
         raise TimeoutError(f"{op}: no response in {timeout:.0f}s")
@@ -349,8 +351,9 @@ class SomnoPal:
 
     def close(self):
         try:
-            self._ctrl.StopNotify()
-            if self._data:
+            if self._ctrl is not None:
+                self._ctrl.StopNotify()
+            if self._data is not None:
                 self._data.StopNotify()
         except dbus.exceptions.DBusException:
             pass
@@ -409,9 +412,12 @@ def print_days(r):
 
 
 def print_day(r, day):
+    hr(f"LIST_DAY {day}")
+    if not r.get("ok"):
+        print(f"  unavailable: {r.get('error')}")
+        return
     res = r.get("result", {})
     files = res.get("files", [])
-    hr(f"LIST_DAY {day}")
     print(f"  {len(files)} file(s), scan_age_us={res.get('scan_age_us')}")
     for f in files[:20]:
         print(f"    {f.get('name'):<32} {f.get('size'):>10} B  ts={f.get('ts')}")

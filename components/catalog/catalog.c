@@ -16,6 +16,7 @@
 
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -27,12 +28,14 @@ static void *cat_alloc(size_t n)
     return heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 static int64_t now_stub(void) { return esp_timer_get_time(); }
+#define CAT_LOG(...)  ESP_LOGI("cat", __VA_ARGS__)
 #else
 static int s_lock_dummy;
 #define LOCK()    ((void)s_lock_dummy)
 #define UNLOCK()  ((void)s_lock_dummy)
 static void *cat_alloc(size_t n) { return malloc(n); }
 static int64_t now_stub(void) { return 0; }
+#define CAT_LOG(...)  ((void)0)
 #endif
 
 #define CAT_MAX_FOLDERS  366    /* ~1yr of days, hard ceiling         */
@@ -249,6 +252,8 @@ esp_err_t cat_feed_parent(const ezs_entry_t *entries, int n,
         }
         if (!seen[i] && s_folders[i].state != CAT_FOLDER_UNSCANNED &&
             s_folders[i].last_scan_us > 0) {
+            CAT_LOG("parent: %s not seen -> GONE (was state=%d)",
+                    s_folders[i].day, (int)s_folders[i].state);
             s_folders[i].state = CAT_FOLDER_GONE;
             free_files(&s_folders[i]);
         }
@@ -292,6 +297,8 @@ esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
     if (n > 0) {
         nf = cat_alloc((size_t)n * sizeof(cat_file_t));
         if (!nf) {
+            CAT_LOG("feed %s: alloc %u B failed (psram_used=%d)",
+                     day, (unsigned)(n * sizeof(cat_file_t)), s_psram_used);
             return ESP_ERR_NO_MEM;
         }
         s_psram_used += n * (int)sizeof(cat_file_t);
