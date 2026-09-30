@@ -106,10 +106,6 @@ static void ui_tick(void)
                 (unsigned long)sched_backoff_ms());
 }
 
-/* boot-hang bisection: LCD row survives WDT resets (panel RAM) */
-void boot_mark(uint8_t n) { lcd_ui_rowf(14, 0, "MARK %02x", n); }
-#define MARK(n) boot_mark(n)
-
 void app_main(void)
 {
     ESP_LOGI(TAG, "SomnoPal boot");
@@ -130,32 +126,25 @@ void app_main(void)
                        cfg.magic_valid;
     lcd_ui_rowf(2, 0, "CFG:%s SEC:%s",
                 provisioned ? "OK" : "NONE", settings_security_label());
-    MARK(0xa1);
 
     /* 2. evidence journal (may run degraded without security cfg)     */
     err = jrn_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "journal degraded: %s", esp_err_to_name(err));
     }
-    MARK(1);
     jrn_put("event", "\"e\":\"boot\"");
 
     /* 3. volatile catalog + therapy FSM + scheduler                  */
-    MARK(2);
     cat_init();
-    MARK(3);
     err = sched_init();
-    MARK(4);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "sched_init failed");
         lcd_ui_row(9, "SCHED FAIL", 1);
     }
     drift_reset();
-    MARK(5);
 
     /* 4. WiFi — STA with stored config, or fall back to setup AP     */
     err = netw_init();
-    MARK(6);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "netw_init failed");
         lcd_ui_row(9, "WIFI FAIL", 1);
@@ -163,16 +152,13 @@ void app_main(void)
     netw_set_link_cb(on_wifi_link);
     if (provisioned) {
         netw_enter_sta(&cfg);
-        MARK(7);
     } else {
         /* unconfigured: straight to setup AP so the user can pair    */
         netw_enter_ap();
         show_setup_ap();
-        MARK(8);
     }
 
     /* 5. BLE stack — advertises; pairing window opens on button      */
-    MARK(9);
     err = ble_svc_init();
     if (err == ESP_OK) {
         ble_svc_advertise();
@@ -183,11 +169,9 @@ void app_main(void)
         ESP_LOGE(TAG, "ble_svc_init failed");
         lcd_ui_row(10, "BLE FAIL", 1);
     }
-    MARK(10);
 
     /* 6. card worker task — the only HTTP owner (spec §13.1)         */
     xTaskCreate(card_task, "card", 8192, NULL, 5, NULL);
-    MARK(11);
 
     esp_task_wdt_add(NULL);
 

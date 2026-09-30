@@ -42,6 +42,9 @@ static int64_t      s_batch_since_us;
 static char         s_batch[JRN_BATCH_MAX];
 static size_t       s_batch_len;
 static uint8_t      s_next_slot;
+/* full-size read scratch shared by scan_slots/jrn_walk — nvs_get_blob
+ * always returns whole blobs, so callers must pass this capacity     */
+static uint8_t s_slot_buf[sizeof(jrn_hdr_t) + JRN_PAYLOAD_MAX];
 
 static void slot_key(uint8_t slot, char out[4])
 {
@@ -52,65 +55,42 @@ static void slot_key(uint8_t slot, char out[4])
     /* NOTE: 4-char key; nvs key space includes NUL so "b255" is fine  */
 }
 
-/* Find which slot holds sequence `seq` (i.e. slot index used when seq
- * was written); slot rotation is seq % JRN_SLOTS chunks, but one write
- * may span several slots, so ordering uses seq, not slot index.        */
+/* Scan all slots once at boot: bound the live sequence range and resume
+ * rotation after the newest chunk. CRC is verified here so torn or
+ * corrupt blobs can never poison the sequence space (a structurally
+ * plausible header alone is not enough — the mid-write crash loop
+ * proved that). */
 static void scan_slots(void)
 {
-    uint32_t best_lo = UINT32_MAX, best_hi = 0;
+    uint32_t best_lo = UINT32_MAX, best_hi = 0, hi = 0;
     bool any = false;
+    int hi_slot = -1;
     for (int i = 0; i < JRN_SLOTS; i++) {
         char k[5];
         slot_key((uint8_t)i, k);
         k[4] = '\0';
-        size_t need = 0;
-        if (nvs_get_blob(s_nvs, k, NULL, &need) != ESP_OK || need < sizeof(jrn_hdr_t)) {
+        size_t want = sizeof(s_slot_buf);
+        if (nvs_get_blob(s_nvs, k, s_slot_buf, &want) != ESP_OK ||
+            want < sizeof(jrn_hdr_t)) {
             continue;
         }
-        uint8_t buf[sizeof(jrn_hdr_t)];
-        if (nvs_get_blob(s_nvs, k, buf, &need) != ESP_OK) {
-            continue;
-        }
-        jrn_hdr_t *h = (jrn_hdr_t *)buf;
+        const jrn_hdr_t *h = (const jrn_hdr_t *)s_slot_buf;
         if (h->magic != JRN_MAGIC || h->version != JRN_VERSION ||
-            h->len > JRN_PAYLOAD_MAX) {
-            s_truncated = true;
+            h->len > JRN_PAYLOAD_MAX || want != sizeof(*h) + h->len ||
+            esp_crc32_le(0, s_slot_buf + sizeof(*h), h->len) != h->crc32) {
+            s_truncated = true;          /* damaged slot: a gap        */
             continue;
         }
-        /* CRC is verified lazily on read to keep boot fast; structural
-         * checks are enough to bound the sequence space.             */
         any = true;
         if (h->seq < best_lo) best_lo = h->seq;
         if (h->seq >= best_hi) best_hi = h->seq + 1;
+        if (h->seq >= hi) { hi = h->seq; hi_slot = i; }
     }
     if (any) {
         s_seq_oldest = best_lo;
         s_seq_next   = best_hi;
-        /* resume rotation where the highest-seq chunk ended */
-        s_next_slot  = 0;
-        /* find the slot holding the highest seq to continue after it */
-        uint32_t hi = 0;
-        int hi_slot = -1;
-        for (int i = 0; i < JRN_SLOTS; i++) {
-            char k[5];
-            slot_key((uint8_t)i, k);
-            k[4] = '\0';
-            size_t need = 0;
-            if (nvs_get_blob(s_nvs, k, NULL, &need) != ESP_OK ||
-                need < sizeof(jrn_hdr_t)) {
-                continue;
-            }
-            jrn_hdr_t h;
-            size_t want = sizeof(h);
-            if (nvs_get_blob(s_nvs, k, &h, &want) == ESP_OK &&
-                h.magic == JRN_MAGIC && h.seq >= hi) {
-                hi = h.seq;
-                hi_slot = i;
-            }
-        }
-        if (hi_slot >= 0) {
-            s_next_slot = (uint8_t)((hi_slot + 1) % JRN_SLOTS);
-        }
+        s_next_slot  = hi_slot >= 0 ? (uint8_t)((hi_slot + 1) % JRN_SLOTS)
+                                  : 0;
     } else {
         s_seq_oldest = 0;
         s_seq_next   = 1;
@@ -118,20 +98,15 @@ static void scan_slots(void)
     }
 }
 
-extern void boot_mark(uint8_t);
-
 esp_err_t jrn_init(void)
 {
-    boot_mark(0xB0);
     nvs_sec_cfg_t *sec = (nvs_sec_cfg_t *)settings_sec_cfg();
     if (!sec) {
         ESP_LOGE(TAG, "no NVS security config — journal off");
         s_health = JRN_OFF;
         return ESP_ERR_INVALID_STATE;
     }
-    boot_mark(0xB1);
     esp_err_t err = nvs_flash_secure_init_partition("evidence", sec);
-    boot_mark(0xB2);
     if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
         err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         /* no auto-erase: report degraded and leave data alone        */
@@ -141,19 +116,16 @@ esp_err_t jrn_init(void)
     }
     ESP_RETURN_ON_ERROR(err, TAG, "evidence partition init");
     err = nvs_open_from_partition("evidence", JRN_NS, NVS_READWRITE, &s_nvs);
-    boot_mark(0xB3);
     ESP_RETURN_ON_ERROR(err, TAG, "evidence ns open");
     s_open = true;
     s_health = JRN_OK;
     scan_slots();
-    boot_mark(0xB4);
     s_batch_len = 0;
     s_dirty = false;
     s_batch_since_us = esp_timer_get_time();
     ESP_LOGI(TAG, "journal: seq_next=%lu oldest=%lu slot=%u%s",
              (unsigned long)s_seq_next, (unsigned long)s_seq_oldest,
              s_next_slot, s_truncated ? " (gaps)" : "");
-    boot_mark(0xB5);
     return ESP_OK;
 }
 
@@ -284,7 +256,6 @@ bool       jrn_truncated(void)   { return s_truncated; }
 /* ---------------- replay (GET_EVIDENCE) ---------------- */
 
 typedef struct { uint32_t seq; uint8_t slot; } jrn_idx_t;
-static uint8_t s_slot_buf[sizeof(jrn_hdr_t) + JRN_PAYLOAD_MAX];
 
 esp_err_t jrn_walk(jrn_walk_cb_t cb, void *ctx, uint32_t *gaps_out)
 {
