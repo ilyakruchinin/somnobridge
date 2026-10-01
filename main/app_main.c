@@ -56,6 +56,7 @@ static void run_portal_action(int act)
         break;
     case PORTAL_ACTION_RESET_SETTINGS:
         settings_clear();               /* EZShare cfg, keeps peer    */
+        drift_sot_invalidate();         /* card may change (U6)       */
         lcd_ui_row(11, "SETTINGS RESET", 1);
         jrn_put("event", "\"e\":\"reset_settings\"");
         break;
@@ -111,6 +112,34 @@ static void ui_tick(void)
     lcd_ui_rowf(7, 0, "L8H:%lu BK:%lus",
                 (unsigned long)sched_active_8h(),
                 (unsigned long)(sched_backoff_ms() / 1000));
+
+    /* D: live estimate; S: persisted source of truth (U10).
+     * Nulls render as "—" — never a fabricated value.             */
+    drift_record_t dr;
+    if (drift_pub_get(&dr) && dr.has_drift) {
+        lcd_ui_rowf(8, 0, "D:%c%lldms +/-%lld %s",
+                    dr.clock_drift_ms >= 0 ? '+' : '-',
+                    (long long)(dr.clock_drift_ms < 0
+                        ? -dr.clock_drift_ms : dr.clock_drift_ms),
+                    (long long)dr.accuracy_half_ms,
+                    dr.tier == ACC_ACCURATE ? "ACC" :
+                    dr.tier == ACC_APPROXIMATE ? "APX" : "---");
+    } else if (drift_pub_get(NULL)) {
+        lcd_ui_row(8, "D: pending", 0);
+    } else {
+        lcd_ui_row(8, "D: ---", 0);
+    }
+    drift_sot_t sot;
+    if (drift_sot_view(&sot)) {
+        lcd_ui_rowf(14, 0, "S:%c%lldms +/-%lld %s",
+                    sot.clock_drift_ms >= 0 ? '+' : '-',
+                    (long long)(sot.clock_drift_ms < 0
+                        ? -sot.clock_drift_ms : sot.clock_drift_ms),
+                    (long long)sot.accuracy_half_ms,
+                    sot.origin == DRIFT_SOT_NVS ? "NVS" : "RAM");
+    } else {
+        lcd_ui_row(14, "S: ---", 0);
+    }
 }
 
 void app_main(void)
@@ -158,6 +187,17 @@ void app_main(void)
         lcd_ui_row(9, "SCHED FAIL", 1);
     }
     drift_reset();
+    /* newest accurate-tier SOT from NVS — served immediately on boot
+     * until a newer live estimate supersedes it (U6)                */
+    if (drift_sot_load() == ESP_OK) {
+        drift_sot_t sot;
+        if (drift_sot_view(&sot)) {
+            ESP_LOGI(TAG, "SOT restored: drift=%lldms ±%lldms seq=%lu",
+                     (long long)sot.clock_drift_ms,
+                     (long long)sot.accuracy_half_ms,
+                     (unsigned long)sot.persisted_seq);
+        }
+    }
 
     /* 4. WiFi — STA with stored config, or fall back to setup AP     */
     err = netw_init();

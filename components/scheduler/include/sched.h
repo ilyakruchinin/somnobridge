@@ -55,7 +55,6 @@ typedef enum {
     JOB_DAY,           /* list one day folder                       */
     JOB_GET_FILE,      /* full download (BLE stream)                */
     JOB_LIST_LIVE,     /* live non-DATALOG listing                  */
-    JOB_PROBE,         /* bounded header probe                      */
     JOB_VERSION,       /* /client?command=version                   */
 } job_kind_t;
 

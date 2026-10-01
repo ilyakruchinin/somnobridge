@@ -14,6 +14,7 @@
 #include "journal.h"
 #include "netw.h"
 #include "settings.h"
+#include "drift.h"
 
 #include "cJSON.h"
 #include "esp_check.h"
@@ -233,6 +234,9 @@ static esp_err_t on_post_config(httpd_req_t *r)
      * watches for the flag below. */
     extern volatile bool portal_saved_flag;
     portal_saved_flag = true;
+    /* settings change may mean a different card — the persisted drift
+     * SOT characterizes the old identity; fail closed (U6)           */
+    drift_sot_invalidate();
     jrn_put("config", "\"e\":\"settings_saved\"");   /* evidence (§9) */
     return send_json(r, 200, "{\"ok\":true,\"saved\":true}");
 }

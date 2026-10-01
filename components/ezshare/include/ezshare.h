@@ -20,12 +20,6 @@
 extern "C" {
 #endif
 
-typedef enum {
-    EZW_RANGE_UNKNOWN = 0,  /* never probed                        */
-    EZW_RANGE_UNSUPPORTED,/* got 200/416 for a Range request      */
-    EZW_RANGE_VERIFIED,   /* real 206 + valid Content-Range seen   */
-} ezw_range_cap_t;
-
 /** Observation stamped by the scheduler after every request. */
 typedef struct {
     int64_t  req_start_us;   /* esp_timer at request issue         */
@@ -34,6 +28,7 @@ typedef struct {
     esp_err_t transport;     /* esp_http_client result            */
     ezs_err_t parse;         /* parser result for listings         */
     uint32_t body_bytes;     /* bytes received                     */
+    int64_t  content_length; /* exact announced length, -1 unknown  */
 } ezw_obs_t;
 
 /** Configure the card host once per association (host-order IPv4). */
@@ -52,39 +47,28 @@ esp_err_t ezs_list_dir(const char *canon_dir,
 esp_err_t ezs_client_version(char *buf, size_t cap, ezw_obs_t *obs);
 
 /**
- * GET /download?fname&dir — streams the body through `sink`.
+ * GET /download — streams the body through `sink`.
  * sink is called with response chunks; return false from sink to abort.
- * expected_size==0 means "accept Content-Length as truth".
- * Sets obs->body_bytes; rejects a length mismatching the expected tuple.
+ *
+ * Addressing: `dl_name` (the 8.3 basename captured from the listing's
+ * own ?file= link) is preferred — the card canonicalizes long display
+ * names to 8.3 and only that form is guaranteed to resolve. With
+ * dl_name the request is `download?file=<dir>\<dl_name>`; when empty
+ * it falls back to `download?fname=<name>&fdir=<dir>` (U8).
+ *
+ * Size gate: `listed_size` is the listing's display-rounded size and
+ * `size_unit_shift` its unit (ezs_entry_t). The exact Content-Length
+ * must fall inside the rounding envelope — exact <= listed <
+ * exact+unit (ezs_size_within_listing). listed_size==0 means "accept
+ * Content-Length as truth". Sets obs->body_bytes and
+ * obs->content_length; any mismatch fails closed before the first
+ * body byte.
  */
 typedef bool (*ezs_sink_t)(const uint8_t *data, size_t len, void *ctx);
 esp_err_t ezs_download(const char *canon_dir, const char *name,
-                       uint64_t expected_size,
+                       const char *dl_name, uint64_t listed_size,
+                       uint8_t size_unit_shift,
                        ezs_sink_t sink, void *ctx, ezw_obs_t *obs);
-
-/**
- * Bounded early-header probe (spec §8.2): bytes [0, len) of `name`.
- * Range is attempted only when ezw_range_cap()==VERIFIED; otherwise a
- * capped full GET (still counts toward the single-probe allowance).
- * Returns bytes written to buf via out_n.
- */
-/**
- * Bounded early-header probe (spec §8.2): bytes [0, listed_size) of
- * `name`, with `listed_size` <= len <= 16 KiB (caller's §8.2 duty).
- * Range is attempted only when ezw_range_cap()==VERIFIED; otherwise a
- * full GET whose complete body must fit in buf (len).
- */
-esp_err_t ezs_probe_header(const char *canon_dir, const char *name,
-                           uint64_t listed_size,
-                           uint8_t *buf, size_t len, size_t *out_n,
-                           ezw_obs_t *obs);
-
-/** Current card Range capability (§8.2). */
-ezw_range_cap_t ezs_range_cap(void);
-void ezs_range_cap_reset(void);   /* on association change          */
-
-/** Called internally when a Range request behaves: VERIFIED. */
-void ezs_range_cap_note(bool ok_206);
 
 #ifdef __cplusplus
 }

@@ -20,17 +20,10 @@
 static const char *TAG = "ezshare";
 
 static uint32_t      s_card_ip;
-static ezw_range_cap_t s_range = EZW_RANGE_UNKNOWN;
 
 /* ---------------- plumbing ---------------- */
 
 void ezs_client_set_host(uint32_t card_ip) { s_card_ip = card_ip; }
-ezw_range_cap_t ezs_range_cap(void)        { return s_range; }
-void ezs_range_cap_reset(void)             { s_range = EZW_RANGE_UNKNOWN; }
-void ezs_range_cap_note(bool ok_206)
-{
-    s_range = ok_206 ? EZW_RANGE_VERIFIED : EZW_RANGE_UNSUPPORTED;
-}
 
 /* Build "http://a.b.c.d/dir?dir=A%3A%5C..." — caller passes canonical
  * inputs only; both path and query are produced here, never elsewhere. */
@@ -231,10 +224,12 @@ esp_err_t ezs_client_version(char *buf, size_t cap, ezw_obs_t *obs)
 /* ---------------- /download ---------------- */
 
 esp_err_t ezs_download(const char *canon_dir, const char *name,
-                       uint64_t expected_size,
+                       const char *dl_name, uint64_t listed_size,
+                       uint8_t size_unit_shift,
                        ezs_sink_t sink, void *ctx, ezw_obs_t *obs)
 {
     memset(obs, 0, sizeof(*obs));
+    obs->content_length = -1;
     if (!sink || !name) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -242,10 +237,25 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
         return ESP_ERR_INVALID_ARG;
     }
 
-    char fdir[320], url[1152];
-    canon_to_fdir(canon_dir, fdir, sizeof(fdir));
-    build_url(url, sizeof(url), "download",
-              "fname", name, "fdir", fdir);
+    char url[1152];
+    if (dl_name && dl_name[0]) {
+        /* listing-derived 8.3 addressing: download?file=<dir>\<dl> —
+         * the card canonicalizes long display names to 8.3 and only
+         * this form resolves for them (U8)                         */
+        if (ezp_validate_name(dl_name) != EZP_OK) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        char fpath[336];
+        snprintf(fpath, sizeof(fpath), "%.320s\\%s",
+                 canon_dir + 2, dl_name);      /* strip "A:\"         */
+        build_url(url, sizeof(url), "download", "file", fpath,
+                  NULL, NULL);
+    } else {
+        char fdir[320];
+        canon_to_fdir(canon_dir, fdir, sizeof(fdir));
+        build_url(url, sizeof(url), "download",
+                  "fname", name, "fdir", fdir);
+    }
 
     obs->req_start_us = esp_timer_get_time();
     esp_http_client_handle_t c = open_get(url, true, obs);
@@ -260,8 +270,12 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
         return ESP_ERR_HTTP_BASE + obs->http_status;
     }
     int64_t clen = esp_http_client_get_content_length(c);
-    if (expected_size && clen >= 0 && (uint64_t)clen != expected_size) {
-        /* known Content-Length mismatch -> fail before any body byte */
+    obs->content_length = clen;
+    if (listed_size && clen >= 0 &&
+        !ezs_size_within_listing(listed_size, size_unit_shift,
+                                 (uint64_t)clen)) {
+        /* announced length outside the ceil-unit envelope -> the
+         * catalog tuple no longer describes this file (U8)          */
         obs->resp_end_us = esp_timer_get_time();
         esp_http_client_cleanup(c);
         return ESP_ERR_INVALID_SIZE;
@@ -269,6 +283,7 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
 
     uint8_t chunk[BODY_CHUNK_CAP];
     uint64_t sent = 0;
+    uint64_t bound = clen >= 0 ? (uint64_t)clen : listed_size;
     bool ok = true;
     for (;;) {
         int r = esp_http_client_read(c, (char *)chunk, sizeof(chunk));
@@ -282,7 +297,7 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
             }
             break;
         }
-        if (expected_size && sent + (uint64_t)r > expected_size) {
+        if (bound && sent + (uint64_t)r > bound) {
             ok = false;               /* grew mid-transfer           */
             break;
         }
@@ -299,103 +314,14 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
     if (!ok) {
         return ESP_FAIL;
     }
-    if (expected_size && sent != expected_size) {
-        return ESP_ERR_INVALID_SIZE;  /* shorter than listed         */
-    }
-    if (!expected_size && clen >= 0 && sent != (uint64_t)clen) {
+    if (clen >= 0) {
+        if (sent != (uint64_t)clen) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+    } else if (listed_size &&
+               !ezs_size_within_listing(listed_size, size_unit_shift,
+                                        sent)) {
         return ESP_ERR_INVALID_SIZE;
     }
     return ESP_OK;
-}
-
-/* ---------------- bounded header probe (§8.2) ---------------- */
-
-struct probe_ctx {
-    uint8_t *buf; size_t cap, got;
-};
-static bool probe_sink(const uint8_t *d, size_t n, void *v)
-{
-    struct probe_ctx *p = v;
-    size_t room = p->cap - p->got;
-    size_t take = n < room ? n : room;
-    memcpy(p->buf + p->got, d, take);
-    p->got += take;
-    return p->got < p->cap;           /* stop early once capped      */
-}
-
-esp_err_t ezs_probe_header(const char *canon_dir, const char *name,
-                           uint64_t listed_size,
-                           uint8_t *buf, size_t len, size_t *out_n,
-                           ezw_obs_t *obs)
-{
-    memset(obs, 0, sizeof(*obs));
-    *out_n = 0;
-    if (len == 0 || len > 16 * 1024 || listed_size > len) {
-        return ESP_ERR_INVALID_ARG;   /* §8.2: only ≤16 KiB files    */
-    }
-
-    char fdir[320], url[1152];
-    canon_to_fdir(canon_dir, fdir, sizeof(fdir));
-    build_url(url, sizeof(url), "download",
-              "fname", name, "fdir", fdir);
-
-    obs->req_start_us = esp_timer_get_time();
-
-    if (s_range == EZW_RANGE_VERIFIED) {
-        /* Range path: bytes=0-(len-1), must get real 206 */
-        esp_http_client_config_t cfg = {
-            .url = url, .method = HTTP_METHOD_GET,
-            .timeout_ms = HTTP_TOTAL_MS,
-            .buffer_size = 2048, .disable_auto_redirect = true,
-        };
-        esp_http_client_handle_t c = esp_http_client_init(&cfg);
-        if (!c) return ESP_FAIL;
-        char range_hdr[40];
-        snprintf(range_hdr, sizeof(range_hdr),
-                 "bytes=0-%u", (unsigned)(len - 1));
-        esp_http_client_set_header(c, "Range", range_hdr);
-        if (esp_http_client_open(c, 0) != ESP_OK) {
-            esp_http_client_cleanup(c);
-            obs->resp_end_us = esp_timer_get_time();
-            obs->transport = ESP_FAIL;
-            return ESP_FAIL;
-        }
-        /* headers must be read before the status code means anything  */
-        if (esp_http_client_fetch_headers(c) < 0) {
-            esp_http_client_cleanup(c);
-            obs->resp_end_us = esp_timer_get_time();
-            obs->transport = ESP_FAIL;
-            return ESP_FAIL;
-        }
-        obs->http_status = esp_http_client_get_status_code(c);
-        if (obs->http_status != 206) {
-            /* regression -> disable Range, abort before body (§8.2) */
-            s_range = EZW_RANGE_UNSUPPORTED;
-            esp_http_client_cleanup(c);
-            obs->resp_end_us = esp_timer_get_time();
-            return ESP_ERR_HTTP_BASE + obs->http_status;
-        }
-        /* verify Content-Range loosely; full check in H4 bring-up   */
-        int r;
-        size_t got = 0;
-        while (got < len &&
-               (r = esp_http_client_read(c, (char *)buf + got,
-                                         len - got)) > 0) {
-            got += r;
-        }
-        obs->resp_end_us = esp_timer_get_time();
-        obs->body_bytes = got;
-        esp_http_client_cleanup(c);
-        *out_n = got;
-        return ESP_OK;
-    }
-
-    /* UNKNOWN/UNSUPPORTED: one capped full GET on a small candidate.
-     * listed_size (≤16 KiB) is the exact-match bound — if the file grew
-     * mid-transfer the GET fails and the probe is spent (§8.2). */
-    struct probe_ctx p = { .buf = buf, .cap = len, .got = 0 };
-    esp_err_t err = ezs_download(canon_dir, name, listed_size,
-                                 probe_sink, &p, obs);
-    *out_n = p.got;
-    return err;
 }

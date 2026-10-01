@@ -22,10 +22,21 @@ extern "C" {
 typedef struct {
     char     name[EZS_NAME_MAX];          /* exact download alias      */
     uint64_t size;                        /* bytes; 0 for dirs         */
+    uint8_t  size_unit_shift;             /* log2 display unit:        */
+                                          /* 0=bytes 10=K 20=M 30=G  */
     bool     is_dir;
     bool     has_timestamp;               /* false -> timestamp_raw="" */
     char     timestamp_raw[EZS_STAMP_MAX];/* verbatim card text        */
+    char     dl_name[16];                 /* 8.3 basename from file=,  */
+                                          /* "" for the fname= form  */
 } ezs_entry_t;
+
+/* Listed sizes are display-rounded: listed = ceil(exact/unit) (U9/F3).
+ * True iff `exact` falls inside the rounding envelope of `listed`:
+ * exact <= listed < exact + unit. unit==1 (shift 0) means exact
+ * equality — the card prints raw bytes without a suffix.            */
+bool ezs_size_within_listing(uint64_t listed, uint8_t size_unit_shift,
+                             uint64_t exact);
 
 typedef enum {
     EZS_OK = 0,

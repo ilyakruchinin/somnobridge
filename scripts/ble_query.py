@@ -14,7 +14,7 @@
 #   ./scripts/ble_query.py                       # status+catalog+days+drift
 #   ./scripts/ble_query.py --time-sync 5         # run+commit a §8.1 anchor
 #   ./scripts/ble_query.py --days 14 --day 20240103
-#   ./scripts/ble_query.py --drift 'A:\DATALOG\20240103' 20240103_231500_CSL.edf
+#   ./scripts/ble_query.py --drift               # estimate + SOT envelope
 #   ./scripts/ble_query.py --evidence            # replay the evidence journal
 #   ./scripts/ble_query.py --json                # raw JSON instead of tables
 
@@ -438,32 +438,53 @@ def print_ls(r, directory):
 
 
 def print_drift(r):
+    """U10 envelope: {"schema":2,"estimate":{...}|null,
+                     "source_of_truth":{...}|null}."""
     res = r.get("result", {})
     hr("GET_DRIFT")
     if not r.get("ok"):
         print(f"  unavailable: {r.get('error')}")
         return
-    files = res.get("files", [])
-    print(f"  estimate_state={res.get('estimate_state')} "
-          f"observation_closed={res.get('observation_closed')} "
-          f"evidence_available={res.get('evidence_available')}")
-    print(f"  files: {', '.join(f.get('name', '?') for f in files) or '-'}")
-    print(f"  session_start_as10={res.get('session_start_as10')}")
-    print(f"  session_start_true_ms = {fmt_ms(res.get('session_start_true_ms'))}"
-          f"   interval {fmt_iv(res.get('start_interval_ms'))}")
-    print(f"  clock_drift_ms        = {fmt_ms(res.get('clock_drift_ms'))}"
-          f"   interval {fmt_iv(res.get('drift_interval_ms'))}")
-    print(f"  flush_period_ms       = {fmt_ms(res.get('flush_period_ms'))}"
-          f"   interval {fmt_iv(res.get('flush_period_interval_ms'))}")
-    print(f"  timer_rate_ppm        = {res.get('timer_rate_ppm')}")
-    print(f"  beacon layout: record_duration_s={res.get('record_duration_s')} "
-          f"record_bytes={res.get('record_bytes')} "
-          f"complete_records={res.get('complete_records')}")
-    print(f"  model_id={res.get('model_id')}  record_key={res.get('record_key')}")
-    flags = res.get("flags") or []
-    print(f"  flags: {', '.join(flags) if flags else '(none)'}")
-    print("  note: clock_drift_ms is NTP-minus-device start; null until an "
-          "anchor exists (§8.1)")
+    est = res.get("estimate")
+    print("  estimate:")
+    if not est:
+        print("    (none — no session observed this boot)")
+    else:
+        files = est.get("files", [])
+        print(f"    estimate_state={est.get('estimate_state')} "
+              f"tier={est.get('accuracy_tier')} "
+              f"closed={est.get('observation_closed')}")
+        fdir = files[0].get('dir', '') if files else ''
+        day = fdir.rsplit('\\', 1)[-1] if fdir else '-'
+        print(f"    beacon: {day}/"
+              f"{files[0].get('name') if files else '-'}")
+        print(f"    clock_drift_ms    = {fmt_ms(est.get('clock_drift_ms'))}"
+              f"   interval {fmt_iv(est.get('drift_interval_ms'))}")
+        print(f"    accuracy_half_ms  = "
+              f"{fmt_ms(est.get('accuracy_half_ms'))}")
+        print(f"    computed_at_ms    = {fmt_ms(est.get('computed_at_ms'))}  "
+              f"reference_at_ms = {fmt_ms(est.get('reference_at_ms'))}")
+        print(f"    session_start_as10={est.get('session_start_as10')}  "
+              f"true={fmt_ms(est.get('session_start_true_ms'))} "
+              f"interval {fmt_iv(est.get('start_interval_ms'))}")
+        print(f"    flush_period_ms   = {fmt_ms(est.get('flush_period_ms'))}"
+              f"   interval {fmt_iv(est.get('flush_period_interval_ms'))}")
+        print(f"    windows={est.get('n_windows')} "
+              f"segments={est.get('segments')}")
+        flags = est.get("flags") or []
+        print(f"    flags: {', '.join(flags) if flags else '(none)'}")
+    sot = res.get("source_of_truth")
+    print("  source_of_truth:")
+    if not sot:
+        print("    (none — no accurate estimate has ever persisted)")
+    else:
+        print(f"    clock_drift_ms    = {fmt_ms(sot.get('clock_drift_ms'))}"
+              f"   interval {fmt_iv(sot.get('interval_ms'))}")
+        print(f"    accuracy_half_ms  = {fmt_ms(sot.get('accuracy_half_ms'))} "
+              f"origin={sot.get('origin')} seq={sot.get('persisted_seq')}")
+        print(f"    computed_at_ms    = {fmt_ms(sot.get('computed_at_ms'))}  "
+              f"reference_at_ms = {fmt_ms(sot.get('reference_at_ms'))}")
+        print("    note: only accurate-tier values occupy the SOT (U6)")
 
 
 def print_time_sync(r):
@@ -533,10 +554,8 @@ def main():
     ap.add_argument("--day", metavar="YYYYMMDD", help="LIST_DAY for a day")
     ap.add_argument("--ls", metavar="DIR",
                     help="LIST_DIRECTORY — live card listing, e.g. 'A:\\'")
-    ap.add_argument("--drift", nargs=2, metavar=("DIR", "NAME"),
-                    help="GET_DRIFT for an explicit file")
-    ap.add_argument("--drift-auto", action="store_true",
-                    help="GET_DRIFT for the newest day's last file")
+    ap.add_argument("--drift", action="store_true",
+                    help="GET_DRIFT — session estimate + source of truth")
     ap.add_argument("--time-sync", type=int, nargs="?", const=5, default=None,
                     metavar="N",
                     help="run N exchanges and commit the best anchor (§8.1)")
@@ -548,9 +567,9 @@ def main():
     args = ap.parse_args()
 
     if not any([args.status, args.catalog, args.days is not None, args.day,
-                args.drift, args.drift_auto, args.time_sync is not None,
+                args.drift, args.time_sync is not None,
                 args.evidence]):
-        args.status = args.catalog = args.drift_auto = True
+        args.status = args.catalog = args.drift = True
         args.days = 14
 
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
@@ -584,29 +603,8 @@ def main():
                             timeout=args.timeout)
             print(json.dumps(r, indent=2)) if args.json else print_ls(r, args.ls)
 
-        target = None
         if args.drift:
-            target = (args.drift[0], args.drift[1])
-        elif args.drift_auto:
-            if not days:
-                r = dev.request("LIST_RECENT_DAYS", {"days": 14},
-                                timeout=args.timeout)
-                days = r.get("result", {}).get("days", [])
-            if days:
-                day = days[0]
-                r = dev.request("LIST_DAY", {"day": day}, timeout=args.timeout)
-                files = r.get("result", {}).get("files", [])
-                if files:
-                    target = (f"A:\\DATALOG\\{day}", files[-1]["name"])
-                else:
-                    print(f"\n(no files listed for {day} — drift needs a "
-                          f"tracked file)")
-            else:
-                print("\n(no days in catalog — card not scanned yet)")
-        if target:
-            r = dev.request("GET_DRIFT", {"directory": target[0],
-                                          "name": target[1]},
-                            timeout=args.timeout)
+            r = dev.request("GET_DRIFT", {}, timeout=args.timeout)
             print(json.dumps(r, indent=2)) if args.json else print_drift(r)
 
         if args.time_sync is not None:

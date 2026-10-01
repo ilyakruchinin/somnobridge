@@ -16,6 +16,8 @@
 #include "sched.h"
 #include "settings.h"
 
+#include "edf_hdr.h"
+
 #include "cJSON.h"
 #include "esp_log.h"
 #include "host/ble_att.h"
@@ -36,17 +38,20 @@ static struct {
     uint32_t    request_id;
     char        canon_dir[280];
     char        name[EZS_NAME_MAX];
-    uint64_t    expected_size;
+    char        dl_name[16];   /* listing-derived 8.3 ?file= alias   */
+    uint64_t    src_size;      /* pre-listing tuple (listed token)   */
+    uint8_t     src_unit_shift;/* ceil-unit of the listing display   */
+    int64_t     src_clen;      /* exact Content-Length seen (-1 TBD) */
     uint64_t    sent;          /* body bytes notified               */
     uint64_t    acked;         /* contiguous ACK offset             */
     uint32_t    window;        /* remaining credit                  */
-    int64_t     credit_deadline_ms;
-    uint64_t    src_size;      /* pre-listing tuple                 */
     char        src_stamp[EZS_STAMP_MAX];
     bool        has_src_stamp;
     char        day[CAT_DAY_STR];
     bool        is_evidence;   /* evidence stream: no card checks    */
     uint32_t    ev_gaps;       /* journal gaps observed while replay */
+    uint8_t    *hdr_cap;       /* EDF prefix capture (diagnostic)    */
+    size_t      hdr_got;
     mbedtls_sha256_context sha;
 } s_stream;
 
@@ -496,9 +501,12 @@ static void op_get_file(uint32_t rid, cJSON *args)
             if (!ents[i].is_dir && !strcmp(ents[i].name, nv->valuestring)) {
                 ok = true;
                 s_stream.src_size = ents[i].size;
+                s_stream.src_unit_shift = ents[i].size_unit_shift;
                 s_stream.has_src_stamp = ents[i].has_timestamp;
                 strncpy(s_stream.src_stamp, ents[i].timestamp_raw,
                         sizeof(s_stream.src_stamp)-1);
+                strncpy(s_stream.dl_name, ents[i].dl_name,
+                        sizeof(s_stream.dl_name)-1);
                 break;
             }
         }
@@ -517,11 +525,17 @@ static void op_get_file(uint32_t rid, cJSON *args)
             return;
         }
         s_stream.src_size = ft.size;
+        s_stream.src_unit_shift = ft.size_unit_shift;
         s_stream.has_src_stamp = ft.has_timestamp;
         strncpy(s_stream.src_stamp, ft.timestamp_raw,
                 sizeof(s_stream.src_stamp)-1);
+        strncpy(s_stream.dl_name, ft.dl_name,
+                sizeof(s_stream.dl_name)-1);
     }
+    s_stream.dl_name[sizeof(s_stream.dl_name) - 1] = '\0';
     if (ev && cJSON_IsString(ev)) {
+        /* the client pins the LISTED size token it saw — the exact
+         * Content-Length check happens inside the envelope (U8)     */
         uint64_t want = strtoull(ev->valuestring, NULL, 10);
         if (want != s_stream.src_size) {
             send_error(rid, OP_GET_FILE, EC_SIZE_MISMATCH);
@@ -541,12 +555,16 @@ static void op_get_file(uint32_t rid, cJSON *args)
     json_append_escaped(begin, 640, &bo, canon);
     bo += (size_t)snprintf(begin + bo, 640 - bo, "\",\"name\":\"");
     json_append_escaped(begin, 640, &bo, nv->valuestring);
+    bo += (size_t)snprintf(begin + bo, 640 - bo,
+        "\",\"download_name\":\"");
+    json_append_escaped(begin, 640, &bo,
+                        s_stream.dl_name[0] ? s_stream.dl_name
+                                            : nv->valuestring);
     snprintf(begin + bo, 640 - bo,
-        "\",\"expected_size\":\"%llu\",\"cached_size_at_start\":\"%llu\","
-        "\"content_length\":\"%llu\",\"source_before\":{\"size\":\"%llu\",\"ts\":%s%s%s}}",
+        "\",\"listed_size\":\"%llu\",\"size_unit_shift\":%u,"
+        "\"source_before\":{\"size\":\"%llu\",\"ts\":%s%s%s}}",
         (unsigned long long)s_stream.src_size,
-        (unsigned long long)s_stream.src_size,
-        (unsigned long long)s_stream.src_size,
+        (unsigned)s_stream.src_unit_shift,
         (unsigned long long)s_stream.src_size,
         s_stream.has_src_stamp ? "\"" : "",
         s_stream.has_src_stamp ? s_stream.src_stamp : "null",
@@ -556,9 +574,17 @@ static void op_get_file(uint32_t rid, cJSON *args)
     s_stream.sent = s_stream.acked = 0;
     s_stream.window = 0;
     s_stream.is_evidence = false;
+    s_stream.src_clen = -1;
     strncpy(s_stream.canon_dir, canon, sizeof(s_stream.canon_dir)-1);
     strncpy(s_stream.name, nv->valuestring, sizeof(s_stream.name)-1);
     strncpy(s_stream.day, day, CAT_DAY_STR-1);
+    /* opportunistic EDF prefix capture: the first ≤16 KiB of a DATALOG
+     * .edf body feeds the header diagnostic — zero extra card reads  */
+    s_stream.hdr_cap = NULL;
+    s_stream.hdr_got = 0;
+    if (in_datalog && strstr(nv->valuestring, ".edf")) {
+        s_stream.hdr_cap = malloc(16 * 1024);
+    }
     send_ok(rid, "STREAM_BEGIN", begin);   /* piggybacks rid          */
     free(begin);
 
@@ -570,6 +596,14 @@ static void op_get_file(uint32_t rid, cJSON *args)
 /* sink: sends FILE_BYTES frames honoring credit window */
 static bool stream_sink(const uint8_t *d, size_t n, void *ctx)
 {
+    /* capture the EDF prefix while it streams past (≤16 KiB, U2 —
+     * diagnostics only; never gates the transfer)                  */
+    if (s_stream.hdr_cap && s_stream.hdr_got < 16 * 1024) {
+        size_t room = 16 * 1024 - s_stream.hdr_got;
+        size_t take = n < room ? n : room;
+        memcpy(s_stream.hdr_cap + s_stream.hdr_got, d, take);
+        s_stream.hdr_got += take;
+    }
     size_t off = 0;
     while (off < n) {
         while (s_stream.window == 0) {
@@ -678,7 +712,10 @@ static void ble_stream_task(void *arg)
             ezw_obs_t obs;
             esp_err_t err =
                 ezs_download(s_stream.canon_dir, s_stream.name,
-                             s_stream.src_size, stream_sink, NULL, &obs);
+                             s_stream.dl_name, s_stream.src_size,
+                             s_stream.src_unit_shift,
+                             stream_sink, NULL, &obs);
+            s_stream.src_clen = obs.content_length;
             transport_ok = err == ESP_OK;
         }
         uint8_t hash[32] = {0};
@@ -726,7 +763,11 @@ static void ble_stream_task(void *arg)
             } else if (s_stream.day[0]) {
                 cat_file_t after;
                 if (!cat_find_file(s_stream.day, s_stream.name, &after) ||
-                    after.size != s_stream.src_size) {
+                    after.size != s_stream.src_size ||
+                    (s_stream.has_src_stamp && after.has_timestamp &&
+                     strcmp(after.timestamp_raw,
+                            s_stream.src_stamp))) {
+                    /* tuple moved under us — size *or* stamp (U3)  */
                     strncpy(reason, "source_changed", sizeof(reason));
                 } else {
                     completion = true;
@@ -758,16 +799,42 @@ static void ble_stream_task(void *arg)
             strncpy(reason, "http_error", sizeof(reason));
         }
 
+        /* opportunistic EDF-header diagnostic — parse the captured
+         * prefix; never gates completion (U2)                        */
+        if (s_stream.hdr_cap) {
+            edf_hdr_t h;
+            if (edf_hdr_parse(s_stream.hdr_cap, s_stream.hdr_got, &h)) {
+                drift_session_t *ls = drift_last();
+                if (ls && s_stream.day[0] &&
+                    !strcmp(ls->day, s_stream.day)) {
+                    drift_sess_header(ls, h.header_bytes, h.record_bytes,
+                                      h.record_duration_s,
+                                      h.start_local_s);
+                    if (h.record_bytes &&
+                        s_stream.sent > h.header_bytes) {
+                        ls->complete_records =
+                            (int64_t)((s_stream.sent - h.header_bytes) /
+                                      h.record_bytes);
+                    }
+                }
+            }
+            free(s_stream.hdr_cap);
+            s_stream.hdr_cap = NULL;
+        }
+
         {
-            char end[512];
+            char end[640];
             snprintf(end, sizeof(end),
                 "{\"ok\":%s,\"actual_bytes\":\"%llu\","
+                "\"listed_size\":\"%llu\",\"content_length\":\"%lld\","
                 "\"sha256\":\"%s\","
                 "\"source_unchanged\":%s,"
                 "\"therapy_status\":%d,\"monitoring_checked\":true,"
                 "\"completion_allowed\":%s,\"error\":\"%s\"}",
                 transport_ok ? "true" : "false",
-                (unsigned long long)s_stream.sent, hex,
+                (unsigned long long)s_stream.sent,
+                (unsigned long long)s_stream.src_size,
+                (long long)s_stream.src_clen, hex,
                 completion ? "true" : "false",
                 (int)therapy_status()->state,
                 completion ? "true" : "false", reason);
@@ -860,72 +927,38 @@ static void on_time_commit(uint32_t rid, const uint8_t *pl, uint16_t n)
     send_ok(rid, "TIME_COMMIT", inner);
 }
 
-/* ---------------- GET_DRIFT ---------------- */
+/* ---------------- GET_DRIFT ----------------
+ * U10: takes no file arguments. Returns an envelope with the live (or
+ * last closed) session estimate plus the persisted source of truth.
+ * Approximate estimates are reported as their true interval; only an
+ * accurate-tier value ever appears in source_of_truth — and when no
+ * accurate value exists the field is an explicit null, never a guess. */
 
-/* GET_DRIFT is a pure local read (§8.5): the card worker owns the
- * live session; here we only refit + serialize.                      */
 static void op_get_drift(uint32_t rid, cJSON *args)
 {
-    cJSON *dv = cJSON_GetObjectItem(args, "directory");
-    cJSON *nv = cJSON_GetObjectItem(args, "name");
-    if (!dv || !nv || !cJSON_IsString(dv) || !cJSON_IsString(nv)) {
-        send_error(rid, OP_GET_DRIFT, EC_BAD_REQUEST);
-        return;
-    }
-    drift_session_t *ls = drift_live();
-    if (!ls) {
-        ls = drift_last();          /* retained closed session (§8.5) */
-    }
-    if (ls) {
-        /* fall through to refit+serialize below                     */
-    } else {
-        ESP_LOGW("ble", "GET_DRIFT: no session (live=%d closed=%d)",
-                 (int)drift_live_is(), (int)drift_last_closed());
-        /* nothing observed this boot — serve the latest record that
-         * survived in metadata NVS, else report unavailable          */
-        char *stored = malloc(8192);
-        if (!stored) { send_error(rid, OP_GET_DRIFT, EC_RESOURCE_LIMIT);
-                       return; }
-        size_t n = drift_meta_latest(stored, 8192, NULL);
-        if (!n) {
-            free(stored);
-            send_error(rid, OP_GET_DRIFT, EC_METADATA_UNAVAILABLE);
-            return;
-        }
-        send_ok(rid, OP_GET_DRIFT, stored);   /* verbatim record JSON */
-        free(stored);
-        return;
-    }
-    if (!ls->header_known && !ls->n_obs) {
-        /* session exists but no evidence yet — explicit null record  */
-    }
-    /* refit with priors each read — cheap (<=192 obs, §8.4)          */
-    int64_t p_lo = 0, p_hi = 0;
-    if (ls->header_known) {
-        int64_t d = (int64_t)ls->record_duration_s * 1000000;
-        p_lo = d * 9 / 10;
-        p_hi = d * 11 / 10;
-    }
-    drift_sess_fit(ls, p_lo, p_hi, INT64_MIN / 4, INT64_MAX / 4);
-    drift_record_t rec;
-    drift_build_record(ls, &rec);
-    snprintf(rec.record_key, sizeof(rec.record_key), "cur");
-    char *files = malloc(512);
-    if (!files) {
+    (void)args;
+    char *buf = malloc(3072);
+    if (!buf) {
         send_error(rid, OP_GET_DRIFT, EC_RESOURCE_LIMIT);
         return;
     }
-    size_t fo = (size_t)snprintf(files, 512, "[{\"dir\":\"");
-    json_append_escaped(files, 512, &fo, dv->valuestring);
-    fo += (size_t)snprintf(files + fo, 512 - fo, "\",\"name\":\"");
-    json_append_escaped(files, 512, &fo, nv->valuestring);
-    snprintf(files + fo, 512 - fo, "\"}]");
-    char *buf = malloc(4096);
-    if (!buf) { send_error(rid, OP_GET_DRIFT, EC_RESOURCE_LIMIT); return; }
-    drift_record_json(&rec, files, NULL, buf, 4096);
+    size_t o = (size_t)snprintf(buf, 3072, "{\"schema\":2,\"estimate\":");
+    drift_record_t rec;
+    if (drift_pub_get(&rec)) {
+        o += (size_t)drift_estimate_json(&rec, buf + o, 3072 - o);
+    } else {
+        o += (size_t)snprintf(buf + o, 3072 - o, "null");
+    }
+    o += (size_t)snprintf(buf + o, 3072 - o, ",\"source_of_truth\":");
+    drift_sot_t sot;
+    if (drift_sot_view(&sot)) {
+        o += (size_t)drift_sot_json(&sot, buf + o, 3072 - o);
+    } else {
+        o += (size_t)snprintf(buf + o, 3072 - o, "null");
+    }
+    snprintf(buf + o, 3072 - o, "}");
     send_ok(rid, OP_GET_DRIFT, buf);
     free(buf);
-    free(files);
 }
 
 /* ---------------- write dispatch ---------------- */

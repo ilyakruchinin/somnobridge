@@ -5,3 +5,4 @@
 /* journal only needs the security-config accessor; tests return a
  * dummy non-NULL pointer so jrn_init proceeds */
 const void *settings_sec_cfg(void);
+nvs_handle_t settings_nvs_metadata(void);   /* SOT + journal NVS      */

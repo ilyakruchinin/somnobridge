@@ -12,7 +12,6 @@
 #include "sched.h"
 
 #include "drift.h"
-#include "edf_hdr.h"
 #include "journal.h"
 #include "nvs_flash.h"
 #include "settings.h"
@@ -24,18 +23,18 @@
 
 static const char *TAG = "sched";
 
-/* -------- tunables (build constants per spec §6) -------- */
+/* -------- tunables (build constants per spec §6 + update U9) ------ */
 #define Q_LEN              16
 #define REQ_GAP_NORMAL_US  (1000 * 1000)   /* 1/s ordinary spacing    */
-#define REQ_GAP_DENSE_US   (200 * 1000)    /* 200 ms burst-only       */
 #define WATCH_PERIOD_US    (60 * 1000 * 1000)
 #define COLD_PERIOD_US     (5 * 1000 * 1000)
 #define NEIGH_PERIOD_US    (3600LL * 1000 * 1000)  /* once/hour        */
 #define ACTIVE_CAP_8H      700
 #define LEDGER_BUCKETS     481
 #define LEDGER_BUCKET_US   (60LL * 1000 * 1000)
-#define ACQ_BUDGET_PER_SET 40
-#define ACQ_DENSE_MINUTE   40
+#define ACQ_BUDGET_PER_SET 40              /* dense-burst req cap/set */
+#define ACQ_DENSE_MINUTE   40              /* dense starts/minute     */
+#define SVC_WINDOW         8               /* day-listing svc median  */
 
 typedef struct {
     job_kind_t kind;
@@ -52,7 +51,6 @@ static int64_t  s_last_req_us;
 static int64_t  s_next_watch_us;
 static int64_t  s_next_cold_us;
 static int64_t  s_next_neigh_us;
-static int      s_dense_minute;           /* dense starts this minute  */
 static bool     s_round_active;           /* watch round in progress   */
 static bool     s_round_growth;           /* any relevant write        */
 static bool     s_round_failed;           /* any listing error         */
@@ -62,15 +60,24 @@ static uint16_t s_ledger[LEDGER_BUCKETS]; /* minute buckets, 8h ring   */
 static int      s_ledger_head;
 static int64_t  s_ledger_ckpt_us;
 
+/* dense burst state (U9): armed only while drift_dense_window says a
+ * flush is predicted; spacing is the profile's 0.5 s guarded by the
+ * listing service-time median                                      */
+static int64_t  s_burst_until_us;
+static int64_t  s_burst_next_us;
+static int      s_burst_reqs;             /* this session              */
+static int      s_dense_minute;           /* dense starts this minute  */
+static int64_t  s_dense_minute_at_us;
+static bool     s_had_live;               /* live-session edge detect  */
+static int64_t  s_svc_us[SVC_WINDOW];     /* day-listing service times */
+static int      s_svc_n;
+
 static const uint32_t s_backoff_ms_ladder[] =
     {2000, 4000, 8000, 16000, 30000, 60000};
 
-/* estimator session bounds (§8.2/§8.3): provisional until validated   */
-#define SESS_CACHE_BOUND_US  (60LL * 1000 * 1000)  /* listing cache C   */
-#define SESS_JITTER_US       (300 * 1000)          /* per-edge jitter   */
-#define PROBE_BUF_BYTES      (16 * 1024)
 static therapy_state_t s_prev_therapy;
 static est_state_t     s_prev_est = EST_INVALID;   /* journaled once   */
+static acc_tier_t      s_prev_tier = ACC_NONE;
 
 /* ---------------- ledger ---------------- */
 
@@ -166,14 +173,50 @@ uint32_t sched_backoff_ms(void) { return s_backoff_ms; }
 
 /* ---------------- spacing / budget gates ---------------- */
 
-/* Dense acquisition (200 ms spacing, 40 starts/min, 40/set/30 min) is an
- * opt-in profile gated on E-sim jitter validation — disabled in v1, so no
- * dense-start gate is wired up here. s_dense_minute still counts starts so
- * the ledger stays honest if a dense profile is ever enabled.            */
+/* Median of recent day-listing service times — the U9 guard that
+ * widens burst spacing when the folder approaches the poll interval. */
+static int64_t svc_median_us(void)
+{
+    if (!s_svc_n) return 0;
+    int64_t v[SVC_WINDOW];
+    int n = s_svc_n < SVC_WINDOW ? s_svc_n : SVC_WINDOW;
+    memcpy(v, s_svc_us, (size_t)n * sizeof(v[0]));
+    for (int i = 1; i < n; i++) {          /* insertion sort, n <= 8  */
+        int64_t x = v[i];
+        int j = i - 1;
+        while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
+        v[j + 1] = x;
+    }
+    return v[n / 2];
+}
+
+static void svc_note(int64_t req_us, int64_t resp_us)
+{
+    int64_t d = resp_us - req_us;
+    if (d <= 0) return;
+    if (s_svc_n < SVC_WINDOW) {
+        s_svc_us[s_svc_n++] = d;
+    } else {
+        memmove(s_svc_us, s_svc_us + 1, (SVC_WINDOW - 1) * sizeof(int64_t));
+        s_svc_us[SVC_WINDOW - 1] = d;
+    }
+}
+
+/* Effective dense spacing: the profile's 0.5 s, widened when the
+ * service-time median approaches it (U9). */
+static int64_t dense_gap_us(void)
+{
+    int64_t gap = (int64_t)drift_profile()->dense_spacing_us;
+    int64_t med = svc_median_us();
+    if (med && med * 4 > gap * 3) {
+        gap = med * 2;                 /* keep service < 50% of gap    */
+    }
+    return gap;
+}
 
 static int64_t earliest_start(int64_t now, bool dense)
 {
-    int64_t gap = dense ? REQ_GAP_DENSE_US : REQ_GAP_NORMAL_US;
+    int64_t gap = dense ? dense_gap_us() : REQ_GAP_NORMAL_US;
     int64_t t = s_last_req_us + gap;
     if (t < now) {
         t = now;
@@ -187,96 +230,79 @@ static int64_t earliest_start(int64_t now, bool dense)
     return t;
 }
 
-/* ---------------- estimator feed (§8.2/§8.3) ----------------
- * The live drift session tracks ONE beacon: the first file observed
- * to grow while monitoring is active. Header bytes come from the
- * single bounded probe (one per observed file set). Session closes
- * on therapy gap / OUT — nothing carries across a discontinuity.   */
+/* ---------------- estimator feed (update spec U3/U4/U6) ----------
+ * Every successfully-parsed day listing feeds the drift session —
+ * changed or not; an unchanged response is what bounds the next
+ * transition window. The session opens on the first listing with
+ * file-level events (a write actually observed) and closes on
+ * therapy OUT / IN->UNKNOWN regression. The estimate re-evaluates
+ * after each feed and on a 1 s cadence so late anchors refit.      */
 
-static void estim_on_growth(const char *day, const cat_file_t *grown,
-                            const ezw_obs_t *obs)
+static void estim_feed_day(const char *day, const ezs_entry_t *ents,
+                           int n, const cat_diff_t *diff,
+                           const ezw_obs_t *obs, int64_t now)
 {
-    if (!grown || !grown->name[0]) {
-        return;
-    }
     drift_session_t *ls = drift_live();
-    if (!ls) {
-        /* no session yet — this growth opens one (§8.3)              */
-        drift_live_begin(SESS_CACHE_BOUND_US, SESS_JITTER_US,
-                         day, grown->name);
+    if (!ls && diff && diff->n_events > 0) {
+        /* file-level activity observed — open a session bound to this
+         * day folder (mid-session join supported, U4)                */
+        drift_live_begin(day);
         ls = drift_live();
-        ESP_LOGI(TAG, "estim: opened session day=%s beacon=%s live=%d",
-                 day, grown->name, (int)drift_live_is());
+        ESP_LOGI(TAG, "estim: session opened day=%s", day);
     }
-    char bday[CAT_DAY_STR], bname[96];
-    const char *bn = drift_live_beacon(bday, bname);
-    if (!bn || strcmp(day, bday) || strcmp(grown->name, bname)) {
-        return;      /* growth in a non-beacon file: not our session  */
+    if (!ls || strcmp(ls->day, day)) {
+        return;                        /* a different folder changed  */
     }
-    drift_sess_observe(ls, obs->req_start_us, obs->resp_end_us,
-                       grown->size);
-    /* keep the fit warm; journal + persist on state transitions (§9) */
-    if (ls->header_known && ls->n_obs >= 3) {
-        int64_t d = (int64_t)ls->record_duration_s * 1000000;
-        if (drift_sess_fit(ls, d * 9 / 10, d * 11 / 10,
-                           INT64_MIN / 4, INT64_MAX / 4)) {
-            est_state_t now_est =
-                ls->fit_valid ? EST_VALIDATED : EST_PENDING;
-            if (now_est != s_prev_est) {
-                char rec[64];
-                snprintf(rec, sizeof(rec), "\"fit\":%s,\"obs\":%d",
-                         ls->fit_valid ? "ok" : "no", ls->n_obs);
-                jrn_put("estimate", rec);
-                /* latest-group estimate into metadata NVS (§9)       */
-                if (ls->fit_valid) {
-                    drift_record_t dr;
-                    drift_build_record(ls, &dr);
-                    char *rj = malloc(8192);
-                    if (rj) {
-                        int n = drift_record_json(&dr, NULL, NULL,
-                                                  rj, 8192);
-                        if (n > 0) drift_meta_save(rj, (size_t)n);
-                        free(rj);
-                    }
-                }
-            }
-            s_prev_est = now_est;
+    int added = drift_feed_scan(ls, day, ents, n, diff,
+                                obs->req_start_us, obs->resp_end_us);
+    if (added > 0 || (diff && diff->n_events > 0)) {
+        char rec[128];
+        snprintf(rec, sizeof(rec),
+                 "\"day\":\"%.8s\",\"ev\":%d,\"cat\":%d%s",
+                 day, added, diff ? diff->n_events : 0,
+                 (diff && diff->overflowed) ? ",\"of\":1" : "");
+        jrn_put("obs", rec);           /* stamp/size events (§9)      */
+    }
+    drift_sess_eval(ls, now);
+}
+
+static void estim_housekeeping(int64_t now)
+{
+    static int64_t s_eval_at_us;
+    drift_session_t *ls = drift_live();
+    if (ls && !s_had_live) {
+        /* session boundary — burst accounting is per file set       */
+        s_burst_reqs = 0;
+        s_burst_next_us = 0;
+        s_burst_until_us = 0;
+        s_had_live = true;
+    } else if (!ls) {
+        s_had_live = false;
+    }
+    /* ~1 s refit cadence so anchors landing after a scan still fold
+     * into the live estimate                                       */
+    if (ls && now - s_eval_at_us >= 1000 * 1000) {
+        s_eval_at_us = now;
+        drift_sess_eval(ls, now);
+    }
+    /* journal + persist on (state,tier) transitions (§9, U6)        */
+    drift_record_t r;
+    if (drift_pub_get(&r) &&
+        (r.state != s_prev_est || r.tier != s_prev_tier)) {
+        char rec[96];
+        snprintf(rec, sizeof(rec),
+                 "\"state\":%d,\"tier\":%d,\"w\":%d,\"seg\":%d",
+                 (int)r.state, (int)r.tier, r.n_windows, r.n_segments);
+        jrn_put("estimate", rec);
+        if (r.tier == ACC_ACCURATE && s_prev_tier != ACC_ACCURATE) {
+            /* first accurate result in the session — persist now    */
+            drift_sot_commit(true, now);
         }
+        s_prev_est = r.state;
+        s_prev_tier = r.tier;
     }
-    /* One early probe per observed file set (§8.2). Every file in a
-     * session shares the EDF layout, so probe the smallest listed
-     * candidate ≤16 KiB rather than the beacon itself — the beacon is
-     * whatever grows first and is usually the largest file (BRP).    */
-    if (!ls->header_known && !drift_live_probe_used()) {
-        int n = cat_day_entries(day, NULL, 0);
-        if (n > 0) {
-            cat_file_t *files = malloc((size_t)n * sizeof(cat_file_t));
-            if (files) {
-                cat_day_entries(day, files, n);
-                const cat_file_t *best = NULL;
-                for (int i = 0; i < n; i++) {
-                    if (!strstr(files[i].name, ".edf") ||
-                        files[i].size == 0 ||
-                        files[i].size > PROBE_BUF_BYTES) {
-                        continue;
-                    }
-                    if (!best || files[i].size < best->size) {
-                        best = &files[i];
-                    }
-                }
-                if (best) {
-                    drift_live_probe_mark();
-                    sched_job_t pj = { .kind = JOB_PROBE, .prio = 2 };
-                    strncpy(pj.dir, day, JOB_DIR_MAX - 1);
-                    strncpy(pj.name, best->name, JOB_NAME_MAX - 1);
-                    sched_submit(&pj);
-                    ESP_LOGI(TAG, "probe queued: %s (%llu B)", best->name,
-                             (unsigned long long)best->size);
-                }
-                free(files);
-            }
-        }
-    }
+    /* throttled improvement writes (U6) — internal rate limit       */
+    drift_sot_commit(false, now);
 }
 
 static void estim_track_therapy(int64_t now)
@@ -290,21 +316,25 @@ static void estim_track_therapy(int64_t now)
         if (cur == THERAPY_OUT ||
             (cur == THERAPY_UNKNOWN &&
              s_prev_therapy == THERAPY_IN)) {
-            /* persist the final estimate before closing (§9)         */
+            /* freeze + persist the final estimate (U6 IN->OUT)      */
             drift_session_t *ls = drift_live();
-            if (ls && ls->fit_valid) {
+            if (ls) {
+                drift_sess_eval(ls, now);
                 drift_record_t dr;
-                drift_build_record(ls, &dr);
-                dr.observation_closed = true;
-                char *rj = malloc(8192);
-                if (rj) {
-                    int n = drift_record_json(&dr, NULL, NULL, rj, 8192);
-                    if (n > 0) drift_meta_save(rj, (size_t)n);
-                    free(rj);
+                if (drift_pub_get(&dr)) {
+                    dr.observation_closed = true;
+                    char *rj = malloc(4096);
+                    if (rj) {
+                        int n = drift_estimate_json(&dr, rj, 4096);
+                        if (n > 0) drift_meta_save(rj, (size_t)n);
+                        free(rj);
+                    }
                 }
             }
-            drift_live_end();
+            drift_live_end(now);
+            drift_sot_commit(true, now);
             s_prev_est = EST_INVALID;
+            s_prev_tier = ACC_NONE;
         }
         s_prev_therapy = cur;
         char rec[64];                    /* therapy transition (§9)    */
@@ -364,18 +394,22 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
         if (!r->entries) { r->err = ESP_ERR_NO_MEM; return; }
         r->err = ezs_list_dir(canon, r->entries, &r->n_entries, &r->obs);
         if (r->err == ESP_OK) {
-            bool changed = false;
-            cat_file_t grown = {0};
-            cat_feed_day(j->dir, r->entries, r->n_entries, now,
-                         &changed, &grown);
-            if (changed) {
+            svc_note(r->obs.req_start_us, r->obs.resp_end_us);
+            cat_diff_t diff;
+            memset(&diff, 0, sizeof(diff));
+            cat_feed_day(j->dir, r->entries, r->n_entries, now, &diff);
+            if (diff.changed) {
                 s_round_growth = true;
-                therapy_on_growth(now);   /* relevant write (§7.1)     */
-                estim_on_growth(j->dir, &grown, &r->obs);  /* §8.3     */
+                therapy_on_growth(now);   /* relevant write (§7.1) —
+                    * stamp-only changes count identically (U3)       */
             }
-            ESP_LOGI(TAG, "day %s: %d listed, changed=%d grown=%s s=%lld r=%lld",
-                     j->dir, r->n_entries, (int)changed,
-                     grown.name[0] ? grown.name : "-",
+            /* every successful listing feeds the estimator — an
+             * unchanged response bounds the next transition (U4)     */
+            estim_feed_day(j->dir, r->entries, r->n_entries, &diff,
+                           &r->obs, now);
+            ESP_LOGI(TAG, "day %s: %d listed, ev=%d chg=%d s=%lld r=%lld",
+                     j->dir, r->n_entries, diff.n_events,
+                     (int)diff.changed,
                      (long long)r->obs.req_start_us,
                      (long long)r->obs.resp_end_us);
             ledger_add(therapy_status()->state != THERAPY_OUT, now);
@@ -396,59 +430,8 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
         obs_success(r->err == ESP_OK);
         if (r->err == ESP_OK) {
             ESP_LOGI(TAG, "card fw: %s", v);
+            drift_card_fw_note(v);      /* identity check → SOT (U6)  */
         }
-        break;
-    }
-    case JOB_PROBE: {
-        /* bounded header read of one file in the observed set (§8.2):
-         * bytes [0, listed_size) capped at 16 KiB, once per file set. */
-        drift_session_t *ls = drift_live();
-        if (!ls || ls->header_known) {
-            r->err = ESP_ERR_INVALID_STATE;
-            break;
-        }
-        cat_file_t cur;
-        if (!cat_find_file(j->dir, j->name, &cur) ||
-            cur.size > PROBE_BUF_BYTES) {
-            r->err = ESP_ERR_INVALID_SIZE;
-            break;
-        }
-        uint8_t *buf = malloc(PROBE_BUF_BYTES);
-        if (!buf) { r->err = ESP_ERR_NO_MEM; break; }
-        size_t got = 0;
-        char canon[12 + CAT_DAY_STR];
-        memcpy(canon, "A:\\DATALOG\\", 11);
-        memcpy(canon + 11, j->dir, CAT_DAY_STR);
-        r->err = ezs_probe_header(canon, j->name, cur.size,
-                                  buf, cur.size, &got, &r->obs);
-        if (r->err == ESP_OK) {
-            edf_hdr_t h;
-            if (edf_hdr_parse(buf, got, &h)) {
-                drift_sess_header(ls, h.header_bytes, h.record_bytes,
-                                  h.record_duration_s, h.start_local_s);
-                ESP_LOGI(TAG, "ed hdr: H=%lu R=%lu D=%lus ns=%lu",
-                         (unsigned long)h.header_bytes,
-                         (unsigned long)h.record_bytes,
-                         (unsigned long)h.record_duration_s,
-                         (unsigned long)h.n_signals);
-                char rec[160];
-                snprintf(rec, sizeof(rec),
-                         "\"f\":\"%s\",\"H\":%lu,\"R\":%lu,\"D\":%lu",
-                         j->name, (unsigned long)h.header_bytes,
-                         (unsigned long)h.record_bytes,
-                         (unsigned long)h.record_duration_s);
-                jrn_put("header", rec);      /* evidence (§9)         */
-            } else {
-                ESP_LOGW(TAG, "probe: not parseable EDF (%u B)",
-                         (unsigned)got);
-            }
-        } else {
-            ESP_LOGW(TAG, "probe %s failed: http=%d transport=%d got=%u",
-                     j->name, r->obs.http_status, r->obs.transport,
-                     (unsigned)got);
-        }
-        free(buf);
-        obs_success(r->err == ESP_OK);
         break;
     }
     case JOB_GET_FILE:
@@ -532,6 +515,66 @@ static void plan_neigh(int64_t now)
     s_next_neigh_us = now + NEIGH_PERIOD_US;
     /* once/hour housekeeping while in therapy — hot neighbours only,
      * the active folder is handled by the liveness loop itself (§6.2) */
+
+    /* card firmware/identity check (U9): hourly, lowest priority —
+     * feeds drift_card_fw_note; a changed identity invalidates the
+     * persisted SOT                                                   */
+    sched_job_t v = { .kind = JOB_VERSION, .prio = 7 };
+    sched_submit(&v);
+}
+
+/* ---------------- dense burst (U9) ----------------
+ * Armed only when the estimator predicts a flush AND the
+ * characterization profile has enabled dense polling. One burst
+ * request at a time, 0.5 s nominal spacing (service-time guarded),
+ * stops the moment the stamp moves (drift_dense_window recomputes the
+ * prediction from the changed response, pushing the next window one
+ * cadence out — the burst self-terminates).                           */
+
+static void plan_dense(int64_t now)
+{
+    int64_t open_us, close_us;
+    if (!drift_dense_window(now, &open_us, &close_us)) {
+        s_burst_until_us = 0;
+        return;
+    }
+    if (s_burst_reqs >= ACQ_BUDGET_PER_SET) {
+        return;                        /* 40/set allowance spent      */
+    }
+    /* per-minute dense-start cap (§6.2)                              */
+    if (now - s_dense_minute_at_us >= 60LL * 1000 * 1000) {
+        s_dense_minute_at_us = now;
+        s_dense_minute = 0;
+    }
+    if (s_dense_minute >= ACQ_DENSE_MINUTE) {
+        return;
+    }
+    if (s_burst_next_us && now < s_burst_next_us) {
+        return;
+    }
+    drift_session_t *ls = drift_live();
+    if (!ls || !ls->day[0]) {
+        return;
+    }
+    sched_job_t d = { .kind = JOB_DAY, .prio = 1 };
+    strncpy(d.dir, ls->day, CAT_DAY_STR);
+    if (sched_submit(&d) == ESP_OK) {
+        s_burst_reqs++;
+        s_dense_minute++;
+        s_burst_next_us = now + dense_gap_us();
+        s_burst_until_us = close_us;
+    }
+}
+
+/* True while this queued job is a burst DAY scan of the live session
+ * — the exec path uses it to pick the dense spacing.                 */
+static bool job_is_dense(const qjob_t *j, int64_t now)
+{
+    if (j->kind != JOB_DAY || !drift_live() ||
+        now > s_burst_until_us) {
+        return false;
+    }
+    return !strcmp(j->dir, drift_live()->day);
 }
 
 /* ---------------- task ---------------- */
@@ -573,6 +616,7 @@ void sched_run_forever(void)
         int64_t now = esp_timer_get_time();
         therapy_tick(now);
         estim_track_therapy(now);      /* session open/close on FSM   */
+        estim_housekeeping(now);       /* refit cadence + SOT persist */
 
         /* restored pre-boot budget expires only after this boot has
          * itself run 8 h (§6.1: expiry rounds late, never early)     */
@@ -593,6 +637,7 @@ void sched_run_forever(void)
             last_plan = now;
             if (s_link_up) {
                 plan_watch(now);
+                plan_dense(now);      /* U9 burst — profile-gated     */
                 plan_cold(now);
                 plan_neigh(now);
             }
@@ -603,8 +648,7 @@ void sched_run_forever(void)
         }
 
         /* spacing + budget + backoff */
-        bool dense = false;           /* dense acquisition is an opt-in
-                                         * profile — off in v1 */
+        bool dense = job_is_dense(&j, now);
         int64_t when = earliest_start(now, dense);
         if (when > now) {
             vTaskDelay(pdMS_TO_TICKS((when - now) / 1000 + 1));
@@ -627,7 +671,6 @@ void sched_run_forever(void)
         }
         xQueueReceive(s_q, &j, 0);
         s_last_req_us = esp_timer_get_time();
-        s_dense_minute++;
         sched_result_t r;
         exec_job(&j, &r);
         if (r.entries) {

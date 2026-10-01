@@ -18,7 +18,6 @@ SRCS="$SRCS components/catalog/catalog.c"
 SRCS="$SRCS components/scheduler/therapy.c"
 SRCS="$SRCS components/ble_api/ble_proto.c"
 SRCS="$SRCS components/drift/drift.c"
-SRCS="$SRCS components/drift/drift_fit.c"
 SRCS="$SRCS components/drift/edf_hdr.c"
 SRCS="$SRCS components/journal/journal.c"
 

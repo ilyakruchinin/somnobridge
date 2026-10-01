@@ -79,7 +79,7 @@ Host-side diagnostic for a bonded SomnoPal (needs `python3-dbus` +
 ./scripts/ble_query.py --status --catalog
 ./scripts/ble_query.py --days 14 --day 20240103
 ./scripts/ble_query.py --ls 'A:\'           # live card listing
-./scripts/ble_query.py --drift-auto         # newest day's last file
+./scripts/ble_query.py --drift              # live estimate + SOT envelope
 ./scripts/ble_query.py --time-sync 5        # run+commit a §8.1 anchor
 ./scripts/ble_query.py --evidence           # replay the evidence journal
 ./scripts/ble_query.py --json               # raw JSON

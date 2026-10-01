@@ -47,9 +47,43 @@ extern "C" {
 typedef struct {
     char     name[CAT_NAME_MAX];
     uint64_t size;
+    uint8_t  size_unit_shift;     /* log2 display unit (0=B,10=K..)  */
     bool     has_timestamp;
     char     timestamp_raw[CAT_STAMP_MAX];
+    char     dl_name[16];         /* card's 8.3 ?file= basename, ""  */
+                                  /* when only fname= was listed     */
 } cat_file_t;
+
+/* Per-file change events from one complete feed (spec §7 update tuple:
+ * a change in either of (size, stamp) is an update event — U3). The
+ * estimator consumes these; the FSM consumes diff->changed.        */
+typedef enum {
+    CAT_EV_NEW = 0,    /* file appeared in the new listing            */
+    CAT_EV_GREW,       /* size increased                              */
+    CAT_EV_SHRUNK,     /* size decreased (discontinuity suspect)      */
+    CAT_EV_STAMP,      /* timestamp changed (size same or differed)   */
+    CAT_EV_GONE,       /* vanished from the resident set              */
+} cat_ev_kind_t;
+
+#define CAT_EV_CAP 12
+
+typedef struct {
+    cat_ev_kind_t kind;
+    char     name[CAT_NAME_MAX];
+    uint64_t old_size, new_size;
+    bool     old_stamp_ok, new_stamp_ok;
+    char     old_stamp[CAT_STAMP_MAX];
+    char     new_stamp[CAT_STAMP_MAX];
+} cat_event_t;
+
+typedef struct {
+    bool        changed;          /* any update event / membership   */
+    int         n_events;
+    bool        overflowed;       /* more events than CAT_EV_CAP     */
+    int64_t     prev_scan_us;     /* folder's last_scan before this  */
+                                  /* feed; 0 = first-ever listing    */
+    cat_event_t ev[CAT_EV_CAP];
+} cat_diff_t;
 
 typedef enum {
     CAT_FOLDER_UNSCANNED = 0,  /* known to exist, not resident          */
@@ -90,15 +124,16 @@ esp_err_t cat_feed_parent(const ezs_entry_t *entries, int n,
                           int64_t now_us);
 
 /** Atomically replace a day's file set on successful listing.
- * `changed_out` (may be NULL) reports any file added/removed/resized/
- * re-stamped versus the previous resident set — the therapy FSM's
- * "relevant write" signal (§7).
- * `grown_out` (may be NULL) receives one file that grew or appeared —
- * the drift estimator's beacon candidate (§8.2). */
+ * `diff` (may be NULL) reports the complete-listing change set:
+ * `changed` is the therapy FSM's "relevant write" signal (§7); the
+ * per-file events carry old/new (size, timestamp_raw) tuples for the
+ * timestamp-first estimator (U3/U4). Events are emitted only across a
+ * RESIDENT->RESIDENT transition — a first-ever listing is a baseline,
+ * not evidence of writes. `prev_scan_us` is the previous feed's scan
+ * time (the estimator's "previous unchanged observation" bound).   */
 esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
                        const ezs_entry_t *entries, int n,
-                       int64_t now_us, bool *changed_out,
-                       cat_file_t *grown_out);
+                       int64_t now_us, cat_diff_t *diff);
 
 /** Mark a day's last refresh failed (keeps old entries, sets stale). */
 void cat_mark_folder_stale(const char day[CAT_DAY_STR]);

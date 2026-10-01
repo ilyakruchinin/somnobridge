@@ -22,6 +22,7 @@ esp_err_t nvs_set_blob(nvs_handle_t h, const char *key, const void *in,
                        size_t len);
 esp_err_t nvs_get_u32(nvs_handle_t h, const char *key, uint32_t *out);
 esp_err_t nvs_set_u32(nvs_handle_t h, const char *key, uint32_t v);
+esp_err_t nvs_erase_key(nvs_handle_t h, const char *key);
 esp_err_t nvs_erase_all(nvs_handle_t h);
 esp_err_t nvs_commit(nvs_handle_t h);
 const char *esp_err_to_name(esp_err_t e);

@@ -37,6 +37,7 @@ const void *settings_sec_cfg(void)
     static int dummy;
     return &dummy;
 }
+nvs_handle_t settings_nvs_metadata(void) { return 1; }
 const char *esp_err_to_name(esp_err_t e) { (void)e; return "ERR"; }
 
 static int kv_find(const char *key)
@@ -111,6 +112,15 @@ esp_err_t nvs_set_u32(nvs_handle_t h, const char *key, uint32_t v)
 {
     return nvs_set_blob(h, key, &v, sizeof(v));
 }
+esp_err_t nvs_erase_key(nvs_handle_t h, const char *key)
+{
+    (void)h;
+    int i = kv_find(key);
+    if (i < 0) return ESP_ERR_NVS_NOT_FOUND;
+    free(s_kv[i].data);
+    s_kv[i] = s_kv[--s_kv_n];
+    return ESP_OK;
+}
 esp_err_t nvs_erase_all(nvs_handle_t h)
 {
     (void)h;
@@ -168,7 +178,24 @@ static void test_parser(void)
         CHECK(!strcmp(e[3].name, "20240101_235752_BRP.edf") &&
               e[3].size == 72 * 1024, "72KB row");
         CHECK(e[2].has_timestamp, "file timestamp kept");
+        /* size units: raw bytes -> shift 0; 1KB/72KB -> shift 10     */
+        CHECK(e[1].size_unit_shift == 0, "raw byte size unit");
+        CHECK(e[2].size_unit_shift == 10 &&
+              e[3].size_unit_shift == 10, "KiB size unit");
+        /* download aliases: ?file= 8.3 basename retained; the fname=
+         * form has none and falls back at download time (U8)         */
+        CHECK(!strcmp(e[2].dl_name, "202609~1.EDF") &&
+              !strcmp(e[3].dl_name, "202609~5.EDF"),
+              "?file= basename captured");
+        CHECK(e[1].dl_name[0] == '\0', "fname= row has no dl_name");
     }
+    /* ceil-unit envelope (U8): exact <= listed < exact + unit        */
+    CHECK(ezs_size_within_listing(2048, 10, 1992), "1992 inside 2KB");
+    CHECK(ezs_size_within_listing(2048, 10, 2048), "exact at bound");
+    CHECK(!ezs_size_within_listing(2048, 10, 1024), "1024 outside 2KB");
+    CHECK(!ezs_size_within_listing(2048, 10, 2049), "over listed");
+    CHECK(ezs_size_within_listing(1992, 0, 1992), "raw bytes exact");
+    CHECK(!ezs_size_within_listing(1992, 0, 1993), "raw bytes strict");
     char file[256], token[24];
     CHECK(ezs_find_download_file(k_listing, "A:\\DATALOG\\20240101",
               "20240101_235752_BRP.edf", file, sizeof(file), token,
@@ -271,25 +298,51 @@ static void test_catalog(void)
         mk("20240103_220000_BRP.edf", 4096, "2024-01-03 22:01:00", false),
         mk("20240103_220000_PLD.edf", 8192, "2024-01-03 22:01:00", false),
     };
-    CHECK(cat_feed_day("20240103", f, 2, 2000, NULL, NULL) == ESP_OK, "day feed");
-    CHECK(cat_feed_day("20240102", f, 1, 3000, NULL, NULL) == ESP_OK, "older feed");
-    CHECK(cat_feed_day("20240101", f, 1, 4000, NULL, NULL) == ESP_OK, "oldest feed");
+    CHECK(cat_feed_day("20240103", f, 2, 2000, NULL) == ESP_OK, "day feed");
+    CHECK(cat_feed_day("20240102", f, 1, 3000, NULL) == ESP_OK, "older feed");
+    CHECK(cat_feed_day("20240101", f, 1, 4000, NULL) == ESP_OK, "oldest feed");
     CHECK(cat_catalog_complete(), "complete after all scanned");
 
     cat_file_t got;
     CHECK(cat_find_file("20240103", "20240103_220000_PLD.edf", &got) &&
           got.size == 8192, "file lookup");
 
-    /* change detection: identical re-feed -> false; size bump -> true */
-    bool ch = true;
-    cat_feed_day("20240103", f, 2, 5000, &ch, NULL);
-    CHECK(!ch, "unchanged listing -> no change");
+    /* change detection: identical re-feed -> false; size bump -> true.
+     * Events carry old/new (size,stamp) tuples per file (U3).        */
+    cat_diff_t d;
+    cat_feed_day("20240103", f, 2, 5000, &d);
+    CHECK(!d.changed && !d.n_events, "unchanged listing -> no change");
+    CHECK(d.prev_scan_us == 2000, "prev scan bound reported");
+
     f[1].size = 9000;
-    cat_feed_day("20240103", f, 2, 6000, &ch, NULL);
-    CHECK(ch, "grown file -> change");
+    cat_feed_day("20240103", f, 2, 6000, &d);
+    CHECK(d.changed && d.n_events == 1, "grown file -> one event");
+    CHECK(d.n_events && d.ev[0].kind == CAT_EV_GREW &&
+          d.ev[0].old_size == 8192 && d.ev[0].new_size == 9000 &&
+          !strcmp(d.ev[0].name, "20240103_220000_PLD.edf"),
+          "grew event carries both sizes");
+
     f[1].size = 8192;
-    cat_feed_day("20240103", f, 2, 7000, &ch, NULL);
-    CHECK(ch, "shrunk file -> change (rewrite-suspect)");
+    cat_feed_day("20240103", f, 2, 7000, &d);
+    CHECK(d.changed && d.ev[0].kind == CAT_EV_SHRUNK,
+          "shrunk file -> change (rewrite-suspect)");
+
+    /* timestamp-only flush: same size, new stamp -> STAMP event (U3) */
+    strcpy(f[1].timestamp_raw, "2024-01-03 22:02:02");
+    cat_feed_day("20240103", f, 2, 8000, &d);
+    CHECK(d.changed && d.n_events == 1 &&
+          d.ev[0].kind == CAT_EV_STAMP &&
+          !strcmp(d.ev[0].old_stamp, "2024-01-03 22:01:00") &&
+          !strcmp(d.ev[0].new_stamp, "2024-01-03 22:02:02"),
+          "stamp-only change -> STAMP event");
+
+    /* membership: file removed -> GONE; re-added -> NEW               */
+    cat_feed_day("20240103", f, 1, 9000, &d);
+    CHECK(d.changed && d.n_events == 1 && d.ev[0].kind == CAT_EV_GONE,
+          "removed file -> GONE");
+    cat_feed_day("20240103", f, 2, 10000, &d);
+    CHECK(d.n_events == 1 && d.ev[0].kind == CAT_EV_NEW &&
+          d.ev[0].new_stamp_ok, "re-added file -> NEW");
 
     cat_file_t out[4];
     CHECK(cat_day_entries("20240103", out, 4) == 2, "day entries");
@@ -403,7 +456,32 @@ static void test_framing(void)
     }
 }
 
-/* ---------------- drift anchors + fit ---------------- */
+/* ---------------- drift anchors + stamp estimator ---------------- */
+
+/* dev_s (unix seconds) -> "YYYY-MM-DD HH:MM:SS" for fixture rows. */
+static void fmt_stamp(int64_t dev_s, char *out)
+{
+    long days = dev_s / 86400;
+    long rem  = dev_s % 86400;
+    if (rem < 0) { rem += 86400; days--; }
+    long z   = days + 719468;
+    long era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int  y   = (int)yoe + (int)era * 400;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp  = (5 * doy + 2) / 153;
+    int  d   = (int)(doy - (153 * mp + 2) / 5 + 1);
+    int  m   = (int)mp + (mp < 10 ? 3 : -9);
+    y += m <= 2;
+    if (y < 0) y = 0;
+    if (y > 9999) y = 9999;            /* bound %04d for -Wformat-trunc */
+    if (m < 1 || m > 12 || d < 1 || d > 31) {
+        m = 1; d = 1;                  /* unreachable for real inputs   */
+    }
+    snprintf(out, 24, "%04d-%02d-%02d %02ld:%02ld:%02ld",
+             y, m, d, rem / 3600, (rem / 60) % 60, rem % 60);
+}
 
 static void test_drift(void)
 {
@@ -440,28 +518,328 @@ static void test_drift(void)
                            1000 + 6LL * 1000 * 1000) == ESP_OK,
           "expired pending entry does not block id reuse");
 
+    /* ---- stamp parsing (U4): card rows are space-padded ---- */
+    int64_t ms, ms2;
+    CHECK(drift_stamp_parse("2026- 9-30   14: 9:52", &ms), "stamp parse");
+    CHECK(drift_stamp_parse("2026-09-30 14:09:54", &ms2) &&
+          ms2 - ms == 2, "stamp delta consistent");
+    CHECK(!drift_stamp_parse("garbage", &ms), "bad stamp rejected");
+    CHECK(!drift_stamp_parse("2026-13-30 14:09:54", &ms),
+          "month out of range");
+    CHECK(!drift_stamp_parse("2026-09-30 14:09:54x", &ms),
+          "trailing junk rejected");
+
+    /* ---- beacon classification (U3): sampled vs annotation ---- */
+    CHECK(drift_beacon_class("20240103_220000_BRP.edf") == DRIFT_BC_BRP,
+          "BRP beacon");
+    CHECK(drift_beacon_class("20240103_220000_PLD.edf") == DRIFT_BC_PLD,
+          "PLD beacon");
+    CHECK(drift_beacon_class("20240103_220000_SA2.edf") == DRIFT_BC_SA2,
+          "SA2 beacon");
+    CHECK(drift_beacon_class("20240103_220000_CSL.edf") == DRIFT_BC_ANNOT,
+          "CSL is annotation, not a beacon");
+    CHECK(drift_beacon_class("20240103_220000_EVE.edf") == DRIFT_BC_ANNOT,
+          "EVE is annotation");
+    CHECK(drift_beacon_class("STR.edf") == DRIFT_BC_NONE, "none");
+
+    /* ---- interval-intersection estimator (U4) ----
+     * Anchors map mono -> utc = mono + U. The device clock is Ddev
+     * seconds ahead, so a write at true instant w carries stamp
+     * floor((U + w)/2s)*2 + Ddev. Scan bounds come from the catalog
+     * diff (prev unchanged scan -> upper bound via changed response). */
+    const int64_t U    = 1700000000LL * 1000000LL;   /* anchor utc base */
+    const int64_t Ddev = 100;                        /* dev +100 s      */
+    drift_test_anchor(0, U, 2000, 7);
+    drift_test_anchor(900LL * 1000 * 1000,
+                      U + 900LL * 1000 * 1000, 2000, 7);
+
+    char ts[32];
+    fmt_stamp((U / 1000000) + 200 + Ddev, ts);   /* stamp M0 visible at
+                                                    * the baseline    */
+    ezs_entry_t fs[1];
+    fs[0] = mk("20240103_220000_BRP.edf", 4096, ts, false);
+
     drift_session_t s;
-    drift_sess_begin(&s, 0, 0);
-    drift_sess_header(&s, 512, 2000, 60, 0);
-    CHECK(drift_sess_observe(&s, 0, 61000000, 512 + 2000), "obs1");
-    CHECK(drift_sess_observe(&s, 61000000, 122000000, 512 + 4000), "obs2");
-    CHECK(drift_sess_fit(&s, 55000000, 65000000,
-                         -90000000, 90000000), "fit converges");
-    /* 1µs fp slack: vertices can sit epsilon outside a bound         */
-    CHECK(s.p_lo_us >= 55000000 - 2 && s.p_hi_us <= 65000000 + 2,
-          "P within prior");
+    drift_sess_begin(&s, 60000000, 300000);      /* C=60 s, J=0.3 s    */
+    memcpy(s.day, "20240103", sizeof(s.day));
 
-    drift_record_t rec;
-    drift_build_record(&s, &rec);
-    CHECK(rec.has_period, "period published even without anchors");
-    CHECK(strstr(rec.flags, "timing_unvalidated"), "unvalidated flag");
+    cat_init();
+    cat_diff_t df;
 
-    char js[2048];
-    int jl = drift_record_json(&rec, "[]", NULL, js, sizeof(js));
-    CHECK(jl > 50 && strstr(js, "\"estimate_state\""), "json emitted");
-    CHECK(strstr(js, "\"clock_drift_ms\":null") ||
-          strstr(js, "\"clock_drift_ms\":"),
-          "drift field present (null or value)");
+    /* baseline feed — folder not yet resident -> baseline, no events */
+    cat_feed_day("20240103", fs, 1, 200000, &df);
+    CHECK(df.changed && df.n_events == 0, "first feed is a baseline");
+    drift_feed_scan(&s, "20240103", fs, 1, &df, 200000, 210000);
+    CHECK(s.n_ev == 0 && s.beacon[0], "baseline picks beacon, no ev");
+
+    /* unchanged scan sets the previous-observation bound             */
+    cat_feed_day("20240103", fs, 1, 250000, &df);
+    CHECK(!df.changed, "quiet listing");
+    drift_feed_scan(&s, "20240103", fs, 1, &df, 250000000, 250300000);
+    CHECK(s.n_ev == 0, "quiet -> no events");
+
+    /* flush observed: stamp +60 s (write inside (250.3 s, 320.8 s])  */
+    int64_t w = U + 300LL * 1000 * 1000 + Ddev * 1000000LL;
+    fmt_stamp(((w / 1000000) / 2) * 2, ts);      /* FAT 2 s floor      */
+    strcpy(fs[0].timestamp_raw, ts);
+    fs[0].size = 6144;
+    cat_feed_day("20240103", fs, 1, 320000, &df);
+    CHECK(df.n_events == 1 && (df.ev[0].kind == CAT_EV_STAMP ||
+          df.ev[0].kind == CAT_EV_GREW), "change produces an event");
+    int added = drift_feed_scan(&s, "20240103", fs, 1, &df,
+                                320300000LL, 320500000LL);
+    CHECK(added == 1, "transition event appended");
+    drift_sess_eval(&s, 321000000);
+    CHECK(s.est_bound_valid, "one window gives a bound");
+    CHECK(s.tier == ACC_APPROXIMATE, "single window -> approximate");
+    /* offset must contain -Ddev (true-device, device is ahead)       */
+    CHECK(s.off_lo_us / 1000 <= -Ddev * 1000 &&
+          s.off_hi_us / 1000 >= -Ddev * 1000, "bound contains offset");
+    /* U4.3: the stamp is [M, M+2) — lo subtracts M+2, hi subtracts
+     * M. Asymmetry is the quantization term; verify both edges       */
+    {
+        int64_t M   = ((w / 1000000) / 2) * 2 * 1000000; /* stamp µs  */
+        int64_t elo = (U + 139700000) - (M + 2000000);   /* win_lo−M+2*/
+        int64_t ehi = (U + 320800000) - M;               /* win_hi−M  */
+        CHECK(s.off_lo_us <= elo + 50000 &&
+              s.off_lo_us >= elo - 50000,
+              "lo edge carries the +2 s stamp quant");
+        CHECK(s.off_hi_us >= ehi - 50000 &&
+              s.off_hi_us <= ehi + 50000,
+              "hi edge uses M (not M+2)");
+    }
+
+    /* second independent window keeps narrowing the bound            */
+    cat_feed_day("20240103", fs, 1, 380000, &df);
+    drift_feed_scan(&s, "20240103", fs, 1, &df, 380000000, 380300000);
+    w = U + 360LL * 1000 * 1000 + Ddev * 1000000LL;
+    fmt_stamp(((w / 1000000) / 2) * 2, ts);
+    strcpy(fs[0].timestamp_raw, ts);
+    fs[0].size = 8192;
+    cat_feed_day("20240103", fs, 1, 440000, &df);
+    added = drift_feed_scan(&s, "20240103", fs, 1, &df,
+                            440300000LL, 440500000LL);
+    CHECK(added == 1 && s.n_ev == 2, "second transition");
+    drift_sess_eval(&s, 441000000);
+    CHECK(s.n_windows == 2, "two independent windows");
+    CHECK(s.est_bound_valid &&
+          s.off_lo_us / 1000 <= -Ddev * 1000 &&
+          s.off_hi_us / 1000 >= -Ddev * 1000,
+          "intersection still contains the true offset");
+    int64_t half1 = s.off_hi_us - s.off_lo_us;
+    CHECK(half1 > 0, "nonempty interval");
+
+    /* backwards stamp -> segment split, never interpolated through   */
+    fmt_stamp((U / 1000000) + 10, ts);           /* wildly old stamp   */
+    strcpy(fs[0].timestamp_raw, ts);
+    cat_feed_day("20240103", fs, 1, 500000, &df);
+    added = drift_feed_scan(&s, "20240103", fs, 1, &df,
+                            500300000LL, 500500000LL);
+    drift_sess_eval(&s, 501000000);
+    CHECK(s.flag_bits & DF_BACKWARD, "backwards stamp flagged");
+    CHECK(s.n_splits >= 1 && s.n_segments >= 2, "segment split");
+
+    /* empty intersection -> contradiction -> new segment. Cadence-
+     * plausible stamps (small ddev vs dmono) that nevertheless cannot
+     * coexist inside one offset bound — needs tight windows, so run
+     * it under a characterized profile.                              */
+    {
+        drift_profile_t saved = *drift_profile();
+        drift_profile_t tight = saved;
+        tight.latency_lo_us = 0;
+        tight.latency_hi_us = 500000;      /* 0.5 s                  */
+        tight.stamp_channel_validated = true;
+        drift_profile_set(&tight);
+
+        drift_sess_begin(&s, 500000, 100000);   /* C=0.5 s, J=0.1 s  */
+        memcpy(s.day, "20240103", sizeof(s.day));
+
+        cat_init();
+        fmt_stamp(U / 1000000 + 300, ts);
+        strcpy(fs[0].timestamp_raw, ts);
+        cat_feed_day("20240103", fs, 1, 200000, &df);
+        drift_feed_scan(&s, "20240103", fs, 1, &df, 240000000, 240100000);
+
+        /* quiet scan bound just ahead of event A                     */
+        cat_feed_day("20240103", fs, 1, 250000, &df);
+        drift_feed_scan(&s, "20240103", fs, 1, &df, 300000000, 300050000);
+
+        /* event A: stamp U_s+400 -> offset ~-100 s, tight bound      */
+        fmt_stamp(U / 1000000 + 400, ts);
+        strcpy(fs[0].timestamp_raw, ts);
+        cat_feed_day("20240103", fs, 1, 320000, &df);
+        drift_feed_scan(&s, "20240103", fs, 1, &df, 301000000, 301050000);
+
+        cat_feed_day("20240103", fs, 1, 380000, &df);
+        drift_feed_scan(&s, "20240103", fs, 1, &df, 360000000, 360050000);
+
+        /* event B: stamp +55 s over ~60 s mono — plausible cadence
+         * but its offset interval sits ~5 s above A's bound          */
+        fmt_stamp(U / 1000000 + 455, ts);
+        strcpy(fs[0].timestamp_raw, ts);
+        cat_feed_day("20240103", fs, 1, 440000, &df);
+        drift_feed_scan(&s, "20240103", fs, 1, &df, 361000000, 361050000);
+
+        drift_sess_eval(&s, 362000000);
+        CHECK(s.flag_bits & DF_CONTRADICTION, "empty intersection flagged");
+        CHECK(s.n_splits >= 1, "contradiction split the segment");
+        CHECK(!(s.flag_bits & DF_STEP), "cadence stayed plausible");
+
+        drift_profile_set(&saved);
+    }
+}
+
+/* ---------------- tiers, dense windows, SOT (U5/U6/U9) --------------
+ * A *validated* profile shrinks the windows to the certified tier;
+ * two independent windows inside the ±2 s gate -> ACCURATE -> the SOT
+ * promotes and persists; NVS round-trip + corruption covered.       */
+static void test_sot(void)
+{
+    drift_profile_t base = *drift_profile();   /* restore at the end   */
+    drift_profile_t prof = base;
+    prof.stamp_channel_validated = true;
+    prof.cache_bound_us    = 500000;           /* 0.5 s                */
+    prof.latency_lo_us     = 0;
+    prof.latency_hi_us     = 500000;
+    prof.jitter_us         = 100000;
+    prof.accurate_half_us  = 2000000;
+    prof.dev_rate_ppm      = 50;
+    prof.dense_enabled     = true;
+    prof.dense_spacing_us  = 500000;
+    drift_profile_set(&prof);
+
+    drift_reset();
+    nvs_stub_reset();
+    cat_init();
+    drift_sot_invalidate();
+
+    const int64_t U = 1700000000LL * 1000000LL;
+    const int64_t D = 100;                     /* device +100 s ahead  */
+    drift_test_anchor(0, U, 2000, 9);
+    drift_test_anchor(900LL * 1000 * 1000,
+                      U + 900LL * 1000 * 1000, 2000, 9);
+
+    char ts[32];
+    fmt_stamp(U / 1000000 + 200 + D, ts);
+    ezs_entry_t fs[1] = { mk("20240103_220000_BRP.edf", 4096, ts, false) };
+    cat_diff_t df;
+    drift_session_t *ls;
+    int64_t w;
+
+    /* baseline: resident listing, no session yet                     */
+    cat_feed_day("20240103", fs, 1, 200000000, &df);
+    CHECK(df.n_events == 0, "baseline feed quiet");
+
+    /* unchanged scan at 219.74 s — then a dense-window flush         */
+    cat_feed_day("20240103", fs, 1, 219740000, &df);
+    /* mid-session join: the first changed listing opens the session —
+     * sched gates on diff.n_events; reproduce that here             */
+    w = U + 220LL * 1000 * 1000 + D * 1000000LL;
+    fmt_stamp((w / 1000000 / 2) * 2, ts);
+    strcpy(fs[0].timestamp_raw, ts);
+    fs[0].size = 6144;
+    cat_feed_day("20240103", fs, 1, 220240000, &df);
+    CHECK(df.n_events == 1, "flush observed as catalog event");
+    drift_live_begin("20240103");
+    ls = drift_live();
+    CHECK(ls != NULL, "live session open");
+    /* first feed carries the event; the prev bound comes from the
+     * catalog's prev_scan_us (219.74 s baseline scan) — U4.          */
+    CHECK(drift_feed_scan(ls, "20240103", fs, 1, &df,
+                          220240000, 220480000) == 1, "joined mid-run");
+    drift_sess_eval(ls, 220500000);
+    CHECK(ls->est_bound_valid, "bound from mid-session join");
+    CHECK(ls->tier != ACC_ACCURATE, "one window can't be accurate");
+    CHECK(ls->off_lo_us <= -D * 1000000 && ls->off_hi_us >= -D * 1000000,
+          "window contains the true -100 s offset");
+
+    /* second flush, same spacing -> two independent windows          */
+    cat_feed_day("20240103", fs, 1, 279740000, &df);
+    drift_feed_scan(ls, "20240103", fs, 1, &df, 279740000, 279980000);
+    w = U + 280LL * 1000 * 1000 + D * 1000000LL;
+    fmt_stamp((w / 1000000 / 2) * 2, ts);
+    strcpy(fs[0].timestamp_raw, ts);
+    fs[0].size = 8192;
+    cat_feed_day("20240103", fs, 1, 280240000, &df);
+    drift_feed_scan(ls, "20240103", fs, 1, &df, 280240000, 280480000);
+    drift_sess_eval(ls, 280500000);
+    CHECK(ls->n_windows == 2, "two independent windows");
+    CHECK(ls->tier == ACC_ACCURATE, "accurate tier met");
+    CHECK(ls->off_hi_us - ls->off_lo_us <= 4000000,
+          "half-width <= 2 s gate");
+    CHECK(ls->off_lo_us <= -D * 1000000 &&
+          ls->off_hi_us >= -D * 1000000, "SOT interval correct");
+
+    /* SOT promoted + persisted                                        */
+    drift_sot_t sot;
+    CHECK(drift_sot_view(&sot) && sot.valid, "SOT promoted");
+    CHECK(sot.origin == DRIFT_SOT_SESSION, "SOT from live session");
+    CHECK(sot.accuracy_half_ms <= 2000, "SOT inside gate");
+
+    /* supersede ordering: a later accurate fit supersedes; a fit with
+     * an older computed_at never displaces the newer SOT (U6)        */
+    int64_t comp1 = sot.computed_at_ms;
+    drift_sess_eval(ls, 282000000);
+    CHECK(drift_sot_view(&sot) && sot.computed_at_ms > comp1,
+          "newer accurate supersedes");
+    comp1 = sot.computed_at_ms;
+    drift_sess_eval(ls, 281500000);          /* older fit instant     */
+    CHECK(drift_sot_view(&sot) && sot.computed_at_ms == comp1,
+          "older eval never displaces SOT");
+
+    CHECK(drift_sot_dirty(), "SOT dirty before commit");
+    CHECK(drift_sot_commit(true, 281000000) == ESP_OK, "SOT persisted");
+    CHECK(!drift_sot_dirty(), "clean after commit");
+
+    /* NVS round-trip: reload gives the same value, origin = NVS       */
+    CHECK(drift_sot_load() == ESP_OK, "SOT reloads");
+    CHECK(drift_sot_view(&sot) && sot.origin == DRIFT_SOT_NVS &&
+          sot.clock_drift_ms <= -99000 && sot.clock_drift_ms >= -104000,
+          "reloaded SOT matches");
+
+    /* corrupt blob -> rejected, never a fabricated value              */
+    nvs_stub_corrupt("drift_sot");
+    drift_sot_invalidate();
+    CHECK(drift_sot_load() != ESP_OK, "corrupt SOT rejected");
+    CHECK(!drift_sot_view(&sot), "no SOT after corrupt+invalidate");
+
+    /* freeze outside therapy: a closed session's eval cannot promote —
+     * (the live-end eval itself may promote; the frozen SOT survives) */
+    drift_live_end(290000000);
+    CHECK(drift_live() == NULL, "session closed");
+    drift_sot_invalidate();
+    drift_sess_eval(drift_last(), 300000000);
+    CHECK(!drift_sot_view(&sot), "closed session cannot promote SOT");
+
+    /* GET_DRIFT envelope pieces: the closed session's record stays
+     * published (observation_closed), carries the accurate tier and
+     * bound; the SOT JSON carries origin + persisted_seq             */
+    drift_record_t pub;
+    CHECK(drift_pub_get(&pub) && pub.observation_closed,
+          "closed record stays published");
+    char jb[3072];
+    CHECK(drift_estimate_json(&pub, jb, sizeof(jb)) > 0 &&
+          strstr(jb, "\"accuracy_tier\":\"accurate\"") &&
+          strstr(jb, "\"estimate_state\":\"validated\"") &&
+          strstr(jb, "\"clock_drift_ms\":-") &&
+          strstr(jb, "\"files\":[{"),
+          "estimate JSON carries the accurate bound");
+    /* SOT view is empty post-invalidate — simulate the stored value  */
+    drift_sot_t sim = { .valid = true, .clock_drift_ms = -100000,
+                        .lo_ms = -101900, .hi_ms = -98100,
+                        .accuracy_half_ms = 1900,
+                        .computed_at_ms = U / 1000 + 280000,
+                        .reference_at_ms = U / 1000 + 280200,
+                        .persisted_seq = 7, .origin = DRIFT_SOT_NVS };
+    CHECK(drift_sot_json(&sim, jb, sizeof(jb)) > 0 &&
+          strstr(jb, "\"origin\":\"nvs\"") &&
+          strstr(jb, "\"persisted_seq\":7"),
+          "SOT JSON carries origin+seq");
+    /* empty combo: no session ever -> pub invalid -> estimate null   */
+    drift_reset();
+    CHECK(!drift_pub_get(NULL), "no session -> estimate null");
+
+    drift_profile_set(&base);        /* restore the build profile     */
 }
 
 /* ---------------- EDF fixed header (§8.2) ---------------- */
@@ -556,6 +934,7 @@ int main(void)
     test_therapy();
     test_framing();
     test_drift();
+    test_sot();
     test_edf();
     test_journal();
     if (fails) {

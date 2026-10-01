@@ -279,18 +279,39 @@ esp_err_t cat_feed_parent(const ezs_entry_t *entries, int n,
     return ESP_OK;
 }
 
+/* Emit one change event into the diff (bounded; overflow is flagged
+ * rather than silently dropped — the estimator must not see a partial
+ * truth, §11.2). */
+static void diff_emit(cat_diff_t *d, cat_ev_kind_t kind,
+                      const cat_file_t *oldf, const cat_file_t *newf)
+{
+    if (d->n_events >= CAT_EV_CAP) {
+        d->overflowed = true;
+        return;
+    }
+    cat_event_t *e = &d->ev[d->n_events++];
+    memset(e, 0, sizeof(*e));
+    e->kind = kind;
+    const cat_file_t *named = newf ? newf : oldf;
+    strncpy(e->name, named->name, CAT_NAME_MAX - 1);
+    if (oldf) {
+        e->old_size = oldf->size;
+        e->old_stamp_ok = oldf->has_timestamp;
+        strncpy(e->old_stamp, oldf->timestamp_raw, CAT_STAMP_MAX - 1);
+    }
+    if (newf) {
+        e->new_size = newf->size;
+        e->new_stamp_ok = newf->has_timestamp;
+        strncpy(e->new_stamp, newf->timestamp_raw, CAT_STAMP_MAX - 1);
+    }
+}
+
 esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
                        const ezs_entry_t *entries, int n,
-                       int64_t now_us, bool *changed_out,
-                       cat_file_t *grown_out)
+                       int64_t now_us, cat_diff_t *diff)
 {
-    if (changed_out) {
-        *changed_out = false;
-    }
-    if (grown_out) {
-        grown_out->name[0] = '\0';
-        grown_out->size = 0;
-        grown_out->has_timestamp = false;
+    if (diff) {
+        memset(diff, 0, sizeof(*diff));
     }
     /* build new entry set in scratch first (atomic replace, §5.2) */
     cat_file_t *nf = NULL;
@@ -311,10 +332,14 @@ esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
         strncpy(nf[w].name, entries[i].name, CAT_NAME_MAX - 1);
         nf[w].name[CAT_NAME_MAX - 1] = '\0';
         nf[w].size = entries[i].size;
+        nf[w].size_unit_shift = entries[i].size_unit_shift;
         nf[w].has_timestamp = entries[i].has_timestamp;
         strncpy(nf[w].timestamp_raw, entries[i].timestamp_raw,
                 CAT_STAMP_MAX - 1);
         nf[w].timestamp_raw[CAT_STAMP_MAX - 1] = '\0';
+        strncpy(nf[w].dl_name, entries[i].dl_name,
+                sizeof(nf[w].dl_name) - 1);
+        nf[w].dl_name[sizeof(nf[w].dl_name) - 1] = '\0';
         w++;
     }
 
@@ -329,58 +354,60 @@ esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
         s_psram_used -= n * (int)sizeof(cat_file_t);
         return ESP_ERR_NO_MEM;
     }
-    /* detect change: size/stamp differs, file added, or file removed —
-     * any of these is a "relevant write" for the therapy FSM (§7)      */
+    if (diff) {
+        diff->prev_scan_us = f->last_scan_us;
+    }
+    /* diff the resident set against the new listing; every tuple
+     * difference is an update event (size, stamp, membership — U3)  */
     bool changed = (f->state != CAT_FOLDER_RESIDENT) ||
                    (w != f->n_files);
-    cat_file_t grown = {0};
     if (f->state == CAT_FOLDER_RESIDENT) {
-        /* find one grown/added file for the estimator beacon (§8.2):
-         * size increase or newly-appeared entry carries a usable size */
-        for (int i = 0; i < w && !grown.name[0]; i++) {
-            bool matched = false;
+        for (int i = 0; i < w; i++) {
+            const cat_file_t *old = NULL;
             for (int j = 0; j < f->n_files; j++) {
                 if (!strcmp(f->files[j].name, nf[i].name)) {
-                    matched = true;
-                    if (nf[i].size > f->files[j].size) {
-                        grown = nf[i];
-                    }
+                    old = &f->files[j];
                     break;
                 }
             }
-            if (!matched) {
-                grown = nf[i];   /* newly appeared                  */
+            if (!old) {
+                if (diff) diff_emit(diff, CAT_EV_NEW, NULL, &nf[i]);
+                changed = true;
+                continue;
+            }
+            bool stamp_diff =
+                nf[i].has_timestamp != old->has_timestamp ||
+                (nf[i].has_timestamp &&
+                 strcmp(nf[i].timestamp_raw, old->timestamp_raw));
+            if (nf[i].size != old->size || stamp_diff) {
+                changed = true;
+                if (!diff) {
+                    continue;
+                }
+                cat_ev_kind_t k = stamp_diff ? CAT_EV_STAMP
+                    : (nf[i].size > old->size ? CAT_EV_GREW
+                                              : CAT_EV_SHRUNK);
+                diff_emit(diff, k, old, &nf[i]);
             }
         }
-    }
-    if (!changed) {
-        for (int i = 0; i < w && !changed; i++) {
-            bool matched = false;
-            for (int j = 0; j < f->n_files; j++) {
+        for (int j = 0; j < f->n_files; j++) {
+            bool gone = true;
+            for (int i = 0; i < w; i++) {
                 if (!strcmp(f->files[j].name, nf[i].name)) {
-                    matched = true;
-                    if (nf[i].size != f->files[j].size ||
-                        nf[i].has_timestamp != f->files[j].has_timestamp ||
-                        (nf[i].has_timestamp &&
-                         strcmp(nf[i].timestamp_raw,
-                                f->files[j].timestamp_raw))) {
-                        changed = true;
-                    }
+                    gone = false;
                     break;
                 }
             }
-            if (!matched) {
+            if (gone) {
+                if (diff) diff_emit(diff, CAT_EV_GONE, &f->files[j], NULL);
                 changed = true;
             }
         }
     }
-    if (grown_out && grown.name[0]) {
-        *grown_out = grown;
-    }
     if (changed) {
         f->active = true;         /* a folder that ever wrote stays hot */
-        if (changed_out) {
-            *changed_out = true;
+        if (diff) {
+            diff->changed = true;
         }
     }
     /* budget enforcement: evict oldest cold folders if over ceiling */

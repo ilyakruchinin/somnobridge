@@ -173,6 +173,7 @@ static ezs_err_t meta_parse(const char *m, ezs_entry_t *e)
             return EZS_ERR_MALFORMED;
         }
         e->size = sz << shift;
+        e->size_unit_shift = (uint8_t)shift;
         tl = (size_t)(tok - m);
     }
 
@@ -241,6 +242,33 @@ static bool href_is_download(const char *href)
     const char *p = href_path(href);
     return p && (!strncmp(p, "download?", 9) ||
                  !strncmp(p, "/download?", 10));
+}
+
+/* Extract the basename of a download href's file= parameter (the
+ * card's canonical ?file=DATALOG\..\SHORT~1.EDF addressing). Stored as
+ * just the last path component — the directory is always rebuilt from
+ * the caller's canonical dir, so a hostile or mismatched dir component
+ * can only produce a same-folder 8.3 name, never traversal (§11.1). */
+static bool href_file_base(const char *href, char *out, size_t cap)
+{
+    const char *f = strstr(href, "file=");
+    if (!f) {
+        return false;
+    }
+    f += 5;
+    const char *a = strchr(f, '&');
+    size_t n = a ? (size_t)(a - f) : strlen(f);
+    const char *base = f + n;
+    while (base > f && base[-1] != '\\' && base[-1] != '/') {
+        base--;
+    }
+    n = f + n - base;
+    if (!n || n >= cap) {
+        return false;
+    }
+    memcpy(out, base, n);
+    out[n] = '\0';
+    return true;
 }
 
 /* Extract fname= value from a download href (already entity-decoded). */
@@ -506,6 +534,12 @@ ezs_err_t ezs_parse_dir(const char *body,
                 }
                 strncpy(e.name, lname, sizeof(e.name) - 1);
             }
+            /* retain the ?file= basename when it is a sane filename —
+             * the download path prefers the card's own addressing    */
+            if (!href_file_base(href, e.dl_name, sizeof(e.dl_name)) ||
+                ezp_validate_name(e.dl_name) != EZP_OK) {
+                e.dl_name[0] = '\0';
+            }
         } else {
             strncpy(e.name, lname, sizeof(e.name) - 1);
         }
@@ -516,4 +550,17 @@ ezs_err_t ezs_parse_dir(const char *body,
         entries[(*n_out)++] = e;
     }
     return EZS_OK;
+}
+
+bool ezs_size_within_listing(uint64_t listed, uint8_t size_unit_shift,
+                             uint64_t exact)
+{
+    if (!listed) {
+        return false;
+    }
+    uint64_t unit = size_unit_shift ? (1ULL << size_unit_shift) : 1;
+    /* listed = ceil(exact/unit)*unit  <=>  exact <= listed < exact+unit
+     * — equivalently listed-unit < exact <= listed (unit 1 = exact).
+     * Difference form avoids the exact+unit overflow edge.           */
+    return exact <= listed && listed - exact < unit;
 }
