@@ -92,6 +92,27 @@ which is the fastest way to confirm the drift machinery end to end.
 Measured RTT includes host D-Bus/Python overhead, so treat it as an
 upper bound — on-device processing shows up separately.
 
+## Timing characterization
+
+```bash
+python3 scripts/validate_timing.py self-test
+python3 scripts/validate_timing.py history --day YYYYMMDD
+python3 scripts/validate_timing.py capture --day YYYYMMDD --duration 1200
+python3 scripts/validate_timing.py analyze --input /tmp/somnopal-validation-XXXX/evidence.jsonl
+```
+
+Evidence defaults to a private temporary directory with a mode-0600 JSONL
+file. Only timing/layout metadata is retained; patient fields and waveforms
+are not saved. Capture uses cached BLE catalog reads, existing serial poll
+logs, and read-only SomnoTrace GetDateTime RPCs; it does not add card polls
+or start/stop therapy. It owns the serial reader: stop capture before flashing.
+The current LIST_DAY `scan_age_us` field actually contains the device's
+last scan-start monotonic timestamp, not an age. The recorder accounts for
+this legacy behavior. Host time-source uncertainty comes from chrony's root
+distance; if it exceeds 100 ms, firmware anchors cannot qualify, though
+exchange timings remain available for offline analysis. These observations
+alone do not establish a high-precision write-latency bound.
+
 ## Host tests
 
 Pure-logic modules compile with plain `cc` against stub ESP headers:

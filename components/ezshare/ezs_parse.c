@@ -7,10 +7,12 @@
  * every row must conform or the whole listing is rejected.
  */
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "ezs_parse.h"
+#include "ezs_path.h"
 
 /* ---------------- helpers ---------------- */
 
@@ -305,8 +307,11 @@ static int href_value(const char *p, const char *end,
     if (n + 1 > cap) {
         return -1;
     }
-    decode_entities(a, n, out, cap);
-    return (int)strlen(out);
+    size_t decoded = decode_entities(a, n, out, cap);
+    if (memchr(out, '\0', decoded)) {
+        return -1;
+    }
+    return (int)decoded;
 }
 
 /* Link text between '>' and '<' after the href tag close. */
@@ -344,6 +349,77 @@ static const char *link_text(const char *p, const char *end,
     }
     return lt;                       /* resume scan after '<'      */
 }
+
+bool ezs_find_download_file(const char *body, const char *directory,
+                            const char *name, char *file, size_t file_cap,
+                            char *size_token, size_t token_cap)
+{
+    if (!body || !directory || !name || !file || !size_token ||
+        !file_cap || !token_cap) return false;
+    file[0] = size_token[0] = '\0';
+    const char *end, *p = find_pre(body, &end);
+    if (!p || !end) return false;
+    while (p < end) {
+        const char *le = memchr(p, '\n', (size_t)(end - p));
+        if (!le) le = end;
+        const char *line = p;
+        p = le == end ? end : le + 1;
+        const char *a = NULL;
+        for (const char *q = line; q + 2 < le; q++) {
+            if (*q == '<' && tolower((unsigned char)q[1]) == 'a' &&
+                isspace((unsigned char)q[2])) { a = q; break; }
+        }
+        if (!a) continue;
+        char href[256], label[EZS_NAME_MAX];
+        if (href_value(a, le, href, sizeof(href)) < 0 ||
+            !link_text(a, le, label, sizeof(label))) return false;
+        if (strcmp(label, name) || !href_is_download(href)) continue;
+        const char *path = href_path(href);
+        const char *query = strchr(path, '?');
+        const char *value = NULL;
+        size_t value_len = 0;
+        for (const char *q = query + 1; *q; ) {
+            const char *stop = strchr(q, '&');
+            if (!stop) stop = q + strlen(q);
+            if ((size_t)(stop - q) >= 5 && !strncmp(q, "file=", 5)) {
+                if (value) return false;
+                value = q + 5;
+                value_len = (size_t)(stop - value);
+            }
+            if (!*stop) break;
+            q = stop + 1;
+        }
+        if (!value || !value_len || value_len > EZP_DIR_MAX) continue;
+        char input[EZP_DIR_MAX + 4], canon[EZP_DIR_MAX + 4];
+        int n = snprintf(input, sizeof(input), "A:\\%.*s", (int)value_len, value);
+        if (n < 0 || (size_t)n >= sizeof(input) ||
+            ezp_canon_dir(input, canon, sizeof(canon)) != EZP_OK) return false;
+        char *last = strrchr(canon, '\\');
+        if (!last || last == canon + 2) return false;
+        *last = '\0';
+        bool same = strlen(canon) == strlen(directory);
+        for (size_t i = 0; same && canon[i]; i++) {
+            same = tolower((unsigned char)canon[i]) ==
+                   tolower((unsigned char)directory[i]);
+        }
+        *last = '\\';
+        if (!same || strlen(canon + 3) >= file_cap) return false;
+        char meta[128];
+        decode_entities(line, (size_t)(a - line), meta, sizeof(meta));
+        char *tail = meta + strlen(meta);
+        while (tail > meta && isspace((unsigned char)tail[-1])) tail--;
+        char *token = tail;
+        while (token > meta && !isspace((unsigned char)token[-1])) token--;
+        size_t token_len = (size_t)(tail - token);
+        if (!token_len || token_len >= token_cap) return false;
+        strcpy(file, canon + 3);
+        memcpy(size_token, token, token_len);
+        size_token[token_len] = '\0';
+        return true;
+    }
+    return false;
+}
+
 
 ezs_err_t ezs_parse_dir(const char *body,
                         ezs_entry_t *entries, int *n_out)

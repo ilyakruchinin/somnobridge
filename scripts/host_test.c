@@ -169,6 +169,24 @@ static void test_parser(void)
               e[3].size == 72 * 1024, "72KB row");
         CHECK(e[2].has_timestamp, "file timestamp kept");
     }
+    char file[256], token[24];
+    CHECK(ezs_find_download_file(k_listing, "A:\\DATALOG\\20240101",
+              "20240101_235752_BRP.edf", file, sizeof(file), token,
+              sizeof(token)), "resolve listing-derived download file");
+    CHECK(!strcmp(file, "DATALOG\\20240101\\202609~5.EDF") &&
+          !strcmp(token, "72KB"), "short-name path and size token retained");
+    CHECK(!ezs_find_download_file(k_listing, "A:\\DATALOG\\20240102",
+              "20240101_235752_BRP.edf", file, sizeof(file), token,
+              sizeof(token)), "reject download path in another directory");
+    CHECK(!ezs_find_download_file(k_listing, "A:\\DATALOG\\20240101",
+              "missing.edf", file, sizeof(file), token, sizeof(token)),
+              "reject missing download alias");
+    const char *traversal =
+        "<pre>2024-01-01 00:00:00 1KB "
+        "<a href=\"download?file=DATALOG%5C20240101%5C..%5CSTR.edf\">X.edf</a>\n</pre>";
+    CHECK(!ezs_find_download_file(traversal, "A:\\DATALOG\\20240101",
+              "X.edf", file, sizeof(file), token, sizeof(token)),
+              "reject listing-derived traversal");
 
     const char *login = "<html><form action=\"/login\"></form></html>";
     CHECK(ezs_parse_dir(login, e, &n) == EZS_ERR_NOT_LISTING,

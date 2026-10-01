@@ -53,6 +53,9 @@ typedef enum {
  */
 ezs_err_t ezs_parse_dir(const char *body,
                         ezs_entry_t *entries, int *n_out);
+bool ezs_find_download_file(const char *body, const char *directory,
+                            const char *name, char *file, size_t file_cap,
+                            char *size_token, size_t token_cap);
 
 /** True if the row looks like a valid day folder name (YYYYMMDD, real date). */
 bool ezs_is_valid_day(const char *name);

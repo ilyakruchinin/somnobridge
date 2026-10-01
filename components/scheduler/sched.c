@@ -373,9 +373,11 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
                 therapy_on_growth(now);   /* relevant write (§7.1)     */
                 estim_on_growth(j->dir, &grown, &r->obs);  /* §8.3     */
             }
-            ESP_LOGI(TAG, "day %s: %d listed, changed=%d grown=%s",
+            ESP_LOGI(TAG, "day %s: %d listed, changed=%d grown=%s s=%lld r=%lld",
                      j->dir, r->n_entries, (int)changed,
-                     grown.name[0] ? grown.name : "-");
+                     grown.name[0] ? grown.name : "-",
+                     (long long)r->obs.req_start_us,
+                     (long long)r->obs.resp_end_us);
             ledger_add(therapy_status()->state != THERAPY_OUT, now);
             obs_success(true);
         } else {
