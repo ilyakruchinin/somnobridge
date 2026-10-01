@@ -1131,28 +1131,38 @@ int drift_sot_json(const drift_sot_t *s, char *buf, size_t cap)
 bool drift_dense_window(int64_t now_us, int64_t *open_us,
                         int64_t *close_us)
 {
-    if (!s_live || !s_prof.dense_enabled || !s_live_sess.n_resp) {
+    (void)now_us;
+    if (!s_live || !s_prof.dense_enabled || !s_live_sess.n_resp ||
+        !s_live_sess.anchor_used) {
         return false;
     }
-    /* refine only the first few observed flushes — the intersection
-     * floor is met after ~2–3 independent windows (U9)              */
-    if (s_live_sess.n_ev >= 6) {
+    /* stop when the published bound is already inside the accurate
+     * gate — further bursts buy nothing (U9)                        */
+    if (s_live_sess.est_bound_valid &&
+        s_live_sess.off_hi_us - s_live_sess.off_lo_us <=
+            2 * (int64_t)s_prof.accurate_half_us) {
         return false;
     }
+    /* the next write lands ~one cadence after the last one, whose
+     * mono write-window is [req_lo, resp_hi] of the newest event.
+     * Anchor the burst to the WINDOW EDGES: a resp-anchored
+     * prediction is late by the unknown observation delay (the write
+     * became visible sometime before the scan that showed it, U9) —
+     * the edges cover the write wherever it landed, plus the 2 s
+     * stamp quantization of the next observation.                    */
+    const drift_ev_t *e =
+        &s_live_sess.ev[s_live_sess.n_ev - 1];
     int64_t period = 0;
     for (int i = 0; i < s_live_sess.n_resp; i++) {
         period += s_live_sess.resp_deltas[i];
     }
     period /= s_live_sess.n_resp;
-    int64_t margin = s_live_sess.n_resp >= 3
-                       ? (int64_t)s_prof.dense_margin_tight_us
-                       : (int64_t)s_prof.dense_margin_loose_us;
-    int64_t pred = s_live_sess.last_ev_resp_us + period;
-    if (now_us < pred - margin || now_us > pred + margin) {
-        return false;
-    }
-    if (open_us)  *open_us = pred - margin;
-    if (close_us) *close_us = pred + margin;
+    int64_t lo = e->req_lo_us + period
+               - 2000000LL - (int64_t)s_live_sess.jitter_us;
+    int64_t hi = e->resp_hi_us + period
+               + 2000000LL + (int64_t)s_live_sess.jitter_us;
+    if (open_us)  *open_us = lo;
+    if (close_us) *close_us = hi;
     return true;
 }
 

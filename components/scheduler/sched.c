@@ -32,7 +32,10 @@ static const char *TAG = "sched";
 #define ACTIVE_CAP_8H      700
 #define LEDGER_BUCKETS     481
 #define LEDGER_BUCKET_US   (60LL * 1000 * 1000)
-#define ACQ_BUDGET_PER_SET 40              /* dense-burst req cap/set */
+#define ACQ_BUDGET_PER_SET 80              /* dense-burst req cap/set —
+     * characterization phase: the first burst window spans the full
+     * offset uncertainty (~35 polls at 2 s); a second tightened
+     * window needs ~22 more. The global ledger cap still applies. */
 #define ACQ_DENSE_MINUTE   40              /* dense starts/minute     */
 #define SVC_WINDOW         8               /* day-listing svc median  */
 
@@ -202,14 +205,27 @@ static void svc_note(int64_t req_us, int64_t resp_us)
     }
 }
 
-/* Effective dense spacing: the profile's 0.5 s, widened when the
- * service-time median approaches it (U9). */
+/* Effective dense spacing: the profile's 0.5 s, widened so the scan
+ * allowance covers the current burst window (~24 polls each, U9
+ * adaptive shape), and widened again when the service-time median
+ * approaches it. Never sparser than 2 s. */
+static int64_t  s_burst_span_us;   /* width of the armed burst window */
+
 static int64_t dense_gap_us(void)
 {
     int64_t gap = (int64_t)drift_profile()->dense_spacing_us;
+    if (s_burst_span_us > 0) {
+        int64_t fit = s_burst_span_us / 24;
+        if (fit > gap) {
+            gap = fit;                 /* cover the window in-budget   */
+        }
+    }
     int64_t med = svc_median_us();
     if (med && med * 4 > gap * 3) {
         gap = med * 2;                 /* keep service < 50% of gap    */
+    }
+    if (gap > 2000000) {
+        gap = 2000000;
     }
     return gap;
 }
@@ -243,6 +259,12 @@ static void estim_feed_day(const char *day, const ezs_entry_t *ents,
                            const ezw_obs_t *obs, int64_t now)
 {
     drift_session_t *ls = drift_live();
+    if (ls && strcmp(ls->day, day)) {
+        /* a different day folder is writing — the old session is over
+         * (midnight rollover while monitoring stayed up, U4)         */
+        drift_live_end(now);
+        ls = NULL;
+    }
     if (!ls && diff && diff->n_events > 0) {
         /* file-level activity observed — open a session bound to this
          * day folder (mid-session join supported, U4)                */
@@ -309,13 +331,14 @@ static void estim_track_therapy(int64_t now)
 {
     therapy_state_t cur = therapy_status()->state;
     if (cur != s_prev_therapy) {
-        /* session ends on OUT (therapy over) or on a regression to
-         * UNKNOWN (monitoring lost) — the UNKNOWN->IN transition is
-         * caused by the same growth that opens a session, so it must
-         * not close it                                                */
-        if (cur == THERAPY_OUT ||
-            (cur == THERAPY_UNKNOWN &&
-             s_prev_therapy == THERAPY_IN)) {
+        /* the session ends ONLY on OUT (therapy over). An IN->UNKNOWN
+         * regression is a monitoring gap, not a session end: the day
+         * folder, beacon, and clock are unchanged, so the accumulated
+         * windows remain valid evidence — closing would discard the
+         * dense-bracketed bound on every transient listing failure
+         * (U4/U6). Growth resuming re-feeds the same session; a new
+         * day's growth is handled by the day check in estim_feed_day */
+        if (cur == THERAPY_OUT) {
             /* freeze + persist the final estimate (U6 IN->OUT)      */
             drift_session_t *ls = drift_live();
             if (ls) {
@@ -414,6 +437,7 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
                      (long long)r->obs.resp_end_us);
             ledger_add(therapy_status()->state != THERAPY_OUT, now);
             obs_success(true);
+            therapy_note_listing(now);   /* monitor alive (§6.3)       */
         } else {
             s_round_failed = true;
             cat_mark_folder_stale(j->dir);
@@ -524,22 +548,24 @@ static void plan_neigh(int64_t now)
 }
 
 /* ---------------- dense burst (U9) ----------------
- * Armed only when the estimator predicts a flush AND the
- * characterization profile has enabled dense polling. One burst
- * request at a time, 0.5 s nominal spacing (service-time guarded),
- * stops the moment the stamp moves (drift_dense_window recomputes the
- * prediction from the changed response, pushing the next window one
- * cadence out — the burst self-terminates).                           */
+ * Armed while the estimator's bound is still outside the accurate
+ * gate and the characterization profile has enabled dense polling.
+ * The burst window (drift_dense_window) spans the next write's full
+ * uncertainty — wide at first, shrinking as the offset tightens —
+ * and the pacing widens so ~24 polls cover it. Each observed
+ * transition re-anchors the window one cadence out.                  */
 
 static void plan_dense(int64_t now)
 {
     int64_t open_us, close_us;
     if (!drift_dense_window(now, &open_us, &close_us)) {
         s_burst_until_us = 0;
+        s_burst_span_us = 0;
         return;
     }
+    s_burst_span_us = close_us - open_us;
     if (s_burst_reqs >= ACQ_BUDGET_PER_SET) {
-        return;                        /* 40/set allowance spent      */
+        return;                        /* per-set allowance spent      */
     }
     /* per-minute dense-start cap (§6.2)                              */
     if (now - s_dense_minute_at_us >= 60LL * 1000 * 1000) {

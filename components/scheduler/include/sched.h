@@ -44,6 +44,7 @@ const therapy_status_t *therapy_status(void);
 void  therapy_init(void);
 void  therapy_tick(int64_t now_us);
 void  therapy_on_growth(int64_t now_us);   /* any relevant write      */
+void  therapy_note_listing(int64_t now_us); /* successful listing, changed or not */
 void  therapy_on_quiet_round(int64_t now_us); /* full no-change pass  */
 void  therapy_on_gap(void);                /* monitoring interruption */
 void  therapy_note_resume_check(void);     /* stream END gate         */

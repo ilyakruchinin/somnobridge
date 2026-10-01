@@ -714,6 +714,53 @@ static void test_drift(void)
         CHECK(!strcmp(s2.beacon, "20240103_230000_BRP.edf"),
               "picks the latest same-class file");
     }
+
+    /* dense burst window (U9): anchored to the last event's
+     * write-window edges + fitted cadence — exercised on the live
+     * session, since the planner reads the singleton               */
+    {
+        drift_reset();
+        drift_test_anchor(0, U, 2000, 7);
+        drift_test_anchor(900LL * 1000 * 1000,
+                          U + 900LL * 1000 * 1000, 2000, 7);
+        drift_live_begin("20240103");
+        drift_session_t *ls = drift_live();
+        cat_init();
+        cat_diff_t d3;
+        char ts3[32];
+        fmt_stamp(U / 1000000 + 300, ts3);
+        ezs_entry_t f3[1] = { mk("20240103_220000_BRP.edf", 4096, ts3,
+                                 false) };
+        cat_feed_day("20240103", f3, 1, 200000, &d3);
+        drift_feed_scan(ls, "20240103", f3, 1, &d3, 200000000, 200100000);
+        cat_feed_day("20240103", f3, 1, 250000, &d3);
+        drift_feed_scan(ls, "20240103", f3, 1, &d3, 260000000, 260100000);
+        fmt_stamp(U / 1000000 + 360, ts3);       /* flush 1           */
+        strcpy(f3[0].timestamp_raw, ts3);
+        f3[0].size = 6144;
+        cat_feed_day("20240103", f3, 1, 320000, &d3);
+        drift_feed_scan(ls, "20240103", f3, 1, &d3, 320000000, 320100000);
+        cat_feed_day("20240103", f3, 1, 380000, &d3);
+        drift_feed_scan(ls, "20240103", f3, 1, &d3, 380000000, 380100000);
+        fmt_stamp(U / 1000000 + 420, ts3);       /* flush 2           */
+        strcpy(f3[0].timestamp_raw, ts3);
+        f3[0].size = 8192;
+        cat_feed_day("20240103", f3, 1, 440000, &d3);
+        drift_feed_scan(ls, "20240103", f3, 1, &d3, 440000000, 440100000);
+        drift_sess_eval(ls, 441000000);
+        CHECK(ls->n_ev == 2 && ls->n_resp == 1,
+              "two events, cadence fitted");
+        int64_t dopen = 0, dclose = 0;
+        CHECK(drift_dense_window(450000000, &dopen, &dclose),
+              "dense window armed while bound is loose");
+        int64_t J = (int64_t)ls->jitter_us;
+        CHECK(dopen == ls->ev[1].req_lo_us + ls->resp_deltas[0]
+                        - 2000000 - J &&
+              dclose == ls->ev[1].resp_hi_us + ls->resp_deltas[0]
+                        + 2000000 + J,
+              "burst window covers the write uncertainty");
+        drift_live_end(450000000);
+    }
 }
 
 /* ---------------- tiers, dense windows, SOT (U5/U6/U9) --------------

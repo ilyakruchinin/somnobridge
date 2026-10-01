@@ -65,6 +65,16 @@ void therapy_on_growth(int64_t now_us)
     s_th.transfer_allowed = false;
 }
 
+/* A completed, successfully-parsed listing — changed or not — proves
+ * the monitor is alive. Freshness must age from the last successful
+ * listing, not from the last write: a quiet scan mid-therapy is
+ * monitoring continuity, not a gap (§6.3).                        */
+void therapy_note_listing(int64_t now_us)
+{
+    s_last_ok_us = now_us;
+    s_th.therapy_stale = false;
+}
+
 void therapy_on_quiet_round(int64_t now_us)
 {
     /* caller guarantees: a complete parent+hot round with zero writes */
