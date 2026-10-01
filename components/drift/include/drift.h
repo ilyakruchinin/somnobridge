@@ -228,6 +228,9 @@ bool             drift_live_is(void);
 bool             drift_last_closed(void);
 void             drift_live_begin(const char *day);
 void             drift_live_end(int64_t now_us); /* therapy gap / OUT */
+/* Reactivate a closed session if the same day folder resumed — keeps
+ * retained evidence rather than discarding it (update2 §3.5).       */
+bool             drift_live_resume(const char *day);
 
 void drift_sess_begin(drift_session_t *s, uint32_t cache_bound_us,
                       uint32_t jitter_us);

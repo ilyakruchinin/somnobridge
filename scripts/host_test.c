@@ -753,6 +753,21 @@ static void test_drift(void)
               ls->flush_period_ms == 60000,
               "two events, 60 s cadence fitted");
         drift_live_end(450000000);
+        /* resume semantics (update2 §3.5): a closed same-day session
+         * reactivates with its evidence; a different day must not    */
+        CHECK(drift_last_closed() && !drift_live(),
+              "ended session is retained-closed");
+        CHECK(!drift_live_resume("20240104"), "different day: no resume");
+        CHECK(drift_live_resume("20240103"), "same day resumes");
+        CHECK(drift_live() && drift_live()->n_ev == 2 &&
+              drift_live()->n_deltas == 2,
+              "evidence kept across the gap");
+        drift_live_end(460000000);
+        CHECK(drift_live_resume("20240103"), "re-closed: resumes again");
+        CHECK(drift_live() && drift_live()->n_ev == 2,
+              "evidence still intact");
+        CHECK(!drift_live_resume("20240103"), "while live: no-op");
+        drift_live_end(470000000);
     }
 }
 

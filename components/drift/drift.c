@@ -370,6 +370,26 @@ void drift_live_end(int64_t now_us)
     s_live = false;
 }
 
+bool drift_live_resume(const char *day)
+{
+    /* Reactivate a closed session when the SAME day folder resumes
+     * writing — an AS11 pause/resume or a transient monitoring gap is
+     * not a new observation domain: the card clock and the monotonic
+     * map are unchanged, so retained events remain valid bounds (a
+     * genuine clock step contradicts them honestly via DF_STEP /
+     * DF_CONTRADICTION segmentation). The only cost is that this
+     * feed's prev-scan bound dates from before the gap — a wider,
+     * still-correct interval (update2 §3.5). A different day is a
+     * different session entirely.                                   */
+    if (!s_closed || s_live || !day ||
+        strncmp(s_live_sess.day, day, sizeof(s_live_sess.day))) {
+        return false;
+    }
+    s_closed = false;
+    s_live = true;
+    return true;
+}
+
 /* ---------------- stamp-event feed (U3/U4) ---------------- */
 
 static int bc_prio(drift_beacon_t b)

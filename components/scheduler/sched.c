@@ -265,15 +265,26 @@ static int estim_feed_day(const char *day, const ezs_entry_t *ents,
 {
     drift_session_t *ls = drift_live();
     if (ls && strcmp(ls->day, day)) {
-        /* a different day folder is writing — the old session is over
-         * (midnight rollover while monitoring stayed up, U4)         */
-        drift_live_end(now);
-        ls = NULL;
+        if (diff && diff->n_events > 0) {
+            /* a different day folder is WRITING — the old session is
+             * over (midnight rollover while monitoring stayed up,
+             * U4). A quiet coverage pull of another folder is just
+             * coverage: it must NOT end the live session — the day
+             * is still the active one, only absent from this listing */
+            drift_live_end(now);
+            ls = NULL;
+        } else {
+            return -1;           /* foreign folder, nothing to feed   */
+        }
     }
     if (!ls && diff && diff->n_events > 0) {
         /* file-level activity observed — open a session bound to this
-         * day folder (mid-session join supported, U4)                */
-        drift_live_begin(day);
+         * day folder (mid-session join supported, U4). A same-day
+         * reopen after a monitoring/OUT gap resumes the retained
+         * evidence rather than discarding it (update2 §3.5)          */
+        if (!drift_live_resume(day)) {
+            drift_live_begin(day);
+        }
         ls = drift_live();
         ESP_LOGI(TAG, "estim: session opened day=%s", day);
     }
@@ -440,7 +451,10 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
             cat_diff_t diff;
             memset(&diff, 0, sizeof(diff));
             cat_feed_day(j->dir, r->entries, r->n_entries, now, &diff);
-            if (diff.changed) {
+            if (diff.n_events > 0) {
+                /* a RESIDENT->RESIDENT write, not a baseline relist —
+                 * diff.changed alone also fires on a folder's first
+                 * listing, which emits no events and is not growth   */
                 s_round_growth = true;
                 therapy_on_growth(now);   /* relevant write (§7.1) —
                     * stamp-only changes count identically (U3)       */
@@ -520,8 +534,10 @@ static void update_track_target(void)
     if (ls && ls->day[0]) {
         want = ls->day;
     } else {
-        char days[1][CAT_DAY_STR];
-        if (cat_list_days(days, 1) > 0) {
+        /* cat_list_days truncates at cap BEFORE its internal sort —
+         * asking for 1 yields the first table entry, not the newest  */
+        char days[8][CAT_DAY_STR];
+        if (cat_list_days(days, 8) > 0) {
             memcpy(dbuf, days[0], CAT_DAY_STR);
             want = dbuf;
         }

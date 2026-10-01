@@ -422,6 +422,25 @@ driven by `sched.c`:
   a +20 s phase-jump reacquire, beacon swap, day change, an oversized
   bracket, an all-failed window, and the `enabled=false` kill switch.
 
+Field-found fixes (first live flash, 2026-10-01):
+
+- `cat_list_days(days, 1)` truncates at cap *before* its internal
+  qsort — it returned the first table entry (an empty stale folder)
+  rather than the newest day. The track target now fetches 8 and takes
+  `[0]` after the sort.
+- `diff.changed` is true on a folder's baseline listing (no events
+  emitted); gating `therapy_on_growth` on it produced a phantom
+  `new_growth` IN at every boot. The growth gate is now
+  `diff.n_events > 0` — an observed write between resident listings.
+- The live estimator session was ending on **any** foreign-day feed —
+  every 60 s coverage pull of a neighbor folder killed it, resetting
+  the phase fit and capping `windows` at 1–2 (observed as ~±5 s
+  wandering bounds and flip-flopping `closed`). The kill now requires
+  `n_events > 0` on the foreign folder (real rollover only), and a
+  closed same-day session **resumes with its evidence** via
+  `drift_live_resume` — a pause/OUT gap is not a new observation
+  domain on an unchanged clock.
+
 Not yet done (deliberately): the §6.3 filename-origin offset path
 (uncharacterized), `phase_refine_enabled` defaults off pending
 characterization, and tightened latency/cache priors — night 1 runs
