@@ -8,6 +8,10 @@ measured evidence in `docs/validation-results.md` (masked-session validation
 against an independent AS11 clock reference). All other guarantees of the
 base spec stand.
 
+**Poll scheduling is superseded by `implementation-update2-spec.md`**
+(phase-tracking schedule); the estimator, tiers, SOT, and API sections
+here remain normative.
+
 Goal: **the API MUST always be able to return a high-accuracy time-drift
 value.** Serve the newest accurate-tier value when one exists; otherwise the
 last accurate value persisted in NVS. Never substitute an approximate value
