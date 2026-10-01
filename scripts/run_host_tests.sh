@@ -24,5 +24,5 @@ SRCS="$SRCS components/journal/journal.c"
 
 OUT="${TMPDIR:-/tmp}/somnopal-host-test"
 cc -std=c11 -Wall -Wextra -Werror -g -O0 \
-    $INC $SRCS scripts/host_test.c -o "$OUT"
+    $INC $SRCS scripts/host_test.c -lm -o "$OUT"
 "$OUT"

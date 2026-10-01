@@ -73,6 +73,9 @@ typedef struct {
     job_kind_t kind;
     int        prio;             /* lower = sooner (0 = post-check) */
     uint32_t   min_gap_us;       /* min start spacing; 0 = default  */
+    int64_t    deadline_us;      /* latest useful completion; 0 none */
+    bool       required;         /* monitoring safety, not optional  */
+    bool       phase_job;        /* owns one phase pull token        */
     char       dir[JOB_DIR_MAX]; /* canonical A:\ dir or day name   */
     char       name[JOB_NAME_MAX];
     /* completion callback — runs on card worker context           */

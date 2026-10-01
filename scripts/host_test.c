@@ -8,9 +8,12 @@
  * BLE framing, drift anchors/fit. Synthetic fixtures only.
  */
 #include <assert.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "esp_crc.h"
 
 #include "ezs_parse.h"
 #include "ezs_path.h"
@@ -858,13 +861,13 @@ static void test_sot(void)
     CHECK(sot.origin == DRIFT_SOT_SESSION, "SOT from live session");
     CHECK(sot.accuracy_half_ms <= 2000, "SOT inside gate");
 
-    /* supersede ordering: a later accurate fit supersedes; a fit with
-     * an older computed_at never displaces the newer SOT (U6)        */
+    /* update3: recomputation alone does not displace persisted
+     * history. The same slot changes only on a materially tighter or
+     * non-overlapping bound, not merely because it is newer.          */
     int64_t comp1 = sot.computed_at_ms;
     drift_sess_eval(ls, 282000000);
-    CHECK(drift_sot_view(&sot) && sot.computed_at_ms > comp1,
-          "newer accurate supersedes");
-    comp1 = sot.computed_at_ms;
+    CHECK(drift_sot_view(&sot) && sot.computed_at_ms == comp1,
+          "same-width re-eval does not supersede");
     drift_sess_eval(ls, 281500000);          /* older fit instant     */
     CHECK(drift_sot_view(&sot) && sot.computed_at_ms == comp1,
           "older eval never displaces SOT");
@@ -880,7 +883,7 @@ static void test_sot(void)
           "reloaded SOT matches");
 
     /* corrupt blob -> rejected, never a fabricated value              */
-    nvs_stub_corrupt("drift_sot");
+    nvs_stub_corrupt("drift_sot_q");
     drift_sot_invalidate();
     CHECK(drift_sot_load() != ESP_OK, "corrupt SOT rejected");
     CHECK(!drift_sot_view(&sot), "no SOT after corrupt+invalidate");
@@ -922,6 +925,260 @@ static void test_sot(void)
     CHECK(!drift_pub_get(NULL), "no session -> estimate null");
 
     drift_profile_set(&base);        /* restore the build profile     */
+}
+
+/* ---------------- update3: filename candidates + SOT tiers -------- */
+
+static void feed_quiet(const char *day, ezs_entry_t *fs, int n,
+                       cat_diff_t *df, int64_t req_us, int64_t resp_us,
+                       drift_session_t *s)
+{
+    cat_feed_day(day, fs, n, req_us, df);
+    drift_feed_scan(s, day, fs, n, df, req_us, resp_us);
+}
+
+static void test_update3(void)
+{
+    drift_profile_t base = *drift_profile();
+    const int64_t F = 1704319200LL * 1000000LL;  /* 2024-01-03 22:00Z */
+    char ts[32];
+    cat_diff_t df;
+    drift_sot_t sot;
+
+    CHECK(drift_filename_local("20240103_220000_BRP.edf",
+                               &(int64_t){0}), "filename parses");
+    CHECK(!drift_filename_local("20240103_246000_BRP.edf",
+                                &(int64_t){0}), "bad filename rejected");
+
+    drift_reset();
+    nvs_stub_reset();
+    cat_init();
+    drift_sot_invalidate();
+    drift_profile_t p = base;
+    p.cache_bound_us = 0;
+    p.jitter_us = 0;
+    p.latency_lo_us = 0;
+    p.latency_hi_us = 0;
+    p.dev_rate_ppm = 100;
+    p.stamp_channel_validated = false;
+    p.filename_encoding = DRIFT_ENC_TRUNCATED;
+    p.filename_origin_bounded = true;
+    p.fname_create_lo_us = 0;
+    p.fname_create_hi_us = 500000;
+    p.filename_periodic_bounded = true;
+    p.fname_period_lo_us = 0;
+    p.fname_period_hi_us = 500000;
+    p.filename_create_validated = false;
+    p.filename_periodic_validated = false;
+    drift_profile_set(&p);
+    drift_timezone_set("UTC0", true);
+    drift_test_anchor(0, F, 1000, 21);
+    drift_test_anchor(900LL * 1000 * 1000, F + 900LL * 1000 * 1000,
+                      1000, 21);
+
+    /* Creation candidate: one bounded file-appearance event supplies a
+     * displayable filename-origin estimate, separate from the mtime
+     * fallback.                                                        */
+    {
+        drift_session_t s;
+        drift_sess_begin(&s, 0, 0);
+        memcpy(s.day, "20240103", sizeof(s.day));
+        cat_feed_day("20240103", NULL, 0, 10000000, &df);
+        drift_feed_scan(&s, "20240103", NULL, 0, &df,
+                        10000000, 10200000);
+        fmt_stamp(F / 1000000, ts);
+        ezs_entry_t fs[1] = {
+            mk("20240103_220000_BRP.edf", 4096, ts, false)
+        };
+        cat_feed_day("20240103", fs, 1, 10500000, &df);
+        CHECK(df.n_events == 1 && df.ev[0].kind == CAT_EV_NEW,
+              "appearance is a creation event");
+        CHECK(drift_feed_scan(&s, "20240103", fs, 1, &df,
+                              10500000, 10700000) == 1,
+              "creation evidence appended");
+        drift_sess_eval(&s, 10800000);
+        CHECK(s.n_create_ev == 1, "creation candidate observed");
+        CHECK(s.preferred_source == DRIFT_SRC_FNAME_CREATE,
+              "narrower creation source selected");
+        drift_record_t rec;
+        CHECK(drift_pub_get(&rec) && rec.candidates[1].available,
+              "creation candidate published");
+        CHECK(!rec.candidates[2].available &&
+              strstr(rec.candidates[2].reason, "no_periodic_event"),
+              "periodic candidate has explicit reason");
+        char jb[4096];
+        CHECK(drift_estimate_json(&rec, jb, sizeof(jb)) > 0 &&
+              strstr(jb, "\"preferred_source\":\"filename_creation\"") &&
+              strstr(jb, "filename_creation_interval_ms"),
+              "candidate JSON emitted");
+    }
+
+    /* Periodic filename candidate: each transition must resolve to one
+     * cycle by intersecting the filename/period model with its mtime
+     * bin; an inconsistent stamp makes the candidate unavailable.      */
+    {
+        drift_session_t s;
+        drift_sess_begin(&s, 0, 0);
+        memcpy(s.day, "20240103", sizeof(s.day));
+        fmt_stamp(F / 1000000, ts);
+        ezs_entry_t fs[1] = {
+            mk("20240103_220000_BRP.edf", 4096, ts, false)
+        };
+        cat_feed_day("20240103", fs, 1, 0, &df);
+        drift_feed_scan(&s, "20240103", fs, 1, &df, 0, 200000);
+        feed_quiet("20240103", fs, 1, &df, 59000000, 59200000, &s);
+        fmt_stamp(F / 1000000 + 60, ts);
+        strcpy(fs[0].timestamp_raw, ts);
+        fs[0].size = 6144;
+        cat_feed_day("20240103", fs, 1, 59800000, &df);
+        drift_feed_scan(&s, "20240103", fs, 1, &df,
+                        59800000, 60000000);
+        feed_quiet("20240103", fs, 1, &df, 119000000, 119200000, &s);
+        fmt_stamp(F / 1000000 + 120, ts);
+        strcpy(fs[0].timestamp_raw, ts);
+        fs[0].size = 8192;
+        cat_feed_day("20240103", fs, 1, 119800000, &df);
+        drift_feed_scan(&s, "20240103", fs, 1, &df,
+                        119800000, 120000000);
+        drift_sess_eval(&s, 120100000);
+        CHECK(s.n_periodic_ev == 2 && s.periodic_cycle_valid,
+              "periodic cycles resolved");
+        CHECK(s.preferred_source == DRIFT_SRC_FNAME_PERIODIC,
+              "periodic filename source selected");
+        CHECK(s.off_lo_us <= 0 && s.off_hi_us >= 0,
+              "periodic bound contains true offset");
+
+        fmt_stamp(F / 1000000 + 125, ts);       /* no 60 s cycle match */
+        strcpy(fs[0].timestamp_raw, ts);
+        cat_feed_day("20240103", fs, 1, 125400000, &df);
+        drift_feed_scan(&s, "20240103", fs, 1, &df,
+                        125400000, 125600000);
+        drift_sess_eval(&s, 125700000);
+        CHECK(s.flag_bits & DF_CYCLE_AMBIG,
+              "cycle ambiguity flagged");
+        CHECK(!s.periodic_cycle_valid &&
+              s.preferred_source == DRIFT_SRC_MTIME,
+              "ambiguous periodic candidate cannot win");
+    }
+
+    /* Provisional SOT: three distinct mtime windows inside ±5 s persist
+     * without touching the qualified slot. Failed writes stay dirty.   */
+    {
+        drift_profile_t q = p;
+        q.filename_periodic_bounded = false;
+        drift_profile_set(&q);
+        drift_reset();
+        nvs_stub_reset();
+        cat_init();
+        drift_sot_invalidate();
+        drift_timezone_set("UTC0", true);
+        drift_test_anchor(0, F, 1000, 22);
+        drift_test_anchor(900LL * 1000 * 1000,
+                          F + 900LL * 1000 * 1000, 1000, 22);
+        drift_live_begin("20240103");
+        drift_session_t *ls = drift_live();
+        fmt_stamp(F / 1000000, ts);
+        ezs_entry_t fs[1] = {
+            mk("20240103_220000_BRP.edf", 4096, ts, false)
+        };
+        cat_feed_day("20240103", fs, 1, 0, &df);
+        drift_feed_scan(ls, "20240103", fs, 1, &df, 0, 200000);
+        for (int i = 1; i <= 3; i++) {
+            int64_t rq = i * 60000000LL - 200000;
+            feed_quiet("20240103", fs, 1, &df, rq, rq + 200000, ls);
+            fmt_stamp(F / 1000000 + i * 60, ts);
+            strcpy(fs[0].timestamp_raw, ts);
+            fs[0].size = 4096 + i * 2048;
+            cat_feed_day("20240103", fs, 1, rq + 800000, &df);
+            drift_feed_scan(ls, "20240103", fs, 1, &df,
+                            rq + 800000, rq + 1000000);
+        }
+        drift_sess_eval(ls, 181000000);
+        CHECK(ls->n_windows >= 3 && ls->n_segments == 1,
+              "three distinct provisional windows");
+        CHECK(!drift_sot_view(&sot), "qualified SOT absent");
+        CHECK(drift_sot_slot_view(DRIFT_SOT_PROVISIONAL, &sot) &&
+              sot.quality == DRIFT_Q_PROVISIONAL,
+              "provisional SOT offered");
+        CHECK(drift_sot_best(&sot) &&
+              sot.quality == DRIFT_Q_PROVISIONAL,
+              "best view returns provisional explicitly");
+
+        int64_t alo, ahi;
+        int64_t w0 = sot.hi_ms - sot.lo_ms;
+        CHECK(drift_sot_apply(&sot, sot.ref_mono_us + 8LL * 3600 * 1000000,
+                              &alo, &ahi), "SOT can be re-referenced");
+        CHECK(ahi - alo >= w0 + 14000,
+              "rate uncertainty expands persisted bound");
+
+        nvs_stub_fail_writes(1);
+        CHECK(drift_sot_commit(true, 182000000) != ESP_OK &&
+              drift_sot_dirty(), "failed SOT write remains dirty");
+        CHECK(drift_sot_commit(true, 183000000) == ESP_OK &&
+              !drift_sot_dirty(), "SOT retry persists");
+        CHECK(drift_sot_slot_view(DRIFT_SOT_PROVISIONAL, &sot) &&
+              sot.persisted_seq == 1, "persisted seq advances once");
+        CHECK(drift_sot_load() == ESP_OK &&
+              drift_sot_slot_view(DRIFT_SOT_PROVISIONAL, &sot) &&
+              sot.freshness_unknown,
+              "restored record starts freshness-unknown");
+        CHECK(!drift_sot_apply(&sot, 184000000, &alo, &ahi),
+              "restored record not applicable before fresh anchor");
+
+        /* Same session now qualifies: provisional remains separate.    */
+        q.stamp_channel_validated = true;
+        drift_profile_set(&q);
+        drift_sess_eval(ls, 185000000);
+        CHECK(drift_sot_view(&sot) &&
+              sot.quality == DRIFT_Q_QUALIFIED,
+              "qualified SOT is separate");
+        CHECK(drift_sot_slot_view(DRIFT_SOT_PROVISIONAL, &sot) &&
+              sot.quality == DRIFT_Q_PROVISIONAL,
+              "provisional slot retained");
+        CHECK(drift_sot_commit(true, 186000000) == ESP_OK,
+              "qualified record persists separately");
+    }
+
+    /* Legacy v1 migration: the old single accurate blob becomes a
+     * freshness-unknown qualified record, then serializes as v2.       */
+    {
+        typedef struct __attribute__((packed)) {
+            uint32_t magic;
+            uint8_t version, rsv[3];
+            uint32_t seq;
+            int64_t drift_ms, lo_ms, hi_ms, half_ms, comp_ms, ref_ms;
+            char fw[24];
+            uint32_t crc32;
+        } old_sot_t;
+        old_sot_t old;
+        memset(&old, 0, sizeof(old));
+        old.magic = 0x534F5431u;
+        old.version = 1;
+        old.seq = 9;
+        old.drift_ms = -100000;
+        old.lo_ms = -101000;
+        old.hi_ms = -99000;
+        old.half_ms = 1000;
+        old.comp_ms = F / 1000 + 1000;
+        old.ref_ms = F / 1000 + 1000;
+        strcpy(old.fw, "ezs-test");
+        old.crc32 = esp_crc32_le(0, (const uint8_t *)&old,
+                                 offsetof(old_sot_t, crc32));
+        drift_sot_invalidate();
+        CHECK(nvs_set_blob(settings_nvs_metadata(), "drift_sot",
+                           &old, sizeof(old)) == ESP_OK, "seed legacy SOT");
+        CHECK(drift_sot_load() == ESP_OK &&
+              drift_sot_view(&sot) &&
+              sot.quality == DRIFT_Q_QUALIFIED &&
+              sot.freshness_unknown &&
+              (sot.assumptions & DRIFT_A_LEGACY_MODEL),
+              "v1 migrates to qualified slot");
+        CHECK(drift_sot_commit(true, 187000000) == ESP_OK,
+              "migrated SOT serializes as v2");
+    }
+
+    drift_timezone_set("UTC0", true);
+    drift_profile_set(&base);
 }
 
 /* ---------------- phase tracker (update2 §3) --------------------
@@ -1012,9 +1269,13 @@ static void test_phase(void)
     sim_run(&p, &now, 360000000);
     CHECK(p.st == PH_MAINTAIN && p.n_brackets >= 5,
           "maintain brackets each cycle");
-    CHECK(p.period_us > 59000000 && p.period_us < 61000000,
-          "period fitted ~60 s");
-    CHECK(p.iunc_us < 3000000, "iunc tightened below watch level");
+    printf("  phase: P=[%lld,%lld] pred=[%lld,%lld] iunc=%lld\n",
+           (long long)p.per_lo_us, (long long)p.per_hi_us,
+           (long long)p.pred_lo_us, (long long)p.pred_hi_us,
+           (long long)p.iunc_us);
+    CHECK(p.period_us > 55000000 && p.period_us < 65000000,
+          "period bound contains ~60 s");
+    CHECK(p.iunc_us < 6000000, "prediction tightened below watch level");
     CHECK(!p.n_misses, "no misses on a stable phase");
 
     /* flush stops: the next armed window closes quiet -> HUNT      */
@@ -1033,7 +1294,7 @@ static void test_phase(void)
 
     /* beacon swap must not reuse the old file's phase              */
     phase_reacquire(&p);
-    CHECK(p.st == PH_HUNT && !p.n_mids && !p.mark_us,
+    CHECK(p.st == PH_HUNT && !p.n_obs && !p.mark_us,
           "beacon swap resets the fit");
 
     /* day change resets everything                                 */
@@ -1175,6 +1436,7 @@ int main(void)
     test_framing();
     test_drift();
     test_sot();
+    test_update3();
     test_phase();
     test_edf();
     test_journal();

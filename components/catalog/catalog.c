@@ -502,6 +502,22 @@ int cat_list_days(char (*days)[CAT_DAY_STR], int cap)
     return n;
 }
 
+bool cat_newest_day(char out[CAT_DAY_STR])
+{
+    bool found = false;
+    memset(out, 0, CAT_DAY_STR);
+    LOCK();
+    for (int i = 0; i < s_nfolders; i++) {
+        if (s_folders[i].state != CAT_FOLDER_GONE &&
+            (!found || strcmp(s_folders[i].day, out) > 0)) {
+            strncpy(out, s_folders[i].day, CAT_DAY_STR - 1);
+            found = true;
+        }
+    }
+    UNLOCK();
+    return found;
+}
+
 int cat_hot_days(char (*days)[CAT_DAY_STR], int cap)
 {
     int n = 0;

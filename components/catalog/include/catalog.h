@@ -147,6 +147,9 @@ int         cat_folder_count(void);
 
 /** Sorted (newest-first) day names that exist (not GONE). */
 int cat_list_days(char (*days)[CAT_DAY_STR], int cap);
+/** Newest existing day over the whole table; false when none. Unlike a
+ * capped list, the maximum is computed before any truncation. */
+bool cat_newest_day(char out[CAT_DAY_STR]);
 
 /** Copy a complete day's entries into caller buffer (NULL -> count). */
 int cat_day_entries(const char day[CAT_DAY_STR],

@@ -1,5 +1,5 @@
 /*
- * SomnoPal — phase-tracking poll schedule (update2 spec §3)
+ * SomnoPal — phase-tracking poll schedule (update3 spec §4)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *
@@ -26,15 +26,15 @@ extern "C" {
 
 typedef enum {
     PH_WATCH = 0,   /* no live estimator session: fixed watch-gap pulls */
-    PH_HUNT,        /* session live, no bracket yet: same fixed pulls   */
+    PH_HUNT,        /* session live, no usable model: fixed pulls       */
     PH_NARROW1,     /* ladder: 2 s nominal grid                         */
     PH_NARROW2,     /*         0.8 s nominal grid                       */
-    PH_VERNIER,     /*         0.8 s grid, +0.4 s cycle shift           */
+    PH_VERNIER,     /*         shifted grid, interval constraints       */
     PH_REFINE,      /* optional: further shifted grids (profile-gated)  */
-    PH_MAINTAIN,    /* steady: pulls centred on the predicted mark      */
+    PH_MAINTAIN,    /* steady: pulls around the bounded prediction      */
 } ph_state_t;
 
-#define PH_MID_CAP 6    /* transition midpoints kept for the period fit */
+#define PH_OBS_CAP 24   /* bounded transition brackets retained         */
 
 typedef struct {
     uint32_t watch_gap_us;   /* continuous-poll spacing (5 s)          */
@@ -42,6 +42,12 @@ typedef struct {
     bool     enabled;        /* false pins the tracker to fixed polls  */
     bool     refine;         /* allow the optional REFINE stage        */
 } phase_cfg_t;
+
+typedef struct {
+    uint32_t cycle;          /* fitted cycle index, not listing count  */
+    int64_t  lo_us;          /* previous unchanged request start       */
+    int64_t  hi_us;          /* changed response end                   */
+} phase_obs_t;
 
 typedef struct {
     ph_state_t st;
@@ -52,27 +58,32 @@ typedef struct {
     int64_t  last_due_us;       /* last scheduled continuous pull      */
     int64_t  pend_due_us;       /* due value last handed to the caller */
 
-    /* observation: req_start of the newest UNCHANGED tracked scan —
-     * the lower bound for the next transition bracket              */
+    /* observation lower bound: req_start of the newest UNCHANGED
+     * tracked scan, in the same beacon/session phase segment          */
     int64_t  unch_req_us;
     bool     have_unch;
 
-    /* fitted phase (monotonic domain) */
-    int64_t  mids[PH_MID_CAP];  /* recent transition bracket midpoints */
-    int      n_mids;
-    int64_t  period_us;
-    int      n_period;
-    int64_t  dpers[4];          /* recent valid inter-midpoint deltas  */
-    int      n_dper;
-    int64_t  resid_us[4];       /* |mid - predicted mark| samples      */
-    int      n_resid;
-    int64_t  cyc_us;            /* adaptive per-cycle surprise bound   */
-    int64_t  iunc_us;           /* next-cycle prediction half-width    */
-    int64_t  mark_us;           /* predicted next transition midpoint  */
+    /* bounded phase/period model. phase bounds are re-referenced to
+     * base_cycle; prediction projects them to last_cycle+1.           */
+    phase_obs_t obs[PH_OBS_CAP];
+    int      n_obs;
+    uint32_t base_cycle;
+    uint32_t last_cycle;
+    int64_t  phase_lo_us, phase_hi_us;
+    int64_t  per_lo_us, per_hi_us;
+    int64_t  period_us;         /* midpoint, diagnostics only          */
+    int64_t  cyc_us;            /* per-cycle visible variation bound   */
+    int64_t  pred_lo_us, pred_hi_us;
+    int64_t  iunc_us;           /* prediction half-width               */
+    int64_t  mark_us;           /* prediction midpoint                 */
+    bool     fit_valid;
+    bool     cycle_ambig;
+    uint8_t  reacq_reason;      /* last fit invalidation cause         */
 
     /* armed cycle window */
     bool     armed;
     int64_t  grid0_us;          /* nominal first-pull start            */
+    int64_t  grid_hi_us;        /* nominal last covered instant        */
     int64_t  spacing_us;
     int      pull_total;
     int      pull_sent;
@@ -115,6 +126,7 @@ void phase_obs(phase_t *p, int64_t req_us, int64_t resp_us,
 void phase_fail(phase_t *p, int64_t now_us);
 
 const char *phase_state_name(ph_state_t st);
+const char *phase_reacq_name(uint8_t reason);
 
 #ifdef __cplusplus
 }

@@ -169,6 +169,7 @@ void app_main(void)
     sp_settings_t cfg;
     bool provisioned = err == ESP_OK && settings_load(&cfg) == ESP_OK &&
                        cfg.magic_valid;
+    drift_timezone_set(cfg.as10_tz, cfg.timezone_confirmed);
     lcd_ui_rowf(2, 0, "CFG:%s SEC:%.3s",
                 provisioned ? "OK" : "NONE", settings_security_label());
 
@@ -282,6 +283,7 @@ void app_main(void)
             portal_saved_flag = false;
             if (settings_load(&cfg) == ESP_OK && cfg.magic_valid) {
                 lcd_ui_row(11, "SAVED - JOINING", 1);
+                drift_timezone_set(cfg.as10_tz, cfg.timezone_confirmed);
                 netw_leave_ap();
                 netw_enter_sta(&cfg);
                 provisioned = true;

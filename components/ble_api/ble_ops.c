@@ -482,7 +482,10 @@ static void op_get_file(uint32_t rid, cJSON *args)
          * require the resident listing to be fresh (<=90 s)          */
         int64_t last = cat_day_last_scan(day);
         if (esp_timer_get_time() - last > 90LL * 1000 * 1000) {
-            sched_job_t j = { .kind = JOB_DAY, .prio = 1 };
+            sched_job_t j = { .kind = JOB_DAY, .prio = 1,
+                              .deadline_us = esp_timer_get_time() +
+                                            10LL * 1000 * 1000,
+                              .required = true };
             strncpy(j.dir, day, CAT_DAY_STR);
             sched_submit(&j);
             send_error(rid, OP_GET_FILE, EC_STALE);
@@ -754,7 +757,10 @@ static void ble_stream_task(void *arg)
         char reason[40] = "ok";
         if (transport_ok) {
             /* give the scheduler a beat, then refresh */
-            sched_job_t j = { .kind = JOB_DAY, .prio = 0 };
+            sched_job_t j = { .kind = JOB_DAY, .prio = 0,
+                              .deadline_us = esp_timer_get_time() +
+                                            5LL * 1000 * 1000,
+                              .required = true };
             strncpy(j.dir, s_stream.day, CAT_DAY_STR);
             sched_submit(&j);
             /* wait a fixed settle window; the refresh lands in catalog */
@@ -940,29 +946,87 @@ static void on_time_commit(uint32_t rid, const uint8_t *pl, uint16_t n)
 
 static void op_get_drift(uint32_t rid, cJSON *args)
 {
-    (void)args;
-    char *buf = malloc(3072);
+    /* Legacy readers get the qualified-only source_of_truth. A new
+     * reader must explicitly ask for the best-available view before a
+     * provisional persisted record is exposed to it.                 */
+    bool best_req = false;
+    if (args) {
+        cJSON *b = cJSON_GetObjectItem(args, "best_available");
+        cJSON *p = cJSON_GetObjectItem(args, "include_provisional");
+        best_req = cJSON_IsTrue(b) || cJSON_IsTrue(p);
+    }
+    char *buf = malloc(4096);
     if (!buf) {
         send_error(rid, OP_GET_DRIFT, EC_RESOURCE_LIMIT);
         return;
     }
-    size_t o = (size_t)snprintf(buf, 3072, "{\"schema\":2,\"estimate\":");
+    /* Checked serializer: every append is bounded, a truncated field
+     * pins o at the cap, and an overlong payload is an explicit error
+     * rather than a clipped document (update3 §11).                */
+    size_t o = 0;
+#define DAPP(...)                                                     \
+    do {                                                              \
+        if (o < 4096) {                                               \
+            int w_ = snprintf(buf + o, 4096 - o, __VA_ARGS__);        \
+            if (w_ >= 0 && (size_t)w_ < 4096 - o) o += (size_t)w_;    \
+            else o = 4096;                                            \
+        }                                                             \
+    } while (0)
+#define DJSON(fn, arg)                                                \
+    do {                                                              \
+        int jn_ = fn((arg), buf + (o < 4096 ? o : 4095),              \
+                     4096 - (o < 4096 ? o : 4095));                   \
+        if (jn_ < 0 || o + (size_t)jn_ >= 4096) o = 4096;             \
+        else o += (size_t)jn_;                                        \
+    } while (0)
+    DAPP("{\"schema\":3,\"estimate\":");
     drift_record_t rec;
-    if (drift_pub_get(&rec)) {
-        o += (size_t)drift_estimate_json(&rec, buf + o, 3072 - o);
+    if (o < 4096 && drift_pub_get(&rec)) {
+        DJSON(drift_estimate_json, &rec);
     } else {
-        o += (size_t)snprintf(buf + o, 3072 - o, "null");
+        DAPP("null");
     }
-    o += (size_t)snprintf(buf + o, 3072 - o, ",\"source_of_truth\":");
+    DAPP(",\"source_of_truth\":");
     drift_sot_t sot;
-    if (drift_sot_view(&sot)) {
-        o += (size_t)drift_sot_json(&sot, buf + o, 3072 - o);
+    if (o < 4096 && drift_sot_view(&sot)) {
+        DJSON(drift_sot_json, &sot);
     } else {
-        o += (size_t)snprintf(buf + o, 3072 - o, "null");
+        DAPP("null");
     }
-    snprintf(buf + o, 3072 - o, "}");
+    DAPP(",\"qualified_source_of_truth\":");
+    if (o < 4096 && drift_sot_slot_view(DRIFT_SOT_QUALIFIED, &sot)) {
+        DJSON(drift_sot_json, &sot);
+    } else {
+        DAPP("null");
+    }
+    DAPP(",\"provisional_source_of_truth\":");
+    if (o < 4096 && drift_sot_slot_view(DRIFT_SOT_PROVISIONAL, &sot)) {
+        DJSON(drift_sot_json, &sot);
+    } else {
+        DAPP("null");
+    }
+    DAPP(",\"best_available_opt_in_required\":true,"
+         "\"best_available_offset\":");
+    bool have_best = o < 4096 && best_req && drift_sot_best(&sot);
+    if (have_best) {
+        DJSON(drift_sot_json, &sot);
+    } else {
+        DAPP("null");
+    }
+    DAPP(",\"best_available_reason\":\"%s\"",
+         !best_req ? "client_opt_in_required" :
+         have_best ? "selected_by_quality_then_width" :
+                     "no_persisted_record");
+    if (o >= 4095) {
+        send_error(rid, OP_GET_DRIFT, EC_RESOURCE_LIMIT);
+        free(buf);
+        return;
+    }
+    snprintf(buf + o, 4096 - o, "}");
     send_ok(rid, OP_GET_DRIFT, buf);
     free(buf);
+#undef DAPP
+#undef DJSON
 }
 
 /* ---------------- write dispatch ---------------- */

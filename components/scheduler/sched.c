@@ -42,6 +42,9 @@ typedef struct {
     job_kind_t kind;
     int        prio;
     uint32_t   min_gap_us;
+    int64_t    deadline_us;
+    bool       required;
+    bool       phase_job;
     char       dir[JOB_DIR_MAX];
     char       name[JOB_NAME_MAX];
     void      (*done)(const sched_result_t *, void *);
@@ -180,18 +183,41 @@ int sched_phase_json(char *buf, size_t cap)
     int64_t mark_in = s_ph.mark_us > now ? (s_ph.mark_us - now) / 1000 : 0;
     int64_t br_ms = (s_ph.last_br_hi_us > s_ph.last_br_lo_us)
                   ? (s_ph.last_br_hi_us - s_ph.last_br_lo_us) / 1000 : 0;
+    int64_t common_ms = (s_ph.fit_valid &&
+                         s_ph.phase_hi_us > s_ph.phase_lo_us)
+                      ? (s_ph.phase_hi_us - s_ph.phase_lo_us) / 1000 : 0;
+    int64_t pred_ms = (s_ph.fit_valid &&
+                       s_ph.pred_hi_us > s_ph.pred_lo_us)
+                    ? (s_ph.pred_hi_us - s_ph.pred_lo_us) / 1000 : 0;
+    char common_txt[24];
+    if (s_ph.fit_valid) {
+        snprintf(common_txt, sizeof(common_txt), "%lld",
+                 (long long)common_ms);
+    } else {
+        strcpy(common_txt, "null");
+    }
     int n = snprintf(buf, cap,
         "\"phase\":{\"st\":\"%s\",\"day\":\"%.8s\",\"armed\":%s,"
-        "\"pulls\":[%d,%d],\"bracket_ms\":%lld,\"period_ms\":%lld,"
+        "\"pulls\":[%d,%d],\"bracket_ms\":%lld,"
+        "\"common_width_ms\":%s,\"prediction_width_ms\":%lld,"
+        "\"period_ms\":%lld,\"period_interval_ms\":[%lld,%lld],"
+        "\"cycle\":%lu,\"cycle_ambiguous\":%s,"
         "\"iunc_ms\":%lld,\"mark_in_ms\":%lld,\"brackets\":%lu,"
-        "\"misses\":%lu}",
+        "\"misses\":%lu,\"reacq_reason\":\"%s\",\"model\":\"u3_interval_v1\"}",
         phase_state_name(s_ph.st), s_ph.day,
         s_ph.armed ? "true" : "false",
         s_ph.pull_sent, s_ph.pull_total,
-        (long long)br_ms, (long long)(s_ph.period_us / 1000),
+        (long long)br_ms, common_txt,
+        (long long)pred_ms,
+        (long long)(s_ph.period_us / 1000),
+        (long long)(s_ph.per_lo_us / 1000),
+        (long long)(s_ph.per_hi_us / 1000),
+        (unsigned long)s_ph.last_cycle,
+        s_ph.cycle_ambig ? "true" : "false",
         (long long)(s_ph.iunc_us / 1000), (long long)mark_in,
         (unsigned long)s_ph.n_brackets,
-        (unsigned long)s_ph.n_misses);
+        (unsigned long)s_ph.n_misses,
+        phase_reacq_name(s_ph.reacq_reason));
     return n > 0 && n < (int)cap ? n : 0;
 }
 
@@ -259,13 +285,26 @@ static int64_t earliest_start(int64_t now, const qjob_t *j)
  * therapy OUT / IN->UNKNOWN regression. The estimate re-evaluates
  * after each feed and on a 1 s cadence so late anchors refit.      */
 
+static bool diff_has_write(const cat_diff_t *diff)
+{
+    if (!diff) return false;
+    for (int i = 0; i < diff->n_events; i++) {
+        /* NEW/GREW/SHRUNK/STAMP are file writes; GONE alone is not
+         * evidence that a new day's therapy session has started       */
+        if (diff->ev[i].kind != CAT_EV_GONE) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int estim_feed_day(const char *day, const ezs_entry_t *ents,
                           int n, const cat_diff_t *diff,
                           const ezw_obs_t *obs, int64_t now)
 {
     drift_session_t *ls = drift_live();
     if (ls && strcmp(ls->day, day)) {
-        if (diff && diff->n_events > 0) {
+        if (diff_has_write(diff)) {
             /* a different day folder is WRITING — the old session is
              * over (midnight rollover while monitoring stayed up,
              * U4). A quiet coverage pull of another folder is just
@@ -277,7 +316,7 @@ static int estim_feed_day(const char *day, const ezs_entry_t *ents,
             return -1;           /* foreign folder, nothing to feed   */
         }
     }
-    if (!ls && diff && diff->n_events > 0) {
+    if (!ls && diff_has_write(diff)) {
         /* file-level activity observed — open a session bound to this
          * day folder (mid-session join supported, U4). A same-day
          * reopen after a monitoring/OUT gap resumes the retained
@@ -309,15 +348,23 @@ static int estim_feed_day(const char *day, const ezs_entry_t *ents,
  * listing: while a session is live it is the beacon's own periodic
  * update (TRANSITION events — creation/vanish are not flushes);
  * before any session it is any non-membership file write.           */
-static bool is_periodic_change(const char *day, const cat_diff_t *diff,
-                               int added)
+static bool is_periodic_change(const char *day, const cat_diff_t *diff)
 {
-    drift_session_t *ls = drift_live();
-    if (ls && ls->day[0] && !strcmp(ls->day, day)) {
-        return added > 0 && ls->n_ev > 0 &&
-               ls->ev[ls->n_ev - 1].kind == DRIFT_EV_TRANSITION;
-    }
     if (!diff) return false;
+    drift_session_t *ls = drift_live();
+    if (ls && ls->day[0] && !strcmp(ls->day, day) && ls->beacon[0]) {
+        /* The catalog diff remains authoritative even after the
+         * estimator's 96-event evidence array is full.              */
+        for (int i = 0; i < diff->n_events; i++) {
+            const cat_event_t *e = &diff->ev[i];
+            if ((e->kind == CAT_EV_GREW || e->kind == CAT_EV_SHRUNK ||
+                 e->kind == CAT_EV_STAMP) &&
+                !strcmp(e->name, ls->beacon)) {
+                return true;
+            }
+        }
+        return false;
+    }
     for (int i = 0; i < diff->n_events; i++) {
         if (diff->ev[i].kind == CAT_EV_GREW ||
             diff->ev[i].kind == CAT_EV_SHRUNK ||
@@ -461,14 +508,14 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
             }
             /* every successful listing feeds the estimator — an
              * unchanged response bounds the next transition (U4)     */
-            int added = estim_feed_day(j->dir, r->entries, r->n_entries,
-                                       &diff, &r->obs, now);
+            estim_feed_day(j->dir, r->entries, r->n_entries,
+                           &diff, &r->obs, now);
             /* …and the phase tracker — unchanged scans bound the
              * next transition from below (update2 §2/§3)             */
             if (s_ph.day[0] && !strcmp(j->dir, s_ph.day)) {
                 phase_obs(&s_ph, r->obs.req_start_us,
                           r->obs.resp_end_us,
-                          is_periodic_change(j->dir, &diff, added));
+                          is_periodic_change(j->dir, &diff));
             }
             ESP_LOGI(TAG, "day %s: %d listed, ev=%d chg=%d s=%lld r=%lld",
                      j->dir, r->n_entries, diff.n_events,
@@ -533,14 +580,8 @@ static void update_track_target(void)
     const char *want = NULL;
     if (ls && ls->day[0]) {
         want = ls->day;
-    } else {
-        /* cat_list_days truncates at cap BEFORE its internal sort —
-         * asking for 1 yields the first table entry, not the newest  */
-        char days[8][CAT_DAY_STR];
-        if (cat_list_days(days, 8) > 0) {
-            memcpy(dbuf, days[0], CAT_DAY_STR);
-            want = dbuf;
-        }
+    } else if (cat_newest_day(dbuf)) {
+        want = dbuf;
     }
     if (!want) {
         phase_track(&s_ph, NULL, false);
@@ -580,7 +621,8 @@ static void plan_phase(int64_t now)
         static int64_t s_next_disc_us;
         if (now >= s_next_disc_us) {
             s_next_disc_us = now + 5LL * 1000 * 1000;
-            sched_job_t p = { .kind = JOB_PARENT, .prio = 2 };
+            sched_job_t p = { .kind = JOB_PARENT, .prio = 2,
+                              .required = true };
             sched_submit(&p);
         }
         return;
@@ -595,10 +637,13 @@ static void plan_phase(int64_t now)
         return;
     }
     sched_job_t d = { .kind = JOB_DAY, .prio = 2,
-                      .min_gap_us = (uint32_t)gap };
+                      .min_gap_us = (uint32_t)gap,
+                      .deadline_us = due + (gap ? gap :
+                                             REQ_GAP_NORMAL_US),
+                      .phase_job = true };
     memcpy(d.dir, s_ph.day, CAT_DAY_STR);
-    if (sched_submit(&d) == ESP_OK) {
-        phase_submitted(&s_ph);
+    if (sched_submit(&d) != ESP_OK) {
+        phase_fail(&s_ph, now);       /* owner notification on drop   */
     }
 }
 
@@ -635,7 +680,7 @@ static void plan_cover(int64_t now)
         /* poll evidence: one bounded record per closed round (§9)   */
         char rec[96];
         snprintf(rec, sizeof(rec),
-                 "\"round\":%s,\"n8h\":%lu",
+                 "\"round\":\"%s\",\"n8h\":%lu",
                  !complete ? "fail" :
                     (s_round_growth ? "growth" : "quiet"),
                  (unsigned long)sched_active_8h());
@@ -645,7 +690,9 @@ static void plan_cover(int64_t now)
     s_round_growth = false;
     s_round_failed = false;
 
-    sched_job_t p = { .kind = JOB_PARENT, .prio = 3 };
+    sched_job_t p = { .kind = JOB_PARENT, .prio = 3,
+                      .deadline_us = now + COVER_PERIOD_US,
+                      .required = true };
     sched_submit(&p);
 
     char hot[4][CAT_DAY_STR];
@@ -654,7 +701,9 @@ static void plan_cover(int64_t now)
         if (s_ph.day[0] && !strcmp(hot[i], s_ph.day)) {
             continue;                /* covered by the phase pulls    */
         }
-        sched_job_t d = { .kind = JOB_DAY, .prio = 3 };
+        sched_job_t d = { .kind = JOB_DAY, .prio = 3,
+                          .deadline_us = now + COVER_PERIOD_US,
+                          .required = true };
         strncpy(d.dir, hot[i], CAT_DAY_STR);
         sched_submit(&d);
     }
@@ -714,18 +763,144 @@ esp_err_t sched_init(void)
 void sched_set_card_ip(uint32_t ip) { ezs_client_set_host(ip); }
 void sched_set_link(bool up)        { s_link_up = up; }
 
+static bool q_same_target(const qjob_t *a, const qjob_t *b)
+{
+    if (a->kind != b->kind) return false;
+    switch (a->kind) {
+    case JOB_DAY:
+        return !strncmp(a->dir, b->dir, CAT_DAY_STR);
+    case JOB_GET_FILE:
+    case JOB_LIST_LIVE:
+        return !strncmp(a->dir, b->dir, JOB_DIR_MAX) &&
+               !strncmp(a->name, b->name, JOB_NAME_MAX);
+    default:
+        return true;
+    }
+}
+
+static void q_drop(qjob_t *j, esp_err_t err)
+{
+    if (j->phase_job) {
+        phase_fail(&s_ph, esp_timer_get_time());
+    }
+    if (j->done) {
+        sched_result_t r = { .err = err };
+        j->done(&r, j->ctx);
+    }
+}
+
+/* Merge an equivalent queued target rather than enqueueing duplicate
+ * card work. If the queue is momentarily full, a merge still succeeds;
+ * unrelated work fails honestly and its owner is notified.           */
 esp_err_t sched_submit(const sched_job_t *job)
 {
+    if (!job) return ESP_ERR_INVALID_ARG;
     qjob_t q = {
         .kind = job->kind, .prio = job->prio, .ctx = job->ctx,
         .done = job->done, .min_gap_us = job->min_gap_us,
+        .deadline_us = job->deadline_us,
+        .required = job->required, .phase_job = job->phase_job,
     };
     strncpy(q.dir, job->dir, JOB_DIR_MAX - 1);
     strncpy(q.name, job->name, JOB_NAME_MAX - 1);
-    if (xQueueSend(s_q, &q, 0) != pdTRUE) {
-        return ESP_ERR_NO_MEM;
+
+    qjob_t held[Q_LEN];
+    int n = 0;
+    bool merged = false;
+    qjob_t old;
+    while (xQueueReceive(s_q, &old, 0) == pdTRUE) {
+        if (!merged && q_same_target(&old, &q)) {
+            if (q.prio < old.prio) old.prio = q.prio;
+            if (q.min_gap_us && (!old.min_gap_us ||
+                                 q.min_gap_us < old.min_gap_us)) {
+                old.min_gap_us = q.min_gap_us;
+            }
+            if (q.deadline_us && (!old.deadline_us ||
+                                  q.deadline_us < old.deadline_us)) {
+                old.deadline_us = q.deadline_us;
+            }
+            old.required |= q.required;
+            old.phase_job |= q.phase_job;
+            merged = true;
+        }
+        held[n++] = old;
     }
-    return ESP_OK;
+    esp_err_t err = ESP_OK;
+    if (!merged) {
+        if (n < Q_LEN) {
+            held[n++] = q;
+        } else {
+            err = ESP_ERR_NO_MEM;
+            q_drop(&q, err);
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (xQueueSend(s_q, &held[i], 0) != pdTRUE) {
+            q_drop(&held[i], ESP_ERR_NO_MEM);
+            err = ESP_ERR_NO_MEM;
+        }
+    }
+    return err;
+}
+
+/* Select by priority among jobs whose inter-request release has
+ * arrived; an expired required deadline wins over optional precision.
+ * Jobs are drained into a bounded snapshot so a low-priority job at the
+ * FIFO head cannot block a phase pull queued behind it.               */
+static int q_pick(qjob_t *jobs, int n, int64_t now, int64_t *next_when)
+{
+    int64_t med = svc_median_us();
+    int64_t first_when = INT64_MAX;
+    int best = -1;
+    int64_t best_deadline = INT64_MAX;
+    for (int i = 0; i < n; i++) {
+        int64_t when = earliest_start(now, &jobs[i]);
+        if (when < first_when) first_when = when;
+        if (when > now) continue;
+        bool overdue = jobs[i].deadline_us &&
+                       now + (med ? med : 0) > jobs[i].deadline_us;
+        if (overdue && (best < 0 ||
+            (jobs[i].required && !jobs[best].required) ||
+            (jobs[i].required == jobs[best].required &&
+             jobs[i].deadline_us < best_deadline))) {
+            best = i;
+            best_deadline = jobs[i].deadline_us;
+        }
+    }
+    if (best < 0) {
+        for (int i = 0; i < n; i++) {
+            if (earliest_start(now, &jobs[i]) > now) continue;
+            if (best < 0 || jobs[i].prio < jobs[best].prio ||
+                (jobs[i].prio == jobs[best].prio &&
+                 jobs[i].deadline_us &&
+                 (!jobs[best].deadline_us ||
+                  jobs[i].deadline_us < jobs[best].deadline_us))) {
+                best = i;
+            }
+        }
+    }
+    if (next_when) *next_when = first_when;
+    return best;
+}
+
+static int q_drain(qjob_t *jobs)
+{
+    int n = 0;
+    while (n < Q_LEN &&
+           xQueueReceive(s_q, &jobs[n], 0) == pdTRUE) {
+        n++;
+    }
+    return n;
+}
+
+static void q_requeue(qjob_t *jobs, int n, int skip)
+{
+    for (int i = 0; i < n; i++) {
+        if (i == skip) continue;
+        if (xQueueSend(s_q, &jobs[i], 0) != pdTRUE) {
+            q_drop(&jobs[i], ESP_ERR_NO_MEM);
+        }
+    }
 }
 
 void sched_run_forever(void)
@@ -765,8 +940,14 @@ void sched_run_forever(void)
             s_ph_miss_logged = s_ph.n_misses;
         }
 
-        qjob_t j;
-        bool have = xQueuePeek(s_q, &j, pdMS_TO_TICKS(50)) == pdTRUE;
+        qjob_t jobs[Q_LEN];
+        qjob_t first;
+        bool have = xQueueReceive(s_q, &first, pdMS_TO_TICKS(50)) == pdTRUE;
+        int njobs = 0;
+        if (have) {
+            jobs[njobs++] = first;
+            njobs += q_drain(jobs + njobs);
+        }
 
         if (!have && now >= s_next_plan_us) {
             /* planner cadence: 500 ms idle, tightened to the phase
@@ -787,12 +968,18 @@ void sched_run_forever(void)
             continue;
         }
 
-        /* spacing + budget + backoff */
-        int64_t when = earliest_start(now, &j);
-        if (when > now) {
-            vTaskDelay(pdMS_TO_TICKS((when - now) / 1000 + 1));
+        int64_t next_when = now;
+        int pick = q_pick(jobs, njobs, now, &next_when);
+        if (pick < 0) {
+            q_requeue(jobs, njobs, -1);
+            int64_t wait = next_when > now ? next_when - now : 1000;
+            if (wait > 500000) wait = 500000;
+            vTaskDelay(pdMS_TO_TICKS(wait / 1000 + 1));
             continue;
         }
+        qjob_t j = jobs[pick];
+        q_requeue(jobs, njobs, pick);
+
         /* §6.1 + update2 §5: requests suspend when the budget is
          * exhausted OR the last checkpoint is older than 60 s. The
          * ledger counts card requests in every therapy state —
@@ -800,12 +987,14 @@ void sched_run_forever(void)
         bool checkpoint_fresh =
             now - s_ckpt_ok_us < CKPT_PERIOD_US;
         if (!sched_budget_ok() || !checkpoint_fresh) {
-            xQueueReceive(s_q, &j, 0);       /* drop head of queue     */
+            q_drop(&j, ESP_ERR_NO_MEM);
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        xQueueReceive(s_q, &j, 0);
         s_last_req_us = esp_timer_get_time();
+        if (j.phase_job) {
+            phase_submitted(&s_ph);   /* pull token consumed on start */
+        }
         sched_result_t r;
         exec_job(&j, &r);
         if (j.kind == JOB_PARENT || j.kind == JOB_DAY ||

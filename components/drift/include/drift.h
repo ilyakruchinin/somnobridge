@@ -87,18 +87,39 @@ int  drift_anchor_count(void);
  * unvalidated, and phase tracking runs with the 0.2 s refinement
  * stage off. Characterization under the update2 schedule is what may
  * tighten these.                                                  */
+typedef enum {
+    DRIFT_ENC_UNKNOWN = 0,       /* union of truncate/round bins      */
+    DRIFT_ENC_TRUNCATED,         /* filename second is [F,F+1 s)      */
+    DRIFT_ENC_ROUNDED,           /* filename second is [F-0.5,F+0.5]  */
+} drift_filename_enc_t;
+
 typedef struct {
-    bool     stamp_channel_validated; /* U5 gate 4 — update2 output   */
+    bool     stamp_channel_validated; /* U5 gate 4 — mtime source     */
     bool     phase_track_enabled;     /* phase schedule may arm grids */
     bool     phase_refine_enabled;    /* optional shifted-grid refine */
     uint32_t cache_bound_us;          /* listing freshness bound C    */
-    uint32_t jitter_us;               /* per-edge scheduling jitter J */
+    uint32_t jitter_us;               /* separate per-edge allowance  */
     uint32_t latency_lo_us;           /* write→visibility delay bound */
     uint32_t latency_hi_us;
     uint32_t dev_rate_ppm;            /* AS11 rate bound — re-refer-  */
                                       /* ences intervals across gaps */
     uint32_t accurate_half_us;        /* certified-tier gate (2 s)    */
+    uint32_t provisional_half_us;     /* provisional SOT gate (5 s)   */
     uint32_t cadence_step_us;         /* Δstamp vs Δmono step thresh  */
+    uint16_t model_rev;               /* timing model identity        */
+
+    /* Filename candidates are provisional unless their own source
+     * model is independently qualified. Zero-width or absent bounds
+     * are never silently substituted.                               */
+    uint8_t  filename_encoding;       /* drift_filename_enc_t         */
+    bool     filename_origin_bounded; /* creation delay D bounded     */
+    int64_t  fname_create_lo_us;
+    int64_t  fname_create_hi_us;
+    bool     filename_periodic_bounded;/* origin adjustment bounded  */
+    int64_t  fname_period_lo_us;
+    int64_t  fname_period_hi_us;
+    bool     filename_create_validated;
+    bool     filename_periodic_validated;
 } drift_profile_t;
 
 const drift_profile_t *drift_profile(void);
@@ -124,6 +145,8 @@ bool drift_stamp_parse(const char *raw, int64_t *dev_s_out);
 /* Session filename "YYYYMMDD_HHMMSS_XXX.edf" → ISO claim string
  * "YYYY-MM-DDTHH:MM:SS" (AS11-local wall claim, for display only).  */
 bool drift_file_start_iso(const char *name, char *out, size_t cap);
+/* Strict filename local-time parser used by update3 candidates. */
+bool drift_filename_local(const char *name, int64_t *local_s);
 
 /* ---------------- observation session (U3/U4) ---------------- */
 
@@ -150,6 +173,17 @@ typedef enum {
 #define DF_BEACON_GONE    (1u<<6)   /* beacon vanished mid-session    */
 #define DF_EV_OVERFLOW    (1u<<7)   /* diff event cap hit             */
 #define DF_UNVALIDATED    (1u<<8)   /* stamp channel not certified    */
+#define DF_TZ_UNRESOLVED  (1u<<9)   /* filename timezone/rule unknown */
+#define DF_FNAME_ORIGIN   (1u<<10)  /* filename origin bound missing  */
+#define DF_CYCLE_AMBIG    (1u<<11)  /* flush cycle index ambiguous    */
+#define DF_SOURCE_DISAGREE (1u<<12) /* offset candidates do not meet  */
+
+typedef enum {
+    DRIFT_SRC_NONE = 0,
+    DRIFT_SRC_MTIME,
+    DRIFT_SRC_FNAME_CREATE,
+    DRIFT_SRC_FNAME_PERIODIC,
+} drift_source_t;
 
 typedef enum {
     DRIFT_EV_TRANSITION = 0, /* beacon stamp/size update              */
@@ -161,9 +195,9 @@ typedef enum {
  * previous unchanged scan's start minus cache bound minus the latency
  * prior, through the changed response's end (U4).                    */
 typedef struct {
-    int64_t req_lo_us;
-    int64_t resp_hi_us;
-    int64_t stamp_s;
+    int64_t obs_lo_us;    /* actual unchanged request start           */
+    int64_t obs_hi_us;    /* actual changed response end              */
+    int64_t stamp_s;      /* new listing mtime in device-domain secs  */
     uint8_t kind;
     uint8_t pad[7];
 } drift_ev_t;
@@ -190,6 +224,18 @@ typedef struct {
     drift_ev_t ev[DRIFT_EV_CAP];
     int      n_ev;
     bool     ev_overflow;
+
+    /* filename-origin evidence and per-source candidates            */
+    bool     fname_known;
+    int64_t  fname_lo_us, fname_hi_us; /* UTC-shaped device interval  */
+    int      n_create_ev;
+    int      n_periodic_ev;
+    bool     periodic_cycle_valid;
+    int64_t  mtime_lo_us, mtime_hi_us;
+    int64_t  create_lo_us, create_hi_us;
+    int64_t  periodic_lo_us, periodic_hi_us;
+    uint8_t  preferred_source;         /* drift_source_t             */
+    char     source_reason[48];
 
     /* cadence diagnostic (stamp deltas) — the published flush period.
      * Phase/cadence prediction for polling lives in the scheduler's
@@ -259,8 +305,22 @@ void drift_sess_header(drift_session_t *s, uint32_t header_bytes,
 /* ---------------- published estimate (U5) + SOT (U6) ---------------- */
 
 typedef struct {
+    bool     available;
+    uint8_t  source;                /* drift_source_t               */
+    int64_t  lo_ms, hi_ms;
+    int64_t  half_ms;
+    uint16_t observations;
+    char     reason[48];
+} drift_candidate_t;
+
+typedef struct {
     est_state_t state;
     acc_tier_t  tier;
+    uint8_t     quality;            /* none|provisional|qualified   */
+    uint8_t     source;             /* selected drift_source_t      */
+    char        source_reason[48];
+    char        model_id[24];
+    uint64_t    assumptions;
     bool        observation_closed;
     bool        has_drift;
     int64_t     clock_drift_ms;
@@ -279,7 +339,8 @@ typedef struct {
     int64_t     complete_records;            /* opportunistic diag     */
     uint32_t    record_bytes;
     uint32_t    record_duration_s;
-    char        flags[192];                  /* comma list, mach. codes*/
+    drift_candidate_t candidates[3];         /* mtime/create/periodic  */
+    char        flags[224];                  /* comma list, mach. codes*/
     char        record_key[24];
     char        beacon[96];
     char        day[9];
@@ -299,25 +360,81 @@ typedef enum {
     DRIFT_SOT_NVS     = 2,
 } drift_sot_origin_t;
 
+typedef enum {
+    DRIFT_Q_NONE = 0,
+    DRIFT_Q_PROVISIONAL = 1,
+    DRIFT_Q_QUALIFIED = 2,
+} drift_quality_t;
+
+typedef enum {
+    DRIFT_SOT_PROVISIONAL = 0,
+    DRIFT_SOT_QUALIFIED   = 1,
+    DRIFT_SOT_N           = 2,
+} drift_sot_slot_t;
+
+#define DRIFT_A_ZERO_CACHE        (1ull << 0)
+#define DRIFT_A_IMMEDIATE_VISIBLE (1ull << 1)
+#define DRIFT_A_FILENAME_ORIGIN   (1ull << 2)
+#define DRIFT_A_FILENAME_PERIODIC (1ull << 3)
+#define DRIFT_A_TZ_FIXED          (1ull << 4)
+#define DRIFT_A_LEGACY_MODEL      (1ull << 5)
+
 typedef struct {
     bool     valid;
+    bool     applicable;         /* binding+time checks complete      */
+    bool     freshness_unknown;  /* restored before a live anchor     */
+    bool     stale;              /* invalidated for current context   */
+    uint8_t  quality;            /* drift_quality_t                   */
+    uint8_t  source;             /* drift_source_t                    */
+    uint8_t  filename_encoding;
+    uint8_t  origin;
+    uint32_t model_rev;
+    uint64_t assumptions;
+    uint32_t anchor_epoch;
+    uint32_t dev_rate_ppm;
+    uint32_t cache_bound_us;
+    int32_t  latency_lo_us;
+    int32_t  latency_hi_us;
+    uint32_t jitter_us;
+    int32_t  fname_lo_us;
+    int32_t  fname_hi_us;
+    int64_t  filename_period_us;
+    uint16_t observations;
     int64_t  clock_drift_ms;
     int64_t  lo_ms, hi_ms;
     int64_t  accuracy_half_ms;
+    int64_t  current_half_ms;
     int64_t  computed_at_ms;
     int64_t  reference_at_ms;
+    int64_t  ref_mono_us;
     uint32_t persisted_seq;
-    uint8_t  origin;
+    bool     dirty;
+    esp_err_t last_error;
+    char     source_reason[48];
     char     card_fw[24];
+    char     model_id[24];
 } drift_sot_t;
 
-bool      drift_sot_view(drift_sot_t *out);
+bool      drift_sot_view(drift_sot_t *out);       /* legacy qualified */
+bool      drift_sot_slot_view(drift_sot_slot_t slot, drift_sot_t *out);
+bool      drift_sot_best(drift_sot_t *out);
+/* Re-reference a stored bound to now_us; expands it by elapsed-time
+ * rate uncertainty. False when no trusted current map exists or the
+ * record's post-reboot freshness is still unknown.                  */
+bool      drift_sot_apply(const drift_sot_t *s, int64_t now_us,
+                          int64_t *lo_ms, int64_t *hi_ms);
 int       drift_sot_json(const drift_sot_t *s, char *buf, size_t cap);
 esp_err_t drift_sot_load(void);          /* boot: NVS -> RAM           */
 esp_err_t drift_sot_commit(bool force, int64_t now_us); /* throttled */
 bool      drift_sot_dirty(void);
-void      drift_sot_invalidate(void);    /* card/settings/reset change */
+void      drift_sot_invalidate(void);    /* explicit evidence reset    */
 void      drift_card_fw_note(const char *fw); /* card identity check  */
+
+/* Confirmed fixed POSIX-style timezone for filename interpretation —
+ * e.g. UTC0 or AEST-10. Complex DST rules remain unresolved.          */
+void      drift_timezone_set(const char *rule, bool confirmed);
+const char *drift_source_name(uint8_t source);
+const char *drift_quality_name(uint8_t quality);
 
 /* Metadata-partition record store (§9): 64 rotating JSON records.
  * ESP_PLATFORM only — host tests skip persistence.                  */

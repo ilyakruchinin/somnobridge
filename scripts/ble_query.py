@@ -463,6 +463,8 @@ def print_drift(r):
         print(f"    estimate_state={est.get('estimate_state')} "
               f"tier={est.get('accuracy_tier')} "
               f"closed={est.get('observation_closed')}")
+        print(f"    source={est.get('preferred_source')} "
+              f"({est.get('source_reason')})")
         fdir = files[0].get('dir', '') if files else ''
         day = fdir.rsplit('\\', 1)[-1] if fdir else '-'
         print(f"    beacon: {day}/"
@@ -478,6 +480,12 @@ def print_drift(r):
               f"interval {fmt_iv(est.get('start_interval_ms'))}")
         print(f"    flush_period_ms   = {fmt_ms(est.get('flush_period_ms'))}"
               f"   interval {fmt_iv(est.get('flush_period_interval_ms'))}")
+        print(f"    candidates: mtime={fmt_iv(est.get('mtime_interval_ms'))} "
+              f"create={fmt_iv(est.get('filename_creation_interval_ms'))} "
+              f"periodic={fmt_iv(est.get('filename_periodic_interval_ms'))}")
+        print(f"    unavailable: create="
+              f"{est.get('filename_creation_reason')} periodic="
+              f"{est.get('filename_periodic_reason')}")
         print(f"    windows={est.get('n_windows')} "
               f"segments={est.get('segments')}")
         flags = est.get("flags") or []
@@ -493,7 +501,31 @@ def print_drift(r):
               f"origin={sot.get('origin')} seq={sot.get('persisted_seq')}")
         print(f"    computed_at_ms    = {fmt_ms(sot.get('computed_at_ms'))}  "
               f"reference_at_ms = {fmt_ms(sot.get('reference_at_ms'))}")
-        print("    note: only accurate-tier values occupy the SOT (U6)")
+        print(f"    quality={sot.get('quality')} source={sot.get('source')} "
+              f"freshness_unknown={sot.get('freshness_unknown')}")
+        print("    note: source_of_truth stays qualified-only; request "
+              "best_available for provisional records")
+    prov = res.get("provisional_source_of_truth")
+    if prov is not None:
+        print("  provisional_source_of_truth:")
+        if not prov:
+            print("    (none)")
+        else:
+            print(f"    interval={fmt_iv(prov.get('interval_ms'))} "
+                  f"half={fmt_ms(prov.get('accuracy_half_ms'))} "
+                  f"source={prov.get('source')}")
+    best = res.get("best_available_offset")
+    if best is not None:
+        print("  best_available_offset:")
+        if not best:
+            print("    (none)")
+        else:
+            print(f"    quality={best.get('quality')} "
+                  f"source={best.get('source')} "
+                  f"interval={fmt_iv(best.get('interval_ms'))} "
+                  f"half={fmt_ms(best.get('accuracy_half_ms'))}")
+            print(f"    assumptions={best.get('assumptions')} "
+                  f"freshness_unknown={best.get('freshness_unknown')}")
 
 
 def print_time_sync(r):
@@ -564,7 +596,9 @@ def main():
     ap.add_argument("--ls", metavar="DIR",
                     help="LIST_DIRECTORY — live card listing, e.g. 'A:\\'")
     ap.add_argument("--drift", action="store_true",
-                    help="GET_DRIFT — session estimate + source of truth")
+                    help="GET_DRIFT — session estimate + qualified SOT")
+    ap.add_argument("--drift-best", action="store_true",
+                    help="also request the explicit best-available SOT view")
     ap.add_argument("--time-sync", type=int, nargs="?", const=5, default=None,
                     metavar="N",
                     help="run N exchanges and commit the best anchor (§8.1)")
@@ -575,6 +609,8 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
+    if args.drift_best:
+        args.drift = True
     if not any([args.status, args.catalog, args.days is not None, args.day,
                 args.drift, args.time_sync is not None,
                 args.evidence]):
@@ -613,7 +649,8 @@ def main():
             print(json.dumps(r, indent=2)) if args.json else print_ls(r, args.ls)
 
         if args.drift:
-            r = dev.request("GET_DRIFT", {}, timeout=args.timeout)
+            req = {"best_available": True} if args.drift_best else {}
+            r = dev.request("GET_DRIFT", req, timeout=args.timeout)
             print(json.dumps(r, indent=2)) if args.json else print_drift(r)
 
         if args.time_sync is not None:
