@@ -8,6 +8,7 @@
  * BLE framing, drift anchors/fit. Synthetic fixtures only.
  */
 #include <assert.h>
+#include <ctype.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,6 +140,111 @@ static int fails;
     if (!(cond)) { fails++; \
         printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, msg); } \
 } while (0)
+
+/* ---------------- minimal JSON validator ----------------
+ * Structural check only: values, escapes, commas, nesting. Enough to
+ * catch emitter bugs (misplaced keys, unquoted names, stray commas)
+ * that substring greps cannot.                                   */
+typedef struct { const char *p; int depth; } jv_t;
+
+static void jv_ws(jv_t *j)
+{
+    while (*j->p == ' ' || *j->p == '\t' ||
+           *j->p == '\n' || *j->p == '\r') j->p++;
+}
+
+static int jv_str(jv_t *j)
+{
+    if (*j->p++ != '"') return 0;
+    for (;;) {
+        if (!*j->p || *(unsigned char *)j->p < 0x20) return 0;
+        if (*j->p == '"') { j->p++; return 1; }
+        if (*j->p == '\\') {
+            j->p++;
+            if (!strchr("\"\\/bfnrtu", *j->p)) return 0;
+            if (*j->p == 'u') {
+                for (int i = 0; i < 4; i++)
+                    if (!isxdigit((unsigned char)j->p[i])) return 0;
+                j->p += 4;
+            }
+            j->p++;
+            continue;
+        }
+        j->p++;
+    }
+}
+
+static int jv_num(jv_t *j)
+{
+    const char *s = j->p;
+    if (*j->p == '-') j->p++;
+    if (*j->p == '0') j->p++;
+    else if (!isdigit((unsigned char)*j->p)) return 0;
+    else while (isdigit((unsigned char)*j->p)) j->p++;
+    if (*j->p == '.') {
+        j->p++;
+        if (!isdigit((unsigned char)*j->p)) return 0;
+        while (isdigit((unsigned char)*j->p)) j->p++;
+    }
+    if (*j->p == 'e' || *j->p == 'E') {
+        j->p++;
+        if (*j->p == '+' || *j->p == '-') j->p++;
+        if (!isdigit((unsigned char)*j->p)) return 0;
+        while (isdigit((unsigned char)*j->p)) j->p++;
+    }
+    return j->p > s;
+}
+
+static int jv_val(jv_t *j)
+{
+    jv_ws(j);
+    if (++j->depth > 64) return 0;
+    int ok = 0;
+    if (*j->p == '{') {
+        j->p++;
+        jv_ws(j);
+        if (*j->p == '}') { j->p++; ok = 1; goto out; }
+        for (;;) {
+            jv_ws(j);
+            if (!jv_str(j)) goto out;
+            jv_ws(j);
+            if (*j->p++ != ':') goto out;
+            if (!jv_val(j)) goto out;
+            jv_ws(j);
+            if (*j->p == ',') { j->p++; continue; }
+            if (*j->p == '}') { j->p++; ok = 1; }
+            goto out;
+        }
+    }
+    if (*j->p == '[') {
+        j->p++;
+        jv_ws(j);
+        if (*j->p == ']') { j->p++; ok = 1; goto out; }
+        for (;;) {
+            if (!jv_val(j)) goto out;
+            jv_ws(j);
+            if (*j->p == ',') { j->p++; continue; }
+            if (*j->p == ']') { j->p++; ok = 1; }
+            goto out;
+        }
+    }
+    if (*j->p == '"') ok = jv_str(j);
+    else if (!strncmp(j->p, "true", 4)) { j->p += 4; ok = 1; }
+    else if (!strncmp(j->p, "false", 5)) { j->p += 5; ok = 1; }
+    else if (!strncmp(j->p, "null", 4)) { j->p += 4; ok = 1; }
+    else ok = jv_num(j);
+out:
+    j->depth--;
+    return ok;
+}
+
+static int json_valid(const char *s)
+{
+    jv_t j = { s, 0 };
+    if (!jv_val(&j)) return 0;
+    jv_ws(&j);
+    return *j.p == '\0';
+}
 
 /* ---------------- EZShare parser ---------------- */
 
@@ -904,6 +1010,7 @@ static void test_sot(void)
           "closed record stays published");
     char jb[3072];
     CHECK(drift_estimate_json(&pub, jb, sizeof(jb)) > 0 &&
+          json_valid(jb) &&
           strstr(jb, "\"accuracy_tier\":\"accurate\"") &&
           strstr(jb, "\"estimate_state\":\"validated\"") &&
           strstr(jb, "\"clock_drift_ms\":-") &&
@@ -917,6 +1024,7 @@ static void test_sot(void)
                         .reference_at_ms = U / 1000 + 280200,
                         .persisted_seq = 7, .origin = DRIFT_SOT_NVS };
     CHECK(drift_sot_json(&sim, jb, sizeof(jb)) > 0 &&
+          json_valid(jb) &&
           strstr(jb, "\"origin\":\"nvs\"") &&
           strstr(jb, "\"persisted_seq\":7"),
           "SOT JSON carries origin+seq");
@@ -1008,6 +1116,7 @@ static void test_update3(void)
               "periodic candidate has explicit reason");
         char jb[4096];
         CHECK(drift_estimate_json(&rec, jb, sizeof(jb)) > 0 &&
+              json_valid(jb) &&
               strstr(jb, "\"preferred_source\":\"filename_creation\"") &&
               strstr(jb, "filename_creation_interval_ms"),
               "candidate JSON emitted");

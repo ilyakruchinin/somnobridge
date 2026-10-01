@@ -1954,8 +1954,7 @@ int drift_estimate_json(const drift_record_t *r, char *buf, size_t cap)
         "\"rtc_rate_ppm\":null,\"record_duration_s\":%lu,"
         "\"record_bytes\":%lu,\"complete_records\":\"%llu\","
         "\"n_windows\":%d,\"segments\":%d,"
-        "\"model_id\":\"%s\",\"quality\":\"%s\",\"assumptions\":%llu,"
-        "\"flags\":[",
+        "\"model_id\":\"%s\",\"quality\":\"%s\",\"assumptions\":%llu,",
         (unsigned long)r->record_duration_s,
         (unsigned long)r->record_bytes,
         (unsigned long long)r->complete_records,
@@ -1963,6 +1962,7 @@ int drift_estimate_json(const drift_record_t *r, char *buf, size_t cap)
         drift_quality_name(r->quality),
         (unsigned long long)r->assumptions);
     emit_assumptions(buf, cap, &o, r->assumptions);
+    JAPP(buf, cap, o, "\"flags\":[");
     const char *p = r->flags;
     while (*p && o + 8 < cap) {
         const char *c = strchr(p, ',');
@@ -1989,9 +1989,7 @@ int drift_sot_json(const drift_sot_t *s, char *buf, size_t cap)
         "\"current_half_ms\":%lld,\"observations\":%u,"
         "\"assumptions\":%llu,\"model_rev\":%lu,\"model_id\":\"%s\","
         "\"dirty\":%s,\"last_error\":%d,\"source_reason\":\"%s\","
-        "\"filename_encoding\":%u,\"card_fw\":\"%s\","
-        "\"anchor_epoch\":%lu,\"fname_us\":[%ld,%ld],"
-        "\"filename_period_us\":%lld,",
+        "\"filename_encoding\":%u,",
         (long long)s->clock_drift_ms, (long long)s->lo_ms,
         (long long)s->hi_ms, (long long)s->accuracy_half_ms,
         (long long)s->computed_at_ms, (long long)s->reference_at_ms,
@@ -2007,7 +2005,14 @@ int drift_sot_json(const drift_sot_t *s, char *buf, size_t cap)
         (unsigned long)s->model_rev, s->model_id,
         s->dirty ? "true" : "false", (int)s->last_error,
         s->source_reason,
-        (unsigned)s->filename_encoding, s->card_fw,
+        (unsigned)s->filename_encoding);
+    /* card_fw is card-supplied text (e.g. an XML prolog) — it can
+     * carry quotes/backslashes, so it must be escaped, not %s'd  */
+    JAPP(buf, cap, o, "\"card_fw\":\"");
+    json_escape(buf, cap, &o, s->card_fw);
+    JAPP(buf, cap, o,
+        "\",\"anchor_epoch\":%lu,\"fname_us\":[%ld,%ld],"
+        "\"filename_period_us\":%lld,",
         (unsigned long)s->anchor_epoch,
         (long)s->fname_lo_us, (long)s->fname_hi_us,
         (long long)s->filename_period_us);
