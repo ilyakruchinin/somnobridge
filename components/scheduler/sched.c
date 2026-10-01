@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "phase.h"
 #include "settings.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -52,6 +53,7 @@ typedef struct {
 } qjob_t;
 
 static QueueHandle_t s_q;
+static qjob_t *s_jobs;
 static volatile bool s_link_up;
 static int64_t  s_last_req_us;
 static int64_t  s_next_cover_us;
@@ -465,10 +467,18 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
 {
     memset(r, 0, sizeof(*r));
     int64_t now = esp_timer_get_time();
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+    ESP_LOGI(TAG, "heap_ck exec kind=%d: %s", (int)j->kind,
+             heap_caps_check_integrity_all(false) ? "OK" : "CORRUPT");
+#endif
 
     switch (j->kind) {
     case JOB_PARENT: {
         r->entries = malloc(EZS_ENTRIES_MAX * sizeof(ezs_entry_t));
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+        ESP_LOGI(TAG, "heap_ck entries_alloc=%p: %s", (void *)r->entries,
+                 heap_caps_check_integrity_all(false) ? "OK" : "CORRUPT");
+#endif
         if (!r->entries) { r->err = ESP_ERR_NO_MEM; return; }
         r->err = ezs_list_dir("A:\\DATALOG", r->entries,
                               &r->n_entries, &r->obs);
@@ -753,6 +763,12 @@ esp_err_t sched_init(void)
     if (!s_q) {
         return ESP_ERR_NO_MEM;
     }
+    s_jobs = malloc(Q_LEN * sizeof(*s_jobs));
+    if (!s_jobs) {
+        vQueueDelete(s_q);
+        s_q = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     therapy_init();
     ledger_restore();
     s_ckpt_ok_us = esp_timer_get_time();     /* grace: first 60 s free */
@@ -804,11 +820,15 @@ esp_err_t sched_submit(const sched_job_t *job)
     strncpy(q.dir, job->dir, JOB_DIR_MAX - 1);
     strncpy(q.name, job->name, JOB_NAME_MAX - 1);
 
-    qjob_t held[Q_LEN];
+    qjob_t *held = malloc(Q_LEN * sizeof(*held));
+    if (!held) {
+        q_drop(&q, ESP_ERR_NO_MEM);
+        return ESP_ERR_NO_MEM;
+    }
     int n = 0;
     bool merged = false;
     qjob_t old;
-    while (xQueueReceive(s_q, &old, 0) == pdTRUE) {
+    while (n < Q_LEN && xQueueReceive(s_q, &old, 0) == pdTRUE) {
         if (!merged && q_same_target(&old, &q)) {
             if (q.prio < old.prio) old.prio = q.prio;
             if (q.min_gap_us && (!old.min_gap_us ||
@@ -840,6 +860,11 @@ esp_err_t sched_submit(const sched_job_t *job)
             err = ESP_ERR_NO_MEM;
         }
     }
+    free(held);
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+    ESP_LOGI(TAG, "heap_ck submit k=%d: %s", (int)job->kind,
+             heap_caps_check_integrity_all(false) ? "OK" : "CORRUPT");
+#endif
     return err;
 }
 
@@ -883,10 +908,10 @@ static int q_pick(qjob_t *jobs, int n, int64_t now, int64_t *next_when)
     return best;
 }
 
-static int q_drain(qjob_t *jobs)
+static int q_drain(qjob_t *jobs, int capacity)
 {
     int n = 0;
-    while (n < Q_LEN &&
+    while (n < capacity &&
            xQueueReceive(s_q, &jobs[n], 0) == pdTRUE) {
         n++;
     }
@@ -906,11 +931,36 @@ static void q_requeue(qjob_t *jobs, int n, int skip)
 void sched_run_forever(void)
 {
     s_next_plan_us = 0;
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+    static uint32_t s_iter;                /* DIAG: corruption watch   */
+#endif
     for (;;) {
         int64_t now = esp_timer_get_time();
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+        s_iter++;
+        if (s_iter <= 240 && (s_iter % 2) == 1) {
+            ESP_LOGI(TAG, "heap_ck sched_iter%lu: %s",
+                     (unsigned long)(s_iter - 1),
+                     heap_caps_check_integrity_all(false)
+                     ? "OK" : "CORRUPT");
+        }
+#endif
         therapy_tick(now);
         estim_track_therapy(now);      /* session open/close on FSM   */
         estim_housekeeping(now);       /* refit cadence + SOT persist */
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+        if (s_iter <= 240) {
+            ESP_LOGI(TAG, "heap_ck post_estim: %s",
+                     heap_caps_check_integrity_all(false)
+                     ? "OK" : "CORRUPT");
+        }
+        if ((s_iter % 100) == 0) {     /* DIAG: internal RAM trend   */
+            ESP_LOGI(TAG, "mem int free=%u largest=%u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(
+                         MALLOC_CAP_INTERNAL));
+        }
+#endif
 
         /* restored pre-boot budget expires only after this boot has
          * itself run 8 h (§6.1: expiry rounds late, never early)     */
@@ -940,13 +990,13 @@ void sched_run_forever(void)
             s_ph_miss_logged = s_ph.n_misses;
         }
 
-        qjob_t jobs[Q_LEN];
+        qjob_t *jobs = s_jobs;
         qjob_t first;
         bool have = xQueueReceive(s_q, &first, pdMS_TO_TICKS(50)) == pdTRUE;
         int njobs = 0;
         if (have) {
             jobs[njobs++] = first;
-            njobs += q_drain(jobs + njobs);
+            njobs += q_drain(jobs + njobs, Q_LEN - njobs);
         }
 
         if (!have && now >= s_next_plan_us) {
@@ -968,6 +1018,10 @@ void sched_run_forever(void)
             continue;
         }
 
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+        ESP_LOGI(TAG, "heap_ck drained %d: %s", njobs,
+                 heap_caps_check_integrity_all(false) ? "OK" : "CORRUPT");
+#endif
         int64_t next_when = now;
         int pick = q_pick(jobs, njobs, now, &next_when);
         if (pick < 0) {

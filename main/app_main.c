@@ -12,6 +12,7 @@
 #include "board.h"
 #include "catalog.h"
 #include "drift.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
 #include "esp_system.h"
@@ -25,6 +26,19 @@
 #include "ble_svc.h"
 
 static const char *TAG = "somnopal";
+
+/* DIAG: temporary heap-corruption bisection — each boot stage checks
+ * integrity; the walker crashes on the first corrupt structure, so the
+ * last PASS before a crash brackets the corrupting stage.           */
+static void heap_ck(const char *tag)
+{
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+    bool ok = heap_caps_check_integrity_all(false);
+    ESP_LOGI(TAG, "heap_ck %s: %s", tag, ok ? "OK" : "CORRUPT");
+#else
+    (void)tag;
+#endif
+}
 
 /* set by the setup portal when new config is committed (setup_portal.c) */
 volatile bool portal_saved_flag;
@@ -41,6 +55,7 @@ static void on_wifi_link(bool up, uint32_t ip)
     jrn_put("event", up ? "\"e\":\"link_up\"" : "\"e\":\"link_down\"");
     if (up) {
         sched_set_card_ip(netw_status()->card_ip); /* EZShare host   */
+        heap_ck("link_up");
     }
 }
 
@@ -162,6 +177,7 @@ void app_main(void)
     lcd_ui_clear();
     lcd_ui_headline("SOMNOPAL");
     lcd_ui_row(1, "BOOT OK", 0);
+    heap_ck("board");
 
     /* 1. settings/security first — NVS must be up before the journal
      *    or the NimBLE bond store touch flash.                      */
@@ -172,6 +188,7 @@ void app_main(void)
     drift_timezone_set(cfg.as10_tz, cfg.timezone_confirmed);
     lcd_ui_rowf(2, 0, "CFG:%s SEC:%.3s",
                 provisioned ? "OK" : "NONE", settings_security_label());
+    heap_ck("settings");
 
     /* 2. evidence journal (may run degraded without security cfg)     */
     err = jrn_init();
@@ -179,6 +196,7 @@ void app_main(void)
         ESP_LOGW(TAG, "journal degraded: %s", esp_err_to_name(err));
     }
     jrn_put("event", "\"e\":\"boot\"");
+    heap_ck("journal");
 
     /* 3. volatile catalog + therapy FSM + scheduler                  */
     cat_init();
@@ -187,6 +205,7 @@ void app_main(void)
         ESP_LOGE(TAG, "sched_init failed");
         lcd_ui_row(9, "SCHED FAIL", 1);
     }
+    heap_ck("sched");
     drift_reset();
     /* newest accurate-tier SOT from NVS — served immediately on boot
      * until a newer live estimate supersedes it (U6)                */
@@ -199,6 +218,7 @@ void app_main(void)
                      (unsigned long)sot.persisted_seq);
         }
     }
+    heap_ck("sot_load");
 
     /* 4. WiFi — STA with stored config, or fall back to setup AP     */
     err = netw_init();
@@ -214,6 +234,7 @@ void app_main(void)
         netw_enter_ap();
         show_setup_ap();
     }
+    heap_ck("netw");
 
     /* 5. BLE stack — advertises; pairing window opens on button      */
     err = ble_svc_init();
@@ -226,6 +247,12 @@ void app_main(void)
         ESP_LOGE(TAG, "ble_svc_init failed");
         lcd_ui_row(10, "BLE FAIL", 1);
     }
+    heap_ck("ble");
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+    ESP_LOGI(TAG, "mem internal free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+#endif
 
     /* 6. card worker task — the only HTTP owner (spec §13.1)         */
     xTaskCreate(card_task, "card", 16384, NULL, 5, NULL);

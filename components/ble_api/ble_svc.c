@@ -15,6 +15,7 @@
 #include "settings.h"
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "host/ble_att.h"
 #include "host/ble_hs.h"
@@ -239,6 +240,11 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
 {
     switch (ev->type) {
     case BLE_GAP_EVENT_CONNECT:
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+        ESP_LOGI(TAG, "heap_ck gap_connect st=%u: %s",
+                 (unsigned)ev->connect.status,
+                 heap_caps_check_integrity_all(false) ? "OK" : "CORRUPT");
+#endif
         if (ev->connect.status == 0) {
             s_conn = ev->connect.conn_handle;
             s_mtu = 23;

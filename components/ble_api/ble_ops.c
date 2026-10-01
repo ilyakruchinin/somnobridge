@@ -19,6 +19,7 @@
 #include "edf_hdr.h"
 
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "host/ble_att.h"
 #include "esp_timer.h"
@@ -878,6 +879,10 @@ static void on_time_request(uint32_t rid, const uint8_t *pl, uint16_t n)
     memcpy(&unc, pl + 8, 4);
     memcpy(&epoch, pl + 12, 4);
     int64_t m2 = esp_timer_get_time();   /* complete-request receipt  */
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+    ESP_LOGI("ble", "heap_ck time_req pre-begin: %s",
+             heap_caps_check_integrity_all(false) ? "OK" : "CORRUPT");
+#endif
     if (drift_time_begin(rid, t1, unc, epoch, m2) != ESP_OK) {
         send_error(rid, "TIME_REQUEST", EC_BAD_REQUEST);
         return;
@@ -897,7 +902,15 @@ static void on_time_request(uint32_t rid, const uint8_t *pl, uint16_t n)
     uint16_t fl = blep_build_frame(frame, sizeof(frame),
                                    BLEP_TIME_REPLY, rid, 0,
                                    buf, sizeof(buf), true, true);
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+    ESP_LOGI("ble", "heap_ck time_req pre-indicate: %s",
+             heap_caps_check_integrity_all(false) ? "OK" : "CORRUPT");
+#endif
     ble_svc_control_indicate(frame, fl);
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+    ESP_LOGI("ble", "heap_ck time_req done: %s",
+             heap_caps_check_integrity_all(false) ? "OK" : "CORRUPT");
+#endif
 }
 
 static void on_time_commit(uint32_t rid, const uint8_t *pl, uint16_t n)
@@ -1033,6 +1046,10 @@ static void op_get_drift(uint32_t rid, cJSON *args)
 
 int ble_ops_on_write(uint16_t conn, const uint8_t *data, uint16_t len)
 {
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+    ESP_LOGI("ble", "heap_ck on_write len=%u: %s", (unsigned)len,
+             heap_caps_check_integrity_all(false) ? "OK" : "CORRUPT");
+#endif
     if (len < sizeof(blep_hdr_t)) {
         return BLE_ATT_ERR_INVALID_PDU;
     }

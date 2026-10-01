@@ -9,9 +9,12 @@
 #include "ezshare.h"
 
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define HTTP_CONNECT_TIMEOUT_MS 2000
 #define HTTP_TOTAL_MS           5000   /* listings; GET uses its own   */
@@ -72,7 +75,18 @@ static esp_http_client_handle_t open_get(const char *url, bool is_file,
         .disable_auto_redirect = true,
         .keep_alive_enable = true,
     };
+    /* DIAG: temporary instrumentation for the boot-time init crash   */
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+    heap_caps_check_integrity_all(false);
+    ESP_LOGI("ezs", "init cfg=%p url=%p:%.32s stack_hwm=%u heap=%u",
+             (void *)&cfg, (void *)url, url,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned)esp_get_free_heap_size());
+#endif
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
+#if !defined(CONFIG_HEAP_POISONING_DISABLED)
+    ESP_LOGI("ezs", "init ok c=%p", (void *)c);
+#endif
     if (!c) {
         obs->transport = ESP_FAIL;
         return NULL;

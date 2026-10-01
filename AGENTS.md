@@ -125,6 +125,13 @@ Stubs live in `scripts/test_include/` (`esp_err.h`, `esp_timer.h` with a
 `host_now_us` virtual clock). Modules guarded by `ESP_PLATFORM` ifdefs use
 plain malloc/no-op locks on the host.
 
+The host suite does not compile `components/scheduler/sched.c`. For queue
+changes, also check target stack frames: the card task has a 16 KiB stack,
+and nested planner/submit frames count together. Keep queue snapshots off
+the task stack and pass the remaining destination capacity to drain helpers.
+Heap probes are compiled only when heap poisoning is enabled; repeat live
+BLE time-sync checks with poisoning disabled before accepting a crash fix.
+
 ## Layout
 
 - `main/` — thin entry point / mode machine
