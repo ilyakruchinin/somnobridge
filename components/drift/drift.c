@@ -208,20 +208,20 @@ void drift_test_anchor(int64_t mono_us, int64_t utc_us,
 /* ---------------- characterization profile ---------------- */
 
 static drift_profile_t s_prof = {
-    /* characterization-run profile (U9): dense polling armHeyHed, priors
-     * tightened to the evidence-backed provisional values. The stamp
+    /* update2 characterization-run profile: the phase-tracking
+     * schedule is armed, priors stay at the evidence-backed
+     * provisional values, and the optional shifted-grid refinement
+     * stays off until service/phase stability justify it. The stamp
      * channel stays UNVALIDATED until this run's data characterizes
      * the write→visibility latency — a too-tight guessed prior can
      * bias self-consistently, so nothing promotes to the SOT yet.    */
     .stamp_channel_validated = false,
-    .dense_enabled           = true,
+    .phase_track_enabled     = true,
+    .phase_refine_enabled    = false,
     .cache_bound_us          = 2000000,   /* F12: fresh listings +guard */
     .jitter_us               = 300000,
     .latency_lo_us           = 0,
     .latency_hi_us           = 2000000,   /* provisional, measured now  */
-    .dense_spacing_us        = 500000,
-    .dense_margin_loose_us   = 4000000,
-    .dense_margin_tight_us   = 1500000,
     .dev_rate_ppm            = 500,
     .accurate_half_us        = 2000000,
     .cadence_step_us         = 90000000,
@@ -422,12 +422,11 @@ static void set_tuple(drift_session_t *s, uint64_t size, bool has_ts,
     s->have_tuple = true;
 }
 
-/* Cadence diagnostics: the stamp delta feeds the published flush
- * period; the monotonic resp-delta feeds dense-window prediction.
- * Only deltas in a plausible one-flush range count — a missed scan
- * merges two flushes into one larger delta.                          */
-static void note_cadence(drift_session_t *s, int64_t ddev_s,
-                         int64_t resp_us)
+/* Cadence diagnostic: the stamp delta feeds the published flush
+ * period. Only deltas in a plausible one-flush range count — a missed
+ * scan merges two flushes into one larger delta. Phase prediction for
+ * polling is the scheduler's job (update2), not this estimator's.    */
+static void note_cadence(drift_session_t *s, int64_t ddev_s)
 {
     if (ddev_s >= 30 && ddev_s <= 95) {
         int64_t ms = ddev_s * 1000;
@@ -441,19 +440,6 @@ static void note_cadence(drift_session_t *s, int64_t ddev_s,
                 (ms - s->flush_period_ms) / (s->n_deltas + 1);
         }
         s->n_deltas++;
-        if (s->last_ev_resp_us) {
-            int64_t dr = resp_us - s->last_ev_resp_us;
-            if (dr > 0) {
-                if (s->n_resp < (int)(sizeof(s->resp_deltas) /
-                                      sizeof(s->resp_deltas[0]))) {
-                    s->resp_deltas[s->n_resp++] = dr;
-                } else {
-                    memmove(s->resp_deltas, s->resp_deltas + 1,
-                            3 * sizeof(s->resp_deltas[0]));
-                    s->resp_deltas[3] = dr;
-                }
-            }
-        }
     }
 }
 
@@ -469,7 +455,6 @@ static void push_ev(drift_session_t *s, drift_ev_kind_t kind,
         .req_lo_us = req_lo, .resp_hi_us = resp_hi,
         .stamp_s = stamp_s, .kind = (uint8_t)kind,
     };
-    s->last_ev_resp_us = resp_hi;
 }
 
 /* Window bounds for an event: [prev_scan_req − C − λ_hi, resp − λ_lo]
@@ -557,7 +542,7 @@ int drift_feed_scan(drift_session_t *s, const char *day,
                     s->flag_bits |= DF_STAMP_BAD;
                     break;
                 }
-                note_cadence(s, m_new - m_old, resp_end_us);
+                note_cadence(s, m_new - m_old);
                 if (prev) {
                     push_ev(s, DRIFT_EV_TRANSITION, m_new,
                             win_lo(s, p, prev), win_hi(p, resp_end_us));
@@ -580,7 +565,7 @@ int drift_feed_scan(drift_session_t *s, const char *day,
         if (s->have_tuple && okp &&
             (ms != s->stamp_s || cur->size != s->size_tok)) {
             int64_t d = s->stamp_ok ? ms - s->stamp_s : 0;
-            note_cadence(s, d, resp_end_us);
+            note_cadence(s, d);
             if (prev) {
                 push_ev(s, DRIFT_EV_TRANSITION, ms,
                         win_lo(s, p, prev), win_hi(p, resp_end_us));
@@ -1124,46 +1109,6 @@ int drift_sot_json(const drift_sot_t *s, char *buf, size_t cap)
         s->origin == DRIFT_SOT_NVS ? "nvs" : "session",
         (unsigned long)s->persisted_seq);
     return n > 0 ? n : 0;
-}
-
-/* ---------------- dense-window prediction (U9) ---------------- */
-
-bool drift_dense_window(int64_t now_us, int64_t *open_us,
-                        int64_t *close_us)
-{
-    (void)now_us;
-    if (!s_live || !s_prof.dense_enabled || !s_live_sess.n_resp ||
-        !s_live_sess.anchor_used) {
-        return false;
-    }
-    /* stop when the published bound is already inside the accurate
-     * gate — further bursts buy nothing (U9)                        */
-    if (s_live_sess.est_bound_valid &&
-        s_live_sess.off_hi_us - s_live_sess.off_lo_us <=
-            2 * (int64_t)s_prof.accurate_half_us) {
-        return false;
-    }
-    /* the next write lands ~one cadence after the last one, whose
-     * mono write-window is [req_lo, resp_hi] of the newest event.
-     * Anchor the burst to the WINDOW EDGES: a resp-anchored
-     * prediction is late by the unknown observation delay (the write
-     * became visible sometime before the scan that showed it, U9) —
-     * the edges cover the write wherever it landed, plus the 2 s
-     * stamp quantization of the next observation.                    */
-    const drift_ev_t *e =
-        &s_live_sess.ev[s_live_sess.n_ev - 1];
-    int64_t period = 0;
-    for (int i = 0; i < s_live_sess.n_resp; i++) {
-        period += s_live_sess.resp_deltas[i];
-    }
-    period /= s_live_sess.n_resp;
-    int64_t lo = e->req_lo_us + period
-               - 2000000LL - (int64_t)s_live_sess.jitter_us;
-    int64_t hi = e->resp_hi_us + period
-               + 2000000LL + (int64_t)s_live_sess.jitter_us;
-    if (open_us)  *open_us = lo;
-    if (close_us) *close_us = hi;
-    return true;
 }
 
 /* ---------------- diagnostic session helpers ---------------- */

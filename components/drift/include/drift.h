@@ -80,23 +80,21 @@ anchor_result_t drift_time_commit(uint32_t request_id, uint64_t t4_utc_us,
 bool drift_map_utc(int64_t mono_us, int64_t *utc_lo, int64_t *utc_hi);
 int  drift_anchor_count(void);
 
-/* ---------------- characterization profile (U5/U9) ----------------
+/* ---------------- characterization profile (U5, update2) ----------
  * Build/run-time record of what this card combination is allowed to
  * claim. The uncharacterized defaults keep the estimator honest:
- * latency bound is the conservative observed ~50 s, the stamp channel
- * is unvalidated, and the dense-poll machinery stays off. The U9
- * dense-burst characterization is what may tighten these.          */
+ * latency bound stays conservative, the stamp channel is
+ * unvalidated, and phase tracking runs with the 0.2 s refinement
+ * stage off. Characterization under the update2 schedule is what may
+ * tighten these.                                                  */
 typedef struct {
-    bool     stamp_channel_validated; /* U5 gate 4 — U9 output        */
-    bool     dense_enabled;           /* U9 burst machinery armed     */
+    bool     stamp_channel_validated; /* U5 gate 4 — update2 output   */
+    bool     phase_track_enabled;     /* phase schedule may arm grids */
+    bool     phase_refine_enabled;    /* optional shifted-grid refine */
     uint32_t cache_bound_us;          /* listing freshness bound C    */
     uint32_t jitter_us;               /* per-edge scheduling jitter J */
     uint32_t latency_lo_us;           /* write→visibility delay bound */
     uint32_t latency_hi_us;
-    uint32_t dense_spacing_us;        /* burst poll spacing (500 ms)  */
-    uint32_t dense_margin_loose_us;   /* open window while cadence is */
-                                      /* loose (±4 s)                */
-    uint32_t dense_margin_tight_us;   /* after a fitted cadence (±1.5)*/
     uint32_t dev_rate_ppm;            /* AS11 rate bound — re-refer-  */
                                       /* ences intervals across gaps */
     uint32_t accurate_half_us;        /* certified-tier gate (2 s)    */
@@ -193,15 +191,12 @@ typedef struct {
     int      n_ev;
     bool     ev_overflow;
 
-    /* cadence diagnostic (stamp deltas) + dense-window prediction
-     * (true-time response deltas)                                   */
+    /* cadence diagnostic (stamp deltas) — the published flush period.
+     * Phase/cadence prediction for polling lives in the scheduler's
+     * phase tracker (update2), not here.                            */
     int      n_deltas;
     int64_t  per_lo_ms, per_hi_ms;
     int64_t  flush_period_ms;
-    int64_t  resp_deltas[4];
-    int      n_resp;
-    int64_t  last_ev_resp_us;
-    bool     burst_active;        /* dense window currently open      */
 
     /* eval outputs (recomputed by drift_sess_eval)                 */
     uint32_t n_segments;
@@ -327,14 +322,6 @@ void      drift_card_fw_note(const char *fw); /* card identity check  */
 esp_err_t drift_meta_save(const char *json, size_t len);
 size_t    drift_meta_latest(char *buf, size_t cap, uint32_t *seq_out);
 #endif
-
-/* ---------------- dense-window prediction (U9) ---------------- */
-
-/* In a live session with a fitted cadence, the predicted next update
- * window. Returns false when no prediction exists or the burst budget
- * for this session is spent. open/close are monotonic.               */
-bool drift_dense_window(int64_t now_us, int64_t *open_us,
-                        int64_t *close_us);
 
 #ifndef ESP_PLATFORM
 /* host-test hook: inject an anchor without a BLE exchange            */

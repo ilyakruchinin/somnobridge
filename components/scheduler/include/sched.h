@@ -9,6 +9,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -62,10 +63,16 @@ typedef enum {
 #define JOB_DIR_MAX   260
 #define JOB_NAME_MAX  EZS_NAME_MAX
 
+/* Total card-request ceiling in the rolling 8 h ledger (spec §6.1,
+ * update2 §5). Counts parent+day listings and version probes in every
+ * therapy state — reads are cheap but never accounted as free.       */
+#define SCHED_ACTIVE_CAP_8H 8000
+
 struct sched_result;
 typedef struct {
     job_kind_t kind;
     int        prio;             /* lower = sooner (0 = post-check) */
+    uint32_t   min_gap_us;       /* min start spacing; 0 = default  */
     char       dir[JOB_DIR_MAX]; /* canonical A:\ dir or day name   */
     char       name[JOB_NAME_MAX];
     /* completion callback — runs on card worker context           */
@@ -91,9 +98,15 @@ void sched_set_card_ip(uint32_t ip);
 void sched_set_link(bool up);
 
 /* load ledger (spec §6.1) */
-uint32_t sched_active_8h(void);        /* active-mode listing count  */
+uint32_t sched_active_8h(void);        /* card-request count, 8 h    */
 bool     sched_budget_ok(void);
 uint32_t sched_backoff_ms(void);       /* current HTTP backoff       */
+
+/* Phase-tracker status for GET_STATUS (update2 §7): emits
+ * {"st":"maintain","day":"...",...} — phase precision is reported
+ * separately from the drift record's offset half-width, never as
+ * clock-offset accuracy. Returns bytes written, 0 on truncation.   */
+int      sched_phase_json(char *buf, size_t cap);
 
 #ifdef __cplusplus
 }

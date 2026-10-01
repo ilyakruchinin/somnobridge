@@ -16,6 +16,7 @@
 #include "ezs_path.h"
 #include "catalog.h"
 #include "sched.h"
+#include "phase.h"
 #include "ble_proto.h"
 #include "drift.h"
 #include "edf_hdr.h"
@@ -715,9 +716,9 @@ static void test_drift(void)
               "picks the latest same-class file");
     }
 
-    /* dense burst window (U9): anchored to the last event's
-     * write-window edges + fitted cadence — exercised on the live
-     * session, since the planner reads the singleton               */
+    /* live-session feed on the singleton: two 60 s stamp deltas fit
+     * the published cadence (update2 keeps the estimator stamp-first;
+     * the polling schedule lives in the phase tracker)              */
     {
         drift_reset();
         drift_test_anchor(0, U, 2000, 7);
@@ -748,17 +749,9 @@ static void test_drift(void)
         cat_feed_day("20240103", f3, 1, 440000, &d3);
         drift_feed_scan(ls, "20240103", f3, 1, &d3, 440000000, 440100000);
         drift_sess_eval(ls, 441000000);
-        CHECK(ls->n_ev == 2 && ls->n_resp == 1,
-              "two events, cadence fitted");
-        int64_t dopen = 0, dclose = 0;
-        CHECK(drift_dense_window(450000000, &dopen, &dclose),
-              "dense window armed while bound is loose");
-        int64_t J = (int64_t)ls->jitter_us;
-        CHECK(dopen == ls->ev[1].req_lo_us + ls->resp_deltas[0]
-                        - 2000000 - J &&
-              dclose == ls->ev[1].resp_hi_us + ls->resp_deltas[0]
-                        + 2000000 + J,
-              "burst window covers the write uncertainty");
+        CHECK(ls->n_ev == 2 && ls->n_deltas == 2 &&
+              ls->flush_period_ms == 60000,
+              "two events, 60 s cadence fitted");
         drift_live_end(450000000);
     }
 }
@@ -778,8 +771,8 @@ static void test_sot(void)
     prof.jitter_us         = 100000;
     prof.accurate_half_us  = 2000000;
     prof.dev_rate_ppm      = 50;
-    prof.dense_enabled     = true;
-    prof.dense_spacing_us  = 500000;
+    prof.phase_track_enabled    = true;
+    prof.phase_refine_enabled   = false;
     drift_profile_set(&prof);
 
     drift_reset();
@@ -804,7 +797,7 @@ static void test_sot(void)
     cat_feed_day("20240103", fs, 1, 200000000, &df);
     CHECK(df.n_events == 0, "baseline feed quiet");
 
-    /* unchanged scan at 219.74 s — then a dense-window flush         */
+    /* unchanged scan at 219.74 s — then the next flush               */
     cat_feed_day("20240103", fs, 1, 219740000, &df);
     /* mid-session join: the first changed listing opens the session —
      * sched gates on diff.n_events; reproduce that here             */
@@ -916,7 +909,165 @@ static void test_sot(void)
     drift_profile_set(&base);        /* restore the build profile     */
 }
 
-/* ---------------- EDF fixed header (§8.2) ---------------- */
+/* ---------------- phase tracker (update2 §3) --------------------
+ * Drive the tracker over a synthetic 60 s flush at a fixed phase and
+ * a 240 ms service time. A pull "executes" at its due instant; the
+ * observation is a transition iff the next pending flush became
+ * visible at or before the response end.                            */
+
+static int64_t sim_svc_us  = 240000;
+static int64_t sim_fl_next;             /* next flush instant        */
+static int64_t sim_period  = 60000000;
+
+static bool sim_pull(phase_t *p, int64_t now)
+{
+    int64_t due, gap;
+    if (!phase_due(p, now, sim_svc_us, &due, &gap) || due > now) {
+        return false;
+    }
+    phase_submitted(p);
+    int64_t resp = due + sim_svc_us;
+    bool tr = sim_fl_next <= resp;
+    if (tr) sim_fl_next += sim_period;
+    phase_obs(p, due, resp, tr);
+    return true;
+}
+
+static void sim_run(phase_t *p, int64_t *now, int64_t until)
+{
+    int guard = 0;
+    while (*now < until && guard++ < 4000) {
+        if (sim_pull(p, *now)) continue;
+        int64_t due, gap;
+        if (phase_due(p, *now, sim_svc_us, &due, &gap) && due > *now) {
+            *now = due;                       /* sleep until due     */
+        } else {
+            *now += 1000000;                  /* idle                */
+        }
+    }
+}
+
+static void test_phase(void)
+{
+    phase_t p;
+    phase_init(&p);
+    phase_config(&p, &(phase_cfg_t){ .watch_gap_us = 5000000,
+                                     .rate_ppm = 500, .enabled = true,
+                                     .refine = false });
+
+    int64_t due, gap;
+    CHECK(!phase_due(&p, 0, sim_svc_us, &due, &gap),
+          "untracked -> nothing due");
+
+    /* flushes become visible at 13.7 s, then every 60 s            */
+    sim_fl_next = 13700000;
+    phase_track(&p, "20240103", false);          /* WATCH            */
+    int64_t now = 0;
+
+    /* WATCH at 5 s spacing brackets the first flush ~5 s wide      */
+    sim_run(&p, &now, 30000000);
+    CHECK(p.st == PH_WATCH, "no session -> stays watching");
+    CHECK(p.n_brackets == 1, "watch bracket recorded");
+    CHECK(p.last_br_hi_us - p.last_br_lo_us <= 6000000 &&
+          p.last_br_hi_us - p.last_br_lo_us >= 5000000,
+          "watch bracket ~5 s + service");
+
+    /* session opens: the seeded bracket jumps straight to NARROW1  */
+    phase_track(&p, "20240103", true);
+    CHECK(p.st == PH_NARROW1, "session + bracket -> narrow1");
+
+    /* cycle 2: 2 s grid narrows the bracket, -> NARROW2            */
+    sim_run(&p, &now, 105000000);
+    CHECK(p.st == PH_NARROW2 && p.n_brackets == 2, "narrow1 -> narrow2");
+    CHECK(p.last_br_hi_us - p.last_br_lo_us < 3000000,
+          "narrow1 bracket ~2 s + service");
+
+    /* cycle 3: 0.8 s grid -> VERNIER                               */
+    sim_run(&p, &now, 170000000);
+    CHECK(p.st == PH_VERNIER && p.n_brackets == 3, "narrow2 -> vernier");
+    CHECK(p.last_br_hi_us - p.last_br_lo_us < 1600000,
+          "narrow2 bracket ~0.8 s + service");
+
+    /* cycle 4: shifted grid -> MAINTAIN (refine disabled)          */
+    sim_run(&p, &now, 240000000);
+    CHECK(p.st == PH_MAINTAIN && p.n_brackets == 4,
+          "vernier -> maintain");
+
+    /* steady maintenance keeps bracketing every cycle              */
+    sim_run(&p, &now, 360000000);
+    CHECK(p.st == PH_MAINTAIN && p.n_brackets >= 5,
+          "maintain brackets each cycle");
+    CHECK(p.period_us > 59000000 && p.period_us < 61000000,
+          "period fitted ~60 s");
+    CHECK(p.iunc_us < 3000000, "iunc tightened below watch level");
+    CHECK(!p.n_misses, "no misses on a stable phase");
+
+    /* flush stops: the next armed window closes quiet -> HUNT      */
+    int64_t held = sim_fl_next;
+    sim_fl_next = INT64_MAX;
+    sim_run(&p, &now, 500000000);
+    CHECK(p.st == PH_HUNT && p.n_misses == 1, "miss -> hunt");
+
+    /* flush resumes shifted +20 s: HUNT brackets it at 5 s and the
+     * ladder restarts                                               */
+    sim_fl_next = held + 20000000;
+    sim_run(&p, &now, 700000000);
+    CHECK(p.n_brackets >= 5, "reacquired after the phase jump");
+    CHECK(p.st != PH_WATCH && p.st != PH_HUNT,
+          "ladder re-entered after reacquire");
+
+    /* beacon swap must not reuse the old file's phase              */
+    phase_reacquire(&p);
+    CHECK(p.st == PH_HUNT && !p.n_mids && !p.mark_us,
+          "beacon swap resets the fit");
+
+    /* day change resets everything                                 */
+    phase_track(&p, "20240104", false);
+    CHECK(p.st == PH_WATCH && !p.n_brackets &&
+          !strcmp(p.day, "20240104"), "day change resets");
+
+    /* a >15 s bracket is a phase inconsistency, not evidence       */
+    phase_track(&p, "20240104", true);
+    phase_obs(&p, 1000000, 1240000, false);
+    phase_obs(&p, 3000000, 3240000, true);     /* 2 s bracket        */
+    CHECK(p.st == PH_NARROW1 && p.n_brackets == 1, "narrow1 armed");
+    /* consumed bound -> fresh unchanged, then a transition whose
+     * bracket spans a whole cycle: the phase model was wrong       */
+    phase_obs(&p, 10000000, 10240000, false);  /* unch at 10 s       */
+    phase_obs(&p, 75000000, 75240000, true);   /* w=65 s             */
+    CHECK(p.st == PH_HUNT && p.n_misses >= 1,
+          "oversized bracket -> reacquire");
+
+    /* failed pulls count toward the window: deterministic miss     */
+    phase_track(&p, "20240105", true);
+    phase_obs(&p, 1000000, 1240000, false);
+    phase_obs(&p, 3000000, 3240000, true);
+    CHECK(p.st == PH_NARROW1, "ladder armed again");
+    /* exhaust the armed window with failures — every due pull is
+     * submitted then fails; the last one closes the window         */
+    int64_t t2 = 59000000;
+    int g2 = 0;
+    while (p.st == PH_NARROW1 && t2 < 200000000 && g2++ < 4000) {
+        int64_t d2, gp;
+        phase_due(&p, t2, sim_svc_us, &d2, &gp);
+        if (d2 > t2) { t2 = d2; continue; }
+        if (p.armed && p.pull_sent < p.pull_total) {
+            phase_submitted(&p);
+            phase_fail(&p, t2);
+        }
+        t2 += 50000;
+    }
+    CHECK(p.st == PH_HUNT, "all-failed window -> miss -> hunt");
+
+    /* profile kill-switch: tracking disabled pins to fixed polls   */
+    phase_track(&p, "20240105", true);
+    phase_obs(&p, 1000000, 1240000, false);
+    phase_obs(&p, 3000000, 3240000, true);
+    phase_config(&p, &(phase_cfg_t){ .watch_gap_us = 5000000,
+                                     .enabled = false });
+    CHECK(phase_due(&p, 80000000, sim_svc_us, &due, &gap) &&
+          gap == 0, "disabled -> fixed watch spacing");
+}
 
 static void test_edf(void)
 {
@@ -1009,6 +1160,7 @@ int main(void)
     test_framing();
     test_drift();
     test_sot();
+    test_phase();
     test_edf();
     test_journal();
     if (fails) {

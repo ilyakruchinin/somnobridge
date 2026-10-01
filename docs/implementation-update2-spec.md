@@ -1,11 +1,16 @@
 # SomnoPal — implementation update 2: phase-tracking poll schedule
 
-Status: proposed requirements, **revision 2**. Documentation only; this
-revision does not enable a profile, change firmware, or authorize flashing.
-Normative delta over `implementation-update-spec.md` (revision 2): this
-file supersedes poll scheduling and the accuracy interpretations addressed
-below. Anchor discipline, authenticated API, SOT persistence, transfer
-safety, and evidence-journal requirements remain in force.
+Status: **revision 3 — schedule implemented in firmware**. The
+WATCH/HUNT/NARROW/VERNIER/REFINE/MAINTAIN tracker, the coverage round,
+the request-ledger accounting, and the phase status API are now in the
+tree (`components/scheduler/phase.c`, `sched.c`, `ble_ops.c`); defaults
+remain characterization-conservative (`phase_refine_enabled=false`, the
+unvalidated stamp channel, and conservative latency/cache priors are
+unchanged). Not yet flashed or field-validated. Normative delta over
+`implementation-update-spec.md` (revision 2): this file supersedes poll
+scheduling and the accuracy interpretations addressed below. Anchor
+discipline, authenticated API, SOT persistence, transfer safety, and
+evidence-journal requirements remain in force.
 
 Basis: the maintainer's progressive-refinement proposal, the observations
 in `docs/validation-results.md`, and the reported live runs on 2026-10-01.
@@ -213,10 +218,13 @@ service/visibility/cycle uncertainty.
 - At 3.2/min over 8 h, maintenance alone is 1536 requests; acquisition,
   retries, and neighbors require additional allowance. The existing 700
   cap is incompatible with continuous three-pull maintenance.
-- A revised cap and bounded acquisition/refinement allowances require
-  explicit review before implementation. A 1600 cap leaves little margin;
-  neither raise it silently nor describe OUT reads as physically cost-free
-  merely because the current active ledger excludes confirmed OUT.
+- **Implemented:** the ledger now counts parent/day/version requests in
+  every therapy state (reads are never accounted as free), and
+  `SCHED_ACTIVE_CAP_8H` is **8000/8 h ≈ 16.7 req/min sustained** —
+  enough to cover the 12/min WATCH plus ~4/min coverage round with
+  ~4% headroom; the cold crawl self-throttles against the same cap.
+  The bound exists to flag card-side rate intolerance, not flash wear;
+  night-1 E0b validation remains the tolerance gate.
 
 ## 6. Expected accuracy and qualification
 
@@ -354,26 +362,71 @@ extrapolation to later data must also carry clock-rate/step uncertainty.
   across varied sessions (base H2). Do not enable validation merely because
   intersections are self-consistent.
 
-## 7. Implementation requirements (future work only)
+## 7. Implementation requirements — now implemented
 
-- Scheduler: explicit WATCH/HUNT/NARROW/VERNIER/REFINE/MAINTAIN states,
-  actual scan-time evidence, service-aware deadlines, one worker, bounded
-  attempts, and discovery/monitoring coverage independent of phase success.
-- Phase tracker: translated moment intervals, period/rate bounds,
-  cycle-jitter expansion, session reset rules, and deterministic miss
-  recovery. Do not infer cadence from response-end differences alone.
-- Offset estimator: retain mtime path; add optional characterized filename
-  origin only with explicit provenance and separate qualification.
-- API/journal: report phase width separately from offset half-width,
-  estimator source, reference instant, model qualification, and misses.
-  Phase-only precision must never populate the offset SOT.
-- Host tests: fixed 60 s phase, biased constant visibility delay, variable
-  latency, real request durations, shifted-grid intersection, optional
-  refinement, misses, beacon swaps, neighbor scans, clock steps, filename
-  rounding/truncation and origin delay, cycle ambiguity, width/half-width
-  arithmetic, and one-sided correction.
-- No firmware/profile/ledger edits or flashing are part of this document
-  change. Budget and API changes need review before implementation.
+Implemented as `components/scheduler/phase.c` (pure logic, host-tested)
+driven by `sched.c`:
+
+- **States:** `WATCH`/`HUNT` poll on a fixed 5 s gap (HUNT is simply
+  WATCH cadence with a live session). A bracketed transition seeds the
+  fit and enters the ladder: `NARROW1` (2 s grid) → `NARROW2` (0.8 s) →
+  `VERNIER` (0.8 s grid shifted +0.4 s) → optional `REFINE` (two cycles,
+  +0.2 s progressive shift, profile-gated `phase_refine_enabled`,
+  default off) → `MAINTAIN` (1 s grid covering mark ± iunc, minimum
+  ±1 s). The window pull count is derived per cycle as
+  `ceil(coverage_span / spacing) + 1`, clamped to [4,10] — the §3.3
+  table's counts are the nominal case, not a fixed constant.
+- **Prediction:** `mark = bracket_midpoint + period`; `iunc =
+  bracket_half + cyc + period·rate_ppm`, where `cyc` is the adaptive
+  cycle-surprise bound (max of the last four |mid−mark| residuals,
+  init 1.5 s, clamp [0.25 s, 4 s], doubled on each miss). Windows cover
+  `mark ± (iunc + 0.5 s margin + svc/2)` and stop on the first observed
+  transition — a wide bracket from the previous unchanged scan is used
+  rather than an invented boundary.
+- **Misses:** a quiet armed window or a bracket wider than 15 s is a
+  phase inconsistency — `cyc` doubles and the tracker falls to HUNT;
+  it never silently widens into claimed precision.
+- **Feeding:** every completed listing of the tracked folder feeds the
+  tracker regardless of which planner submitted it. The transition
+  signal is the beacon's own periodic update while a session is live
+  (estimator TRANSITION events — creation/vanish are not flushes), or
+  any non-membership file write before a session exists.
+- **Lifecycle:** the tracked day is the live estimator session's day,
+  else the newest known folder. Day changes reset everything; session
+  open/close edges reset the fit (WATCH brackets may seed the first
+  prediction); a beacon swap reacquires without reusing the old file's
+  phase.
+- **Coverage:** a 60 s round still lists the parent plus hot days other
+  than the tracked one, and still gates OUT/transfers — a round is
+  incomplete when a coverage job fails or the tracked folder's last
+  successful listing is older than 75 s (beyond the longest ~55 s
+  MAINTAIN inter-window gap). While no day folder exists at all, the
+  parent is polled at 5 s until one appears.
+- **Service guard:** each job carries its grid spacing as a minimum
+  start gap; the executor widens it to ≥2× the rolling median service
+  time (8-sample window) — a 0.8 s grid holds only while listings stay
+  under ~0.4 s.
+- **API/journal:** `GET_STATUS` now carries a `"phase"` object
+  (`st/day/armed/pulls/bracket_ms/period_ms/iunc_ms/mark_in_ms/
+  brackets/misses`) — phase precision reported separately from the
+  drift record's offset half-width; `ble_query.py --status` shows it.
+  Journal emits `"phase"` records on state/miss transitions and a
+  `"beacon_swap"` event.
+- **Ledger:** see §5 — universal request accounting, cap 8000/8 h.
+- **Estimator:** unchanged — the old uncertainty-window burst planner
+  (`drift_dense_window`, `dense_*` profile fields, response-delta
+  tracking) is removed; cadence deltas still feed the published
+  `flush_period_ms` diagnostic only.
+- **Host tests:** `test_phase` drives a simulated fixed-60 s flush
+  through WATCH → the full ladder → MAINTAIN, then covers misses,
+  a +20 s phase-jump reacquire, beacon swap, day change, an oversized
+  bracket, an all-failed window, and the `enabled=false` kill switch.
+
+Not yet done (deliberately): the §6.3 filename-origin offset path
+(uncharacterized), `phase_refine_enabled` defaults off pending
+characterization, and tightened latency/cache priors — night 1 runs
+conservative (~±3.5 s honest bound) and the measured brackets inform
+the tightening.
 
 ## 8. Validation and rollout
 

@@ -389,6 +389,15 @@ def print_status(r):
     b = res.get("budget", {})
     print(f"  budget: active_8h={b.get('active_8h')} "
           f"backoff={b.get('backoff_ms')} ms cap={b.get('cap')}")
+    ph = res.get("phase")
+    if ph:
+        print(f"  phase: st={ph.get('st')} day={ph.get('day')} "
+              f"armed={ph.get('armed')} pulls={ph.get('pulls')}")
+        print(f"         bracket={ph.get('bracket_ms')} ms "
+              f"iunc={ph.get('iunc_ms')} ms "
+              f"period={ph.get('period_ms')} ms "
+              f"mark_in={ph.get('mark_in_ms')} ms "
+              f"brackets={ph.get('brackets')} misses={ph.get('misses')}")
 
 
 def print_catalog(r):

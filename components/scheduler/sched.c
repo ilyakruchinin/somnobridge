@@ -14,6 +14,7 @@
 #include "drift.h"
 #include "journal.h"
 #include "nvs_flash.h"
+#include "phase.h"
 #include "settings.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -23,25 +24,24 @@
 
 static const char *TAG = "sched";
 
-/* -------- tunables (build constants per spec §6 + update U9) ------ */
+/* -------- tunables (spec §6, update2 §3/§5) ----------------------- */
 #define Q_LEN              16
 #define REQ_GAP_NORMAL_US  (1000 * 1000)   /* 1/s ordinary spacing    */
-#define WATCH_PERIOD_US    (60 * 1000 * 1000)
+#define COVER_PERIOD_US    (60LL * 1000 * 1000)  /* coverage round    */
 #define COLD_PERIOD_US     (5 * 1000 * 1000)
 #define NEIGH_PERIOD_US    (3600LL * 1000 * 1000)  /* once/hour        */
-#define ACTIVE_CAP_8H      700
+#define ACTIVE_CAP_8H      SCHED_ACTIVE_CAP_8H
 #define LEDGER_BUCKETS     481
 #define LEDGER_BUCKET_US   (60LL * 1000 * 1000)
-#define ACQ_BUDGET_PER_SET 80              /* dense-burst req cap/set —
-     * characterization phase: the first burst window spans the full
-     * offset uncertainty (~35 polls at 2 s); a second tightened
-     * window needs ~22 more. The global ledger cap still applies. */
-#define ACQ_DENSE_MINUTE   40              /* dense starts/minute     */
+#define TRACK_FRESH_US     (75LL * 1000 * 1000)  /* tracked folder must
+     * have scanned within this at round close — beyond the longest
+     * scheduled inter-window gap (~55 s in MAINTAIN) with margin     */
 #define SVC_WINDOW         8               /* day-listing svc median  */
 
 typedef struct {
     job_kind_t kind;
     int        prio;
+    uint32_t   min_gap_us;
     char       dir[JOB_DIR_MAX];
     char       name[JOB_NAME_MAX];
     void      (*done)(const sched_result_t *, void *);
@@ -51,28 +51,28 @@ typedef struct {
 static QueueHandle_t s_q;
 static volatile bool s_link_up;
 static int64_t  s_last_req_us;
-static int64_t  s_next_watch_us;
+static int64_t  s_next_cover_us;
 static int64_t  s_next_cold_us;
 static int64_t  s_next_neigh_us;
-static bool     s_round_active;           /* watch round in progress   */
+static int64_t  s_next_plan_us;
+static int64_t  s_ph_due_us;              /* next phase pull due      */
+static bool     s_round_active;           /* coverage round in progr. */
 static bool     s_round_growth;           /* any relevant write        */
-static bool     s_round_failed;           /* any listing error         */
+static bool     s_round_failed;           /* coverage listing error    */
 static uint32_t s_backoff_ms;
 static int      s_backoff_idx;
 static uint16_t s_ledger[LEDGER_BUCKETS]; /* minute buckets, 8h ring   */
 static int      s_ledger_head;
 static int64_t  s_ledger_ckpt_us;
 
-/* dense burst state (U9): armed only while drift_dense_window says a
- * flush is predicted; spacing is the profile's 0.5 s guarded by the
- * listing service-time median                                      */
-static int64_t  s_burst_until_us;
-static int64_t  s_burst_next_us;
-static int      s_burst_reqs;             /* this session              */
-static int      s_dense_minute;           /* dense starts this minute  */
-static int64_t  s_dense_minute_at_us;
-static bool     s_had_live;               /* live-session edge detect  */
-static int64_t  s_svc_us[SVC_WINDOW];     /* day-listing service times */
+/* phase-tracking poll schedule (update2 §3): one tracker bound to the
+ * tracked day folder — the live estimator session's day while a
+ * session is open, the newest known day otherwise                  */
+static phase_t  s_ph;
+static char     s_beacon_seen[CAT_NAME_MAX];
+static int      s_ph_logged     = -1;   /* last journaled phase state */
+static uint32_t s_ph_miss_logged;       /* last journaled miss count  */
+static int64_t  s_svc_us[SVC_WINDOW];   /* day-listing service times  */
 static int      s_svc_n;
 
 static const uint32_t s_backoff_ms_ladder[] =
@@ -174,6 +174,27 @@ static void ledger_restore(void)
 bool sched_budget_ok(void) { return sched_active_8h() < ACTIVE_CAP_8H; }
 uint32_t sched_backoff_ms(void) { return s_backoff_ms; }
 
+int sched_phase_json(char *buf, size_t cap)
+{
+    int64_t now = esp_timer_get_time();
+    int64_t mark_in = s_ph.mark_us > now ? (s_ph.mark_us - now) / 1000 : 0;
+    int64_t br_ms = (s_ph.last_br_hi_us > s_ph.last_br_lo_us)
+                  ? (s_ph.last_br_hi_us - s_ph.last_br_lo_us) / 1000 : 0;
+    int n = snprintf(buf, cap,
+        "\"phase\":{\"st\":\"%s\",\"day\":\"%.8s\",\"armed\":%s,"
+        "\"pulls\":[%d,%d],\"bracket_ms\":%lld,\"period_ms\":%lld,"
+        "\"iunc_ms\":%lld,\"mark_in_ms\":%lld,\"brackets\":%lu,"
+        "\"misses\":%lu}",
+        phase_state_name(s_ph.st), s_ph.day,
+        s_ph.armed ? "true" : "false",
+        s_ph.pull_sent, s_ph.pull_total,
+        (long long)br_ms, (long long)(s_ph.period_us / 1000),
+        (long long)(s_ph.iunc_us / 1000), (long long)mark_in,
+        (unsigned long)s_ph.n_brackets,
+        (unsigned long)s_ph.n_misses);
+    return n > 0 && n < (int)cap ? n : 0;
+}
+
 /* ---------------- spacing / budget gates ---------------- */
 
 /* Median of recent day-listing service times — the U9 guard that
@@ -205,34 +226,18 @@ static void svc_note(int64_t req_us, int64_t resp_us)
     }
 }
 
-/* Effective dense spacing: the profile's 0.5 s, widened so the scan
- * allowance covers the current burst window (~24 polls each, U9
- * adaptive shape), and widened again when the service-time median
- * approaches it. Never sparser than 2 s. */
-static int64_t  s_burst_span_us;   /* width of the armed burst window */
-
-static int64_t dense_gap_us(void)
+/* Minimum start spacing for a job: a phase pull carries its grid's
+ * own spacing; everything else uses the ordinary 1 s. Either way the
+ * service-time guard applies — the listing median must stay under
+ * 50% of the gap (update2 §3.3).                                  */
+static int64_t earliest_start(int64_t now, const qjob_t *j)
 {
-    int64_t gap = (int64_t)drift_profile()->dense_spacing_us;
-    if (s_burst_span_us > 0) {
-        int64_t fit = s_burst_span_us / 24;
-        if (fit > gap) {
-            gap = fit;                 /* cover the window in-budget   */
-        }
-    }
+    int64_t gap = j->min_gap_us ? (int64_t)j->min_gap_us
+                                : REQ_GAP_NORMAL_US;
     int64_t med = svc_median_us();
-    if (med && med * 4 > gap * 3) {
-        gap = med * 2;                 /* keep service < 50% of gap    */
+    if (med && med * 2 > gap) {
+        gap = med * 2;
     }
-    if (gap > 2000000) {
-        gap = 2000000;
-    }
-    return gap;
-}
-
-static int64_t earliest_start(int64_t now, bool dense)
-{
-    int64_t gap = dense ? dense_gap_us() : REQ_GAP_NORMAL_US;
     int64_t t = s_last_req_us + gap;
     if (t < now) {
         t = now;
@@ -254,9 +259,9 @@ static int64_t earliest_start(int64_t now, bool dense)
  * therapy OUT / IN->UNKNOWN regression. The estimate re-evaluates
  * after each feed and on a 1 s cadence so late anchors refit.      */
 
-static void estim_feed_day(const char *day, const ezs_entry_t *ents,
-                           int n, const cat_diff_t *diff,
-                           const ezw_obs_t *obs, int64_t now)
+static int estim_feed_day(const char *day, const ezs_entry_t *ents,
+                          int n, const cat_diff_t *diff,
+                          const ezw_obs_t *obs, int64_t now)
 {
     drift_session_t *ls = drift_live();
     if (ls && strcmp(ls->day, day)) {
@@ -273,7 +278,7 @@ static void estim_feed_day(const char *day, const ezs_entry_t *ents,
         ESP_LOGI(TAG, "estim: session opened day=%s", day);
     }
     if (!ls || strcmp(ls->day, day)) {
-        return;                        /* a different folder changed  */
+        return -1;                       /* a different folder changed */
     }
     int added = drift_feed_scan(ls, day, ents, n, diff,
                                 obs->req_start_us, obs->resp_end_us);
@@ -286,21 +291,36 @@ static void estim_feed_day(const char *day, const ezs_entry_t *ents,
         jrn_put("obs", rec);           /* stamp/size events (§9)      */
     }
     drift_sess_eval(ls, now);
+    return added;
+}
+
+/* The phase tracker's "transition" input for one completed tracked-day
+ * listing: while a session is live it is the beacon's own periodic
+ * update (TRANSITION events — creation/vanish are not flushes);
+ * before any session it is any non-membership file write.           */
+static bool is_periodic_change(const char *day, const cat_diff_t *diff,
+                               int added)
+{
+    drift_session_t *ls = drift_live();
+    if (ls && ls->day[0] && !strcmp(ls->day, day)) {
+        return added > 0 && ls->n_ev > 0 &&
+               ls->ev[ls->n_ev - 1].kind == DRIFT_EV_TRANSITION;
+    }
+    if (!diff) return false;
+    for (int i = 0; i < diff->n_events; i++) {
+        if (diff->ev[i].kind == CAT_EV_GREW ||
+            diff->ev[i].kind == CAT_EV_SHRUNK ||
+            diff->ev[i].kind == CAT_EV_STAMP) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void estim_housekeeping(int64_t now)
 {
     static int64_t s_eval_at_us;
     drift_session_t *ls = drift_live();
-    if (ls && !s_had_live) {
-        /* session boundary — burst accounting is per file set       */
-        s_burst_reqs = 0;
-        s_burst_next_us = 0;
-        s_burst_until_us = 0;
-        s_had_live = true;
-    } else if (!ls) {
-        s_had_live = false;
-    }
     /* ~1 s refit cadence so anchors landing after a scan still fold
      * into the live estimate                                       */
     if (ls && now - s_eval_at_us >= 1000 * 1000) {
@@ -396,7 +416,6 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
                               &r->n_entries, &r->obs);
         if (r->err == ESP_OK) {
             cat_feed_parent(r->entries, r->n_entries, now);
-            ledger_add(therapy_status()->state != THERAPY_OUT, now);
             obs_success(true);
         } else {
             s_round_failed = true;
@@ -428,18 +447,33 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
             }
             /* every successful listing feeds the estimator — an
              * unchanged response bounds the next transition (U4)     */
-            estim_feed_day(j->dir, r->entries, r->n_entries, &diff,
-                           &r->obs, now);
+            int added = estim_feed_day(j->dir, r->entries, r->n_entries,
+                                       &diff, &r->obs, now);
+            /* …and the phase tracker — unchanged scans bound the
+             * next transition from below (update2 §2/§3)             */
+            if (s_ph.day[0] && !strcmp(j->dir, s_ph.day)) {
+                phase_obs(&s_ph, r->obs.req_start_us,
+                          r->obs.resp_end_us,
+                          is_periodic_change(j->dir, &diff, added));
+            }
             ESP_LOGI(TAG, "day %s: %d listed, ev=%d chg=%d s=%lld r=%lld",
                      j->dir, r->n_entries, diff.n_events,
                      (int)diff.changed,
                      (long long)r->obs.req_start_us,
                      (long long)r->obs.resp_end_us);
-            ledger_add(therapy_status()->state != THERAPY_OUT, now);
             obs_success(true);
             therapy_note_listing(now);   /* monitor alive (§6.3)       */
         } else {
-            s_round_failed = true;
+            /* a tracked-folder pull failure is a phase observation
+             * of nothing — the tracker's miss path stays
+             * deterministic; round completeness is judged at cover
+             * close via the tracked-folder freshness bound instead
+             * of failing the whole round on one bad pull (update2)   */
+            if (s_ph.day[0] && !strcmp(j->dir, s_ph.day)) {
+                phase_fail(&s_ph, now);
+            } else {
+                s_round_failed = true;
+            }
             cat_mark_folder_stale(j->dir);
             obs_success(false);
             ESP_LOGW(TAG, "day %s failed: http=%d transport=%d parse=%d",
@@ -471,27 +505,123 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
 
 /* ---------------- planner ---------------- */
 
-static void plan_watch(int64_t now)
+/* -------- tracked-day phase planner (update2 §3) --------
+ * One folder is tracked: the live estimator session's day while a
+ * session is open, else the newest known day. Every pull is a plain
+ * JOB_DAY; only the submission timing differs per tracker state, and
+ * every completion of the tracked folder feeds the tracker — whether
+ * it was submitted by the tracker or not.                          */
+
+static void update_track_target(void)
 {
-    if (now < s_next_watch_us) {
+    drift_session_t *ls = drift_live();
+    char dbuf[CAT_DAY_STR];
+    const char *want = NULL;
+    if (ls && ls->day[0]) {
+        want = ls->day;
+    } else {
+        char days[1][CAT_DAY_STR];
+        if (cat_list_days(days, 1) > 0) {
+            memcpy(dbuf, days[0], CAT_DAY_STR);
+            want = dbuf;
+        }
+    }
+    if (!want) {
+        phase_track(&s_ph, NULL, false);
         return;
     }
-    s_next_watch_us = now + WATCH_PERIOD_US;
+    bool live = ls && ls->day[0];
+    phase_track(&s_ph, want, live);
+    /* a beacon swap must not reuse the old file's phase (§3.5)      */
+    if (live && ls->beacon[0]) {
+        if (s_beacon_seen[0] && strcmp(s_beacon_seen, ls->beacon)) {
+            phase_reacquire(&s_ph);
+            jrn_put("phase", "\"ev\":\"beacon_swap\"");
+        }
+        strncpy(s_beacon_seen, ls->beacon, sizeof(s_beacon_seen) - 1);
+        s_beacon_seen[sizeof(s_beacon_seen) - 1] = '\0';
+    } else if (!live) {
+        s_beacon_seen[0] = '\0';
+    }
+}
+
+static void plan_phase(int64_t now)
+{
+    update_track_target();
+    const drift_profile_t *prof = drift_profile();
+    phase_cfg_t cfg = {
+        .watch_gap_us = 5 * 1000 * 1000,
+        .rate_ppm     = prof->dev_rate_ppm,
+        .enabled      = prof->phase_track_enabled,
+        .refine       = prof->phase_refine_enabled,
+    };
+    phase_config(&s_ph, &cfg);
+
+    s_ph_due_us = 0;
+    if (!s_ph.day[0]) {
+        /* no folder to watch yet — hunt for the first day at watch
+         * cadence rather than waiting a full coverage round (§3.1)  */
+        static int64_t s_next_disc_us;
+        if (now >= s_next_disc_us) {
+            s_next_disc_us = now + 5LL * 1000 * 1000;
+            sched_job_t p = { .kind = JOB_PARENT, .prio = 2 };
+            sched_submit(&p);
+        }
+        return;
+    }
+
+    int64_t due, gap;
+    if (!phase_due(&s_ph, now, svc_median_us(), &due, &gap)) {
+        return;
+    }
+    s_ph_due_us = due;                 /* loop wake hint             */
+    if (now < due) {
+        return;
+    }
+    sched_job_t d = { .kind = JOB_DAY, .prio = 2,
+                      .min_gap_us = (uint32_t)gap };
+    memcpy(d.dir, s_ph.day, CAT_DAY_STR);
+    if (sched_submit(&d) == ESP_OK) {
+        phase_submitted(&s_ph);
+    }
+}
+
+/* -------- coverage round (§6.2/§6.3, update2 §3.5) --------
+ * Once a minute: the parent plus the hot days EXCEPT the tracked one
+ * — the phase pulls cover the tracked folder several-fold. Round
+ * completeness still gates OUT/transfers: a round is incomplete when
+ * a coverage job failed OR the tracked folder went silent beyond the
+ * longest scheduled inter-window gap (~55 s in MAINTAIN, so 75 s).  */
+
+static void plan_cover(int64_t now)
+{
+    if (now < s_next_cover_us) {
+        return;
+    }
+    s_next_cover_us = now + COVER_PERIOD_US;
 
     /* close the previous round: growth was already reported live via
-     * therapy_on_growth; here we only report quiet / interrupted rounds */
+     * therapy_on_growth; here we only report quiet / interrupted
+     * rounds                                                        */
     if (s_round_active) {
-        if (s_round_failed) {
+        bool complete = !s_round_failed;
+        if (complete && s_ph.day[0]) {
+            int64_t last = cat_day_last_scan(s_ph.day);
+            if (!last || now - last > TRACK_FRESH_US) {
+                complete = false;   /* tracked folder went silent    */
+            }
+        }
+        if (!complete) {
             therapy_on_gap();
         } else if (!s_round_growth) {
             therapy_on_quiet_round(now);
         }
-        /* poll evidence: one bounded record per closed round (§9)     */
+        /* poll evidence: one bounded record per closed round (§9)   */
         char rec[96];
         snprintf(rec, sizeof(rec),
-                 "\"round\":%s%s,\"n8h\":%lu",
-                 s_round_failed ? "fail" :
-                    (s_round_growth ? "growth" : "quiet"), "",
+                 "\"round\":%s,\"n8h\":%lu",
+                 !complete ? "fail" :
+                    (s_round_growth ? "growth" : "quiet"),
                  (unsigned long)sched_active_8h());
         jrn_put("poll", rec);
     }
@@ -505,6 +635,9 @@ static void plan_watch(int64_t now)
     char hot[4][CAT_DAY_STR];
     int nh = cat_hot_days(hot, 4);
     for (int i = 0; i < nh; i++) {
+        if (s_ph.day[0] && !strcmp(hot[i], s_ph.day)) {
+            continue;                /* covered by the phase pulls    */
+        }
         sched_job_t d = { .kind = JOB_DAY, .prio = 3 };
         strncpy(d.dir, hot[i], CAT_DAY_STR);
         sched_submit(&d);
@@ -547,62 +680,6 @@ static void plan_neigh(int64_t now)
     sched_submit(&v);
 }
 
-/* ---------------- dense burst (U9) ----------------
- * Armed while the estimator's bound is still outside the accurate
- * gate and the characterization profile has enabled dense polling.
- * The burst window (drift_dense_window) spans the next write's full
- * uncertainty — wide at first, shrinking as the offset tightens —
- * and the pacing widens so ~24 polls cover it. Each observed
- * transition re-anchors the window one cadence out.                  */
-
-static void plan_dense(int64_t now)
-{
-    int64_t open_us, close_us;
-    if (!drift_dense_window(now, &open_us, &close_us)) {
-        s_burst_until_us = 0;
-        s_burst_span_us = 0;
-        return;
-    }
-    s_burst_span_us = close_us - open_us;
-    if (s_burst_reqs >= ACQ_BUDGET_PER_SET) {
-        return;                        /* per-set allowance spent      */
-    }
-    /* per-minute dense-start cap (§6.2)                              */
-    if (now - s_dense_minute_at_us >= 60LL * 1000 * 1000) {
-        s_dense_minute_at_us = now;
-        s_dense_minute = 0;
-    }
-    if (s_dense_minute >= ACQ_DENSE_MINUTE) {
-        return;
-    }
-    if (s_burst_next_us && now < s_burst_next_us) {
-        return;
-    }
-    drift_session_t *ls = drift_live();
-    if (!ls || !ls->day[0]) {
-        return;
-    }
-    sched_job_t d = { .kind = JOB_DAY, .prio = 1 };
-    strncpy(d.dir, ls->day, CAT_DAY_STR);
-    if (sched_submit(&d) == ESP_OK) {
-        s_burst_reqs++;
-        s_dense_minute++;
-        s_burst_next_us = now + dense_gap_us();
-        s_burst_until_us = close_us;
-    }
-}
-
-/* True while this queued job is a burst DAY scan of the live session
- * — the exec path uses it to pick the dense spacing.                 */
-static bool job_is_dense(const qjob_t *j, int64_t now)
-{
-    if (j->kind != JOB_DAY || !drift_live() ||
-        now > s_burst_until_us) {
-        return false;
-    }
-    return !strcmp(j->dir, drift_live()->day);
-}
-
 /* ---------------- task ---------------- */
 
 esp_err_t sched_init(void)
@@ -625,7 +702,7 @@ esp_err_t sched_submit(const sched_job_t *job)
 {
     qjob_t q = {
         .kind = job->kind, .prio = job->prio, .ctx = job->ctx,
-        .done = job->done,
+        .done = job->done, .min_gap_us = job->min_gap_us,
     };
     strncpy(q.dir, job->dir, JOB_DIR_MAX - 1);
     strncpy(q.name, job->name, JOB_NAME_MAX - 1);
@@ -637,7 +714,7 @@ esp_err_t sched_submit(const sched_job_t *job)
 
 void sched_run_forever(void)
 {
-    int64_t last_plan = 0;
+    s_next_plan_us = 0;
     for (;;) {
         int64_t now = esp_timer_get_time();
         therapy_tick(now);
@@ -655,17 +732,38 @@ void sched_run_forever(void)
             ledger_checkpoint(now);
         }
 
+        /* journal phase-tracker transitions and misses (update2 §7) */
+        if ((int)s_ph.st != s_ph_logged ||
+            s_ph.n_misses != s_ph_miss_logged) {
+            char rec[112];
+            snprintf(rec, sizeof(rec),
+                     "\"st\":\"%s\",\"day\":\"%.8s\",\"brk\":%lu,"
+                     "\"miss\":%lu,\"iunc_ms\":%lld,\"per_ms\":%lld",
+                     phase_state_name(s_ph.st), s_ph.day,
+                     (unsigned long)s_ph.n_brackets,
+                     (unsigned long)s_ph.n_misses,
+                     (long long)(s_ph.iunc_us / 1000),
+                     (long long)(s_ph.period_us / 1000));
+            jrn_put("phase", rec);
+            s_ph_logged = (int)s_ph.st;
+            s_ph_miss_logged = s_ph.n_misses;
+        }
+
         qjob_t j;
         bool have = xQueuePeek(s_q, &j, pdMS_TO_TICKS(50)) == pdTRUE;
 
-        if (!have && now - last_plan > 500 * 1000) {
-            /* run planner every 500 ms when idle */
-            last_plan = now;
+        if (!have && now >= s_next_plan_us) {
+            /* planner cadence: 500 ms idle, tightened to the phase
+             * tracker's next due while a window is armed            */
+            s_next_plan_us = now + 500 * 1000;
             if (s_link_up) {
-                plan_watch(now);
-                plan_dense(now);      /* U9 burst — profile-gated     */
+                plan_phase(now);
+                plan_cover(now);
                 plan_cold(now);
                 plan_neigh(now);
+                if (s_ph_due_us > now && s_ph_due_us < s_next_plan_us) {
+                    s_next_plan_us = s_ph_due_us;
+                }
             }
             continue;
         }
@@ -674,24 +772,19 @@ void sched_run_forever(void)
         }
 
         /* spacing + budget + backoff */
-        bool dense = job_is_dense(&j, now);
-        int64_t when = earliest_start(now, dense);
+        int64_t when = earliest_start(now, &j);
         if (when > now) {
             vTaskDelay(pdMS_TO_TICKS((when - now) / 1000 + 1));
             continue;
         }
-        /* §6.1: active requests suspend when the budget is exhausted
-         * OR the last checkpoint is older than 60 s (uncommitted
-         * tail cannot grow unaccounted)                               */
+        /* §6.1 + update2 §5: requests suspend when the budget is
+         * exhausted OR the last checkpoint is older than 60 s. The
+         * ledger counts card requests in every therapy state —
+         * OUT-mode reads are cheap but never accounted as free.     */
         bool checkpoint_fresh =
             now - s_ckpt_ok_us < CKPT_PERIOD_US;
-        if ((!sched_budget_ok() || !checkpoint_fresh) &&
-            therapy_status()->state != THERAPY_OUT) {
-            /* budget exhausted -> UNKNOWN + block (§6.1) */
-            if (therapy_status()->state == THERAPY_IN) {
-                /* keep state; report budget via reason */
-            }
-            xQueueReceive(s_q, &j, 0);       /* drop lowest prio item  */
+        if (!sched_budget_ok() || !checkpoint_fresh) {
+            xQueueReceive(s_q, &j, 0);       /* drop head of queue     */
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -699,6 +792,10 @@ void sched_run_forever(void)
         s_last_req_us = esp_timer_get_time();
         sched_result_t r;
         exec_job(&j, &r);
+        if (j.kind == JOB_PARENT || j.kind == JOB_DAY ||
+            j.kind == JOB_VERSION) {
+            ledger_add(true, esp_timer_get_time());
+        }
         if (r.entries) {
             free(r.entries);
         }

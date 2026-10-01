@@ -232,7 +232,9 @@ static void op_get_status(uint32_t rid, cJSON *args)
 {
     const therapy_status_t *t = therapy_status();
     const netw_status_t *n = netw_status();
-    char inner[768];
+    char phj[288];
+    int pn = sched_phase_json(phj, sizeof(phj));
+    char inner[1152];
     snprintf(inner, sizeof(inner),
         "{\"fw\":\"1\",\"proto\":1,"
         "\"security\":\"%s\","
@@ -244,7 +246,8 @@ static void op_get_status(uint32_t rid, cJSON *args)
         "\"out_timeout_ms\":%lu,\"confidence\":\"%s\","
         "\"reason\":\"%s\",\"transfer_allowed\":%s},"
         "\"budget\":{\"active_8h\":\"%lu\",\"backoff_ms\":%lu,"
-        "\"cap\":%d}}",
+        "\"cap\":%d},"
+        "%s}",
         settings_security_label(),
         n->mode == NETW_MODE_STA ? "STA" :
         n->mode == NETW_MODE_AP ? "AP" : "DOWN",
@@ -260,7 +263,8 @@ static void op_get_status(uint32_t rid, cJSON *args)
         t->confidence, t->reason,
         t->transfer_allowed ? "true" : "false",
         (unsigned long)sched_active_8h(),
-        (unsigned long)sched_backoff_ms(), 700);
+        (unsigned long)sched_backoff_ms(), SCHED_ACTIVE_CAP_8H,
+        pn > 0 ? phj : "\"phase\":null");
     send_ok(rid, OP_GET_STATUS, inner);
 }
 
