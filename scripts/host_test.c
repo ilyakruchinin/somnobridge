@@ -596,11 +596,17 @@ static void test_drift(void)
     CHECK(s.off_lo_us / 1000 <= -Ddev * 1000 &&
           s.off_hi_us / 1000 >= -Ddev * 1000, "bound contains offset");
     /* U4.3: the stamp is [M, M+2) — lo subtracts M+2, hi subtracts
-     * M. Asymmetry is the quantization term; verify both edges       */
+     * M. Asymmetry is the quantization term; verify both edges.
+     * Expected edges computed from the live profile + session args. */
     {
-        int64_t M   = ((w / 1000000) / 2) * 2 * 1000000; /* stamp µs  */
-        int64_t elo = (U + 139700000) - (M + 2000000);   /* win_lo−M+2*/
-        int64_t ehi = (U + 320800000) - M;               /* win_hi−M  */
+        const drift_profile_t *p = drift_profile();
+        int64_t M = ((w / 1000000) / 2) * 2 * 1000000;   /* stamp µs   */
+        int64_t wlo = 250000000 - (int64_t)s.cache_bound_us
+                    - (int64_t)p->latency_hi_us - (int64_t)s.jitter_us;
+        int64_t whi = 320500000 - (int64_t)p->latency_lo_us
+                    + (int64_t)s.jitter_us;
+        int64_t elo = (U + wlo) - (M + 2000000);        /* win_lo−M+2 */
+        int64_t ehi = (U + whi) - M;                    /* win_hi−M   */
         CHECK(s.off_lo_us <= elo + 50000 &&
               s.off_lo_us >= elo - 50000,
               "lo edge carries the +2 s stamp quant");
@@ -686,6 +692,27 @@ static void test_drift(void)
         CHECK(!(s.flag_bits & DF_STEP), "cadence stayed plausible");
 
         drift_profile_set(&saved);
+    }
+
+    /* beacon pick tracks the active session's file: two same-class
+     * files in a day folder (stop/restart) -> the latest wins        */
+    {
+        ezs_entry_t two[2];
+        char t1[32], t2[32];
+        fmt_stamp(U / 1000000 + 100, t1);
+        fmt_stamp(U / 1000000 + 200, t2);
+        two[0] = mk("20240103_220000_BRP.edf", 4096, t1, false);
+        two[1] = mk("20240103_230000_BRP.edf", 4096, t2, false);
+        drift_session_t s2;
+        drift_sess_begin(&s2, 60000000, 300000);
+        memcpy(s2.day, "20240103", sizeof(s2.day));
+        cat_init();
+        cat_diff_t d2;
+        cat_feed_day("20240103", two, 2, 200000, &d2);
+        CHECK(drift_feed_scan(&s2, "20240103", two, 2, &d2,
+                              200000, 210000) == 0, "baseline quiet");
+        CHECK(!strcmp(s2.beacon, "20240103_230000_BRP.edf"),
+              "picks the latest same-class file");
     }
 }
 

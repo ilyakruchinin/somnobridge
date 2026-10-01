@@ -208,15 +208,17 @@ void drift_test_anchor(int64_t mono_us, int64_t utc_us,
 /* ---------------- characterization profile ---------------- */
 
 static drift_profile_t s_prof = {
-    /* uncharacterized defaults — conservative per U9: the stamp
-     * channel is unvalidated, the write→visibility bound is the
-     * ~50 s observed envelope, and dense polling stays off.          */
+    /* characterization-run profile (U9): dense polling armHeyHed, priors
+     * tightened to the evidence-backed provisional values. The stamp
+     * channel stays UNVALIDATED until this run's data characterizes
+     * the write→visibility latency — a too-tight guessed prior can
+     * bias self-consistently, so nothing promotes to the SOT yet.    */
     .stamp_channel_validated = false,
-    .dense_enabled           = false,
-    .cache_bound_us          = 60000000,
+    .dense_enabled           = true,
+    .cache_bound_us          = 2000000,   /* F12: fresh listings +guard */
     .jitter_us               = 300000,
     .latency_lo_us           = 0,
-    .latency_hi_us           = 50000000,
+    .latency_hi_us           = 2000000,   /* provisional, measured now  */
     .dense_spacing_us        = 500000,
     .dense_margin_loose_us   = 4000000,
     .dense_margin_tight_us   = 1500000,
@@ -377,25 +379,34 @@ static int bc_prio(drift_beacon_t b)
 }
 
 /* Choose / upgrade the sampled beacon from the current listing.
- * Upgrades are allowed only before any evidence exists — afterwards
- * the beacon is pinned for the session's life.                     */
+ * Order: class first (BRP preferred), then the chronologically latest
+ * name within the class — a day folder holds one sampled file per
+ * session, so after a stop/restart the latest same-class file is the
+ * active session's. A swap re-baselines the tuple; the old beacon's
+ * accumulated evidence stays as history.                           */
 static void pick_beacon(drift_session_t *s, const ezs_entry_t *e, int n)
 {
-    int best = s->beacon_prio < 0 ? 99 : s->beacon_prio;
     const ezs_entry_t *sel = NULL;
     for (int i = 0; i < n; i++) {
         if (e[i].is_dir) continue;
-        int p = bc_prio(drift_beacon_class(e[i].name));
-        if (p < best) {
-            best = p;
+        if (!sel) {
+            sel = &e[i];
+            continue;
+        }
+        int pa = bc_prio(drift_beacon_class(e[i].name));
+        int ps = bc_prio(drift_beacon_class(sel->name));
+        if (pa < ps ||
+            (pa == ps && strcmp(e[i].name, sel->name) > 0)) {
             sel = &e[i];
         }
     }
     if (!sel) return;
-    if (strcmp(s->beacon, sel->name)) {
+    int sp = bc_prio(drift_beacon_class(sel->name));
+    if (s->beacon_prio < 0 || sp < s->beacon_prio ||
+        (sp == s->beacon_prio && strcmp(sel->name, s->beacon) > 0)) {
         strncpy(s->beacon, sel->name, sizeof(s->beacon) - 1);
         s->beacon[sizeof(s->beacon) - 1] = '\0';
-        s->beacon_prio = best;
+        s->beacon_prio = sp;
         s->have_tuple = false;
     }
 }
@@ -493,9 +504,8 @@ int drift_feed_scan(drift_session_t *s, const char *day,
         s->flag_bits |= DF_EV_OVERFLOW;
     }
 
-    if (s->beacon_prio < 0 || (s->n_ev == 0 && s->beacon_prio > 0)) {
-        pick_beacon(s, entries, n);
-    }
+    pick_beacon(s, entries, n);        /* every scan: tracks the active
+                                        * session's file (U3)          */
 
     const ezs_entry_t *cur = NULL;
     if (s->beacon[0]) {
