@@ -62,6 +62,8 @@ typedef struct {
     int      n_mids;
     int64_t  period_us;
     int      n_period;
+    int64_t  dpers[4];          /* recent valid inter-midpoint deltas  */
+    int      n_dper;
     int64_t  resid_us[4];       /* |mid - predicted mark| samples      */
     int      n_resid;
     int64_t  cyc_us;            /* adaptive per-cycle surprise bound   */

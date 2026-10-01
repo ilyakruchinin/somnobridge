@@ -46,6 +46,7 @@ static void fit_reset(phase_t *p)
     p->n_mids = 0;
     p->period_us = PH_PERIOD_DFLT_US;
     p->n_period = 0;
+    p->n_dper = 0;
     p->n_resid = 0;
     p->cyc_us = PH_CYC_INIT_US;
     p->iunc_us = 0;
@@ -154,13 +155,20 @@ static void win_arm(phase_t *p, int64_t svc_us)
     int64_t half = half_cover(p, svc_us);
     int64_t shift = grid_shift(p);
     p->grid0_us = p->mark_us - half + shift;
-    p->spacing_us = spacing;
     /* cover [mark-half, mark+half] on the shifted lattice: the grid
      * start moved right by `shift`, so the span grows accordingly    */
     int64_t span = 2 * half + (shift > 0 ? shift : 0);
     int64_t n = (span + spacing - 1) / spacing + 1;
+    if (n > PH_PULLS_MAX) {
+        /* the cap would truncate coverage and guarantee a miss —
+         * widen the grid instead: a slightly coarser bracket beats
+         * re-hunting a whole cycle                                  */
+        spacing = (span + PH_PULLS_MAX - 2) / (PH_PULLS_MAX - 1);
+        spacing = (spacing + 99999) / 100000 * 100000;   /* 0.1 s up */
+        n = PH_PULLS_MAX;
+    }
     if (n < s_grid[p->st].min_pulls) n = s_grid[p->st].min_pulls;
-    if (n > PH_PULLS_MAX) n = PH_PULLS_MAX;
+    p->spacing_us = spacing;
     p->pull_total = (int)n;
     p->pull_sent = 0;
     p->resp_got = 0;
@@ -311,8 +319,26 @@ void phase_obs(phase_t *p, int64_t req_us, int64_t resp_us,
     if (p->n_mids) {
         int64_t dper = mid - p->mids[p->n_mids - 1];
         if (dper >= PH_PERIOD_MIN_US && dper <= PH_PERIOD_MAX_US) {
+            /* robust period: median of recent deltas. Midpoints carry
+             * grid-dependent detection offsets, so a single delta
+             * measured across a grid change can pull a mean >1 s     */
+            if (p->n_dper < 4) {
+                p->dpers[p->n_dper++] = dper;
+            } else {
+                memmove(p->dpers, p->dpers + 1, 3 * sizeof(p->dpers[0]));
+                p->dpers[3] = dper;
+            }
+            int64_t v[4];
+            int nd = p->n_dper;
+            memcpy(v, p->dpers, (size_t)nd * sizeof(v[0]));
+            for (int i = 1; i < nd; i++) {           /* sort, n <= 4 */
+                int64_t x = v[i];
+                int j = i - 1;
+                while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
+                v[j + 1] = x;
+            }
+            p->period_us = v[nd / 2];
             p->n_period++;
-            p->period_us += (dper - p->period_us) / p->n_period;
         }
         if (p->mark_us) {
             int64_t err = mid - p->mark_us;
@@ -342,9 +368,19 @@ void phase_obs(phase_t *p, int64_t req_us, int64_t resp_us,
         p->mids[PH_MID_CAP - 1] = mid;
     }
     /* next-cycle prediction uncertainty: this bracket's detection
-     * half-width + adaptive cycle surprise + rate disagreement over
-     * one period (spec §2 — iunc carries no automatic stamp floor)   */
-    p->iunc_us = w / 2 + p->cyc_us
+     * half-width + adaptive cycle surprise + observed delta spread
+     * (the period-fit noise itself) + rate disagreement over one
+     * period (spec §2 — iunc carries no automatic stamp floor)       */
+    int64_t dspread = 0;
+    if (p->n_dper >= 2) {
+        int64_t dlo = p->dpers[0], dhi = p->dpers[0];
+        for (int i = 1; i < p->n_dper; i++) {
+            if (p->dpers[i] < dlo) dlo = p->dpers[i];
+            if (p->dpers[i] > dhi) dhi = p->dpers[i];
+        }
+        dspread = (dhi - dlo) / 2;
+    }
+    p->iunc_us = w / 2 + p->cyc_us + dspread
                + p->period_us * (int64_t)p->cfg.rate_ppm / 1000000;
     p->mark_us = mid + p->period_us;
 
