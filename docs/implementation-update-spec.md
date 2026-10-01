@@ -83,6 +83,11 @@ parsed values with the raw text retained for diagnostics:
    silently normalized.
 5. The therapy FSM's existing `changed` semantics (size or stamp) are
    retained; no threshold changes.
+6. **Poll unit:** the day-folder listing is the only source of per-file
+   stamps — the card API has no per-file stat endpoint. One listing serves
+   both the therapy FSM (any-file change) and the estimator (beacon stamp);
+   per-file requests would double the count for less information. Never
+   partially parse or early-exit a listing to save time (§11.2).
 
 ## U4. Timestamp-first offset estimator
 
@@ -120,7 +125,12 @@ Requirements:
    (dense-poll gate, U9). Until characterized, the conservative observed
    bound applies and keeps the tier `approximate`. The prior is a bound with
    provenance, never an allegedly measured constant.
-7. **No runtime header dependency.** The filename carries the same start
+7. **Latency comes from poll placement, not request size.** The visibility
+   term is set by poll spacing; the measured ~236 ms listing service time
+   adds only ~0.12 s to the half-width. Minimize latency by placing polls
+   densely inside the predicted update window (U9 burst shape) — never by
+   shrinking, filtering, or partially reading the request.
+8. **No runtime header dependency.** The filename carries the same start
    claim as the EDF header (validated: header `starttime` == filename time),
    and stamps carry the offset observable — no estimator path reads a
    header, and no BLE operation exists for header reads. Re-characterization
@@ -129,7 +139,7 @@ Requirements:
    parser is retained only for an opportunistic bounded-prefix parse during
    ordinary post-therapy downloads — zero extra requests or bytes; header
    reads never touch sample data (H ≤ 16 KiB).
-8. `computed_at_ms` and `reference_at_ms` are both published (U6).
+9. `computed_at_ms` and `reference_at_ms` are both published (U6).
 
 ## U5. Accuracy tiers (revised by validation)
 
@@ -146,12 +156,15 @@ reported numerically when a bound exists.
   4. the stamp channel is validated for this card profile (U9 gate);
   5. the bound held across intervals from **at least two independent update
      windows** (not two refits of the same evidence).
-- **Gate rationale (measured):** the 2 s stamp quantization makes a 1 s
-  half-width unreachable on this channel; ±2 s is the honest achievable
-  target and matches the original requirement's primary figure. ±1 s is a
-  theoretical floor, not a target. If the characterized latency prior is
-  wider than ~2 s, the interval simply stays wider and the tier remains
-  `approximate` — the gate is a pure function of the published bound.
+- **Gate rationale (measured):** per-observation interval width =
+  2 s stamp quantization + visibility window + latency range; half-width =
+  width / 2. With 0.5 s dense bursts (visibility ≈ 0.75 s) and a latency
+  prior of [0, 1] s, half-width ≈ 1.9 s — the gate is met. A 1 s half-width
+  (2 s total) is unreachable: the 2 s quantization alone fills the budget
+  and quantization error does not average away. **±2 s each way is the
+  certified tier**; the record always reports the true half-width, and a
+  wider characterized latency simply keeps the tier `approximate` — the
+  gate is a pure function of the published bound.
 - Regression on discontinuity drops the tier honestly (approximate/pending/
   invalid per §8.4 rules).
 
@@ -197,21 +210,63 @@ Measured on the validated combination (see `validation-results.md`):
 - Size encoding `listed = ceil(exact/1024)` KiB (5/5 files, 832–25,032 B).
 - Flush cadence ~56–60 s; first flush ~63–65 s after therapy start; only
   complete records flushed (exact size = H + k·R, no trailing bytes).
-- Listing service times 20–243 ms; fresh listings matched exact lengths
-  (no stale-cache discrepancy observed).
+- **Card-side listing service time (day folder, 51 files): 218–243 ms
+  (median ≈ 236 ms, n = 5).** Fits 0.5 s dense spacing with ~260 ms margin.
+  Fresh listings matched exact lengths (no stale-cache discrepancy
+  observed).
+- **BLE transport (never in the polling path):** small-response round-trip
+  floor ≈ 184 ms; cached 51-file view ≈ 1229 ms. Burst polls are
+  scheduler-internal card requests; BLE cost applies only when serving
+  results to SomnoTrace.
 - Write-to-visibility latency: bounded [≈0, ≈50 s] — **not yet tightly
   characterized**.
 
-Pending gates before `accurate` may be enabled:
+**Dense-burst characterization procedure (the `accurate` gate):**
 
-1. **Dense-poll latency characterization:** one bounded window (~5 s spacing,
-   ≤3 min, inside the existing 40/set acquisition allowance) during a live
-   session, using the per-scan request timestamps now logged. Produces the
-   latency prior and its provenance.
-2. **≥10 varied sessions** (base-spec H2): start phases, pause/resume,
+- Spacing **0.5 s** (measured 236 ms service fits with margin).
+- **Adaptive window:** open at predicted update ±4 s while the cadence fit
+  is loose; tighten toward ±1.5 s after 2–3 fitted stamp deltas.
+- **One-sided stop:** if the stamp already changed when the window opens,
+  stop the burst — the observation still counts with its wider window and
+  the next burst uses the improved prediction. If the window closes with no
+  change, fall back to liveness and re-fit; a late miss alone never
+  classifies therapy as stopped (§6.3).
+- **Refine only the first 3–5 flushes per session** (~20–40 requests, inside
+  the 40/set acquisition allowance), then 60 s liveness — the intersection
+  floor is reached after ~2–3 independent windows.
+- **Safety:** this is deliberate contact with the write burst — requires the
+  base H3/E0b gate (one controlled run, then EDF record-count/CRC and
+  SD-error verification) before it ships.
+- **Output:** the latency prior with provenance; `accurate` unlocks only if
+  the prior keeps the published half-width ≤ 2000 ms.
+
+Other pending gates before `accurate` may be enabled:
+
+1. **≥10 varied sessions** (base-spec H2): start phases, pause/resume,
    stop/restart, one >1 MiB file (MB-unit question).
-3. Estimator-candidate comparison on held-out sessions against the
+2. Estimator-candidate comparison on held-out sessions against the
    SomnoTrace reference (offset error vs declared interval coverage).
+
+**Required fixes surfaced by measurement:**
+
+- **GET_FILE size gate (demonstrated blocker):** the catalog's ceil-KiB
+  listed size is used as `expected_size`, but the card's true
+  Content-Length is smaller (listed 2048 vs exact 1992) — every DATALOG
+  download fails before the first body byte. Fix: accept the exact length
+  within the ceil-KiB envelope (exact ≤ listed < exact + 1024) and use the
+  listing-derived `?file=` path (resolver implemented and host-tested).
+- **LIST_DIRECTORY outside DATALOG (pre-existing):** the card's root page
+  carries non-listing anchors (page chrome) that the strict parser rejects
+  wholesale — live non-DATALOG listings currently fail. Low priority; the
+  therapy path is unaffected; fix only with §11.2 fail-closed parsing
+  intact.
+- **Folder-growth guard:** listing service time scales with entry count
+  (~90 B/row). The scheduler tracks the service-time median; spacing MUST
+  widen when service time approaches the poll interval (base §6.3).
+- Optional future (not v1): one idle-time H4-gated probe of Range /
+  `Last-Modified` behavior — if the card serves per-file headers, a 1-byte
+  ranged GET becomes a ~20–90 ms per-file probe. The stamp channel does not
+  require it.
 
 ## U10. Touchpoints and tests
 
@@ -224,8 +279,9 @@ Firmware:
   opportunistic download-prefix validation and diagnostics only.
 - `scheduler` — feed stamp events; hook IN→OUT → persist; optional bounded
   dense window gated on the characterization record.
-- `ble_ops` — `GET_DRIFT {}` envelope (U7). No header-inspection op: the BLE
-  surface is exactly the base §10.2 set plus the envelope change.
+- `ble_ops`/`ezshare` — `GET_DRIFT {}` envelope (U7); fix the GET_FILE size
+  gate (U9). No header-inspection op: the BLE surface is exactly the base
+  §10.2 set plus the envelope change.
 - `settings`/NVS — `drift_sot` blob (U6).
 
 Host tests MUST cover: interval intersection and empty-intersection
@@ -256,7 +312,8 @@ regression can revert without losing detection or persistence.
   `out_timeout_ms = max(125000, 2 * expected_append_max_ms + allowance)`.
 - **Offset-only first:** no RTC-rate or timer-rate claims in version 1 of
   this update; `rtc_rate_ppm` stays null on SomnoPal (base §8.4).
-- **Achievable precision:** with a characterized small latency prior and a
-  ~5 s dense window, the intersection floor is ≈ (q + latency range)/2;
-  ±2 s is the realistic certified tier, ±1 s only via optional refinements
-  (ctime at creation, post-therapy header) that are out of scope for v1.
+- **Achievable precision:** interval width = 2 s quantization + visibility
+  + latency; with 0.5 s dense bursts and a latency prior ≲1 s, half-width
+  ≈ ±1.9 s — the **±2 s each way** gate is realistic. ±1 s total is
+  unreachable on this channel; optional refinements (ctime at creation,
+  post-therapy header) are out of scope for v1.

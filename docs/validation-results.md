@@ -119,6 +119,20 @@ ledger restored 221 pre-boot requests (not zero). The drop from the pre-flash
 overwrite night positions), not a reset. Worth a dedicated review later; no
 action taken.
 
+**F12 — Request latency (measured over BLE bridge + card-side).**
+
+| Request | Path | Median | Notes |
+|---|---|---|---|
+| `GET_STATUS` | local | 184 ms | BLE round-trip floor (n=5) |
+| `LIST_DAY` (cached, 51 files) | local | 1229 ms | BLE delivery of ~3.3 KB (n=5) |
+| Day-folder listing | card | 218–243 ms (median ≈ 236 ms, n=5) | the burst-poll unit; fits 0.5 s spacing |
+| `GET_FILE` single SA2 | card GET | 319 ms cycle (n=3) | **fails before body**: ceil-KiB `expected_size` (2048) vs exact Content-Length (1992) |
+| `LIST_DIRECTORY 'A:\'` | card | 236 ms | **parse failure**: root-page chrome anchors rejected by the strict parser (pre-existing) |
+
+No per-file stat endpoint exists in the card API; the day-folder listing is
+the minimum unit carrying stamps. BLE is never in the polling path (burst
+polls are scheduler-internal card requests).
+
 ## 4. Implications for the estimator
 
 1. **Offset measurement without content reads is feasible:** pair each stamp
