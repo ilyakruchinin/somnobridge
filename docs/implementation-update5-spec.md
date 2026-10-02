@@ -1,9 +1,9 @@
 # SomnoPal — implementation update 5: independent scoring and qualification
 
-Status: host-side collector/scorer implemented; one beacon-generation firmware
-fix is implemented and build-verified but not flashed; firmware qualification
-still pending. Written after the 2026-10-02 update-4 run and updated after the
-host-tooling smoke test and first automated live session. This document
+Status: host-side collector/scorer implemented; the beacon-generation firmware
+fix is build-verified and has been flashed by the maintainer; firmware
+qualification remains pending. Written after the 2026-10-02 update-4 run and
+updated after the host-tooling smoke test and first automated live session. This document
 records the supplied run, read-only live checks, implemented analysis plumbing,
 and remaining requirements. It does not authorize therapy control, flashing,
 profile certification, or changes to SomnoTrace. The base implementation
@@ -409,13 +409,53 @@ delay intervals are still broad enough to admit substantial positive delay, and
 the run is only one post-tooling session. H2-style multi-session coverage and
 held-out bounds remain open.
 
+### Minimum evidence needed before `stamp_channel_validated=true`
+
+Twenty-nine delay intervals containing zero means the zero-delay model is not
+contradicted; it does not prove that the hidden delay is zero. Each interval
+also contains positive delay, and the freshest events still allow roughly 1.2 s
+or more. Those observations are also correlated: they came from one machine,
+one card, one host clock domain, and two closely related sessions.
+
+Certification must therefore install supported semantics, not merely flip the
+boolean. A promotion candidate needs all of the following:
+
+1. At least ten independent completed sessions on the final firmware/profile,
+   with several held out from any bound-fitting pass. Sessions should vary the
+   flush phase, duration, same-day restarts, reconnects, card/listing load, and
+   ideally machine/card pairing. More observations inside one session do not
+   substitute for independent sessions.
+2. Every qualifying session must retain enough sequenced evidence to audit the
+   result, with no unexplained observation loss, source disagreement,
+   unresolved beacon origin, stale mapping, or unsafe reference transport.
+3. The final mtime estimate must contain its independently bounded AS11/NTP
+   reference in all held-out sessions. Overlap is not sufficient for the final
+   promotion decision. Point residuals should remain small, but containment is
+   the safety criterion.
+4. Tight contemporaneous events must support a combined residual bound
+   `B = cache_freshness + timestamp→visibility delay` that is small enough for
+   the qualified interval to remain below two seconds. With the recent
+   1,473 ms half-width, `B` has only about 1,054 ms of headroom; with a 1,266 ms
+   half-width it has about 1,468 ms. A practical target is therefore a
+   supported combined bound near or below one second.
+5. The fitted bound must then be scored on held-out sessions. If the resulting
+   model still contains every independent reference and leaves no unexplained
+   delay evidence, install that bound in `drift_profile`, mark the residual
+   policy characterized/bounded, set `stamp_channel_validated=true`, bump
+   `model_rev`, rebuild, retest, and flash. Old SOT records must remain stale
+   under the new model identity.
+
+A longer single session can improve the point estimate, but it is not the main
+qualification blocker. Multiple shorter sessions with varied conditions and
+held-out scoring are substantially stronger evidence.
+
 The run exposed a separate correctness bug: when a same-day restart selected a
 new beacon, old create/periodic events were re-evaluated against the new
 filename origin. That yielded an invalid creation interval, set
 `source_disagreement`, and prevented a fresh provisional SOT from replacing a
 record that had been marked stale. A filename-origin generation was added to
 each event so only same-generation events feed filename candidates. Host tests
-and the ESP32-S3 build pass; the fix was not flashed in this task.
+and the ESP32-S3 build pass; the maintainer subsequently flashed the fix.
 
 ## 10. Proposed implementation sequence
 
@@ -427,7 +467,7 @@ and the ESP32-S3 build pass; the fix was not flashed in this task.
 3. Add minimal replay/domain/scope diagnostics needed to prevent evidence loss.
    The filename-generation fix is implemented; cursor replay and explicit SOT
    blocker fields remain open.
-4. Flash the corrected firmware only with explicit authorization, then repeat
-   ordinary-session collection and held-out scoring.
+4. The corrected firmware has been flashed; repeat ordinary-session collection
+   and held-out scoring on this build.
 5. Only after review install characterized semantics, bump model identity, and
    verify compatible qualified SOT behavior. No width-threshold relaxation.
