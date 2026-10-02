@@ -122,6 +122,8 @@ anchor_result_t drift_time_commit(uint32_t request_id, uint64_t t4_utc_us,
 
     if (now_us > e.deadline_us) return ANCHOR_STALE;
     if (e.m3_us < e.m2_us)      return ANCHOR_BAD;
+    /* Wider sources may map best-effort evidence, but never qualify the
+     * accurate tier; DRIFT_SRC_QUAL_MAX_US remains the certified gate. */
     if (e.src_uncertainty_us > DRIFT_SRC_UNC_MAX_US) return ANCHOR_UNCERTAIN;
 
     int64_t rtt = (int64_t)t4_utc_us - (int64_t)e.t1_utc_us
@@ -134,6 +136,7 @@ anchor_result_t drift_time_commit(uint32_t request_id, uint64_t t4_utc_us,
         .utc_us  = (int64_t)((e.t1_utc_us + t4_utc_us) / 2),
         .uncertainty_us = e.src_uncertainty_us + (uint32_t)rtt / 2
                         + DRIFT_STAMP_ALLOW_US,
+        .src_uncertainty_us = e.src_uncertainty_us,
         .source_epoch = e.source_epoch,
     };
 
@@ -216,6 +219,19 @@ bool drift_map_utc(int64_t mono_us, int64_t *utc_lo, int64_t *utc_hi)
 
 int drift_anchor_count(void) { return s_nanchors; }
 
+/* Qualified SOT still requires the original ≤100 ms source bound. Wider
+ * sources are accepted only as honestly widened best-effort evidence.   */
+static bool anchor_quality_ok(void)
+{
+    if (!s_nanchors) return false;
+    for (int i = 0; i < s_nanchors; i++) {
+        if (s_anchors[i].src_uncertainty_us > DRIFT_SRC_QUAL_MAX_US) {
+            return false;
+        }
+    }
+    return true;
+}
+
 #ifndef ESP_PLATFORM
 void drift_test_anchor(int64_t mono_us, int64_t utc_us,
                        uint32_t unc_us, uint32_t epoch)
@@ -224,7 +240,8 @@ void drift_test_anchor(int64_t mono_us, int64_t utc_us,
     if (!s_epoch_set) { s_cur_epoch = epoch; s_epoch_set = true; }
     s_anchors[s_nanchors++] = (drift_anchor_t){
         .mono_us = mono_us, .utc_us = utc_us,
-        .uncertainty_us = unc_us, .source_epoch = epoch,
+        .uncertainty_us = unc_us, .src_uncertainty_us = unc_us,
+        .source_epoch = epoch,
     };
     sot_anchor_ready();
 }
@@ -261,7 +278,7 @@ static drift_profile_t s_prof = {
      * filename seconds encoding not separable from this data -> UNKNOWN.
      * *_validated stay false: bounds are honest but wide; nothing reaches
      * the 2 s qualified gate until dense-poll latency characterization. */
-    .model_rev               = 3,
+    .model_rev               = 4,
     .filename_encoding       = DRIFT_ENC_UNKNOWN,
     .filename_origin_bounded = true,
     .fname_create_lo_us      = -3000000,
@@ -1164,6 +1181,8 @@ static void publish(const drift_session_t *s, int64_t now_us)
 
     uint32_t fb = s->flag_bits;
     if (fb & DF_NO_ANCHOR)     flag(r.flags, sizeof(r.flags), "no_anchor_2h");
+    if (fb & DF_ANCHOR_BEST)   flag(r.flags, sizeof(r.flags),
+                                    "anchor_best_effort");
     if (fb & DF_OBSERVED_LATE) flag(r.flags, sizeof(r.flags), "observed_late");
     if (fb & DF_BACKWARD)      flag(r.flags, sizeof(r.flags), "clock_step_back");
     if (fb & DF_STEP)          flag(r.flags, sizeof(r.flags), "clock_step");
@@ -1266,7 +1285,8 @@ static void sot_anchor_ready(void)
     /* Restored records stop being freshness-unknown once a trusted
      * current-time anchor establishes this boot's monotonic domain. */
     for (int i = 0; i < DRIFT_SOT_N; i++) {
-        if (s_sot[i].valid && !s_sot[i].stale) {
+        if (s_sot[i].valid && !s_sot[i].stale &&
+            (i == DRIFT_SOT_PROVISIONAL || anchor_quality_ok())) {
             s_sot[i].freshness_unknown = false;
             s_sot[i].applicable = true;
         }
@@ -1443,7 +1463,7 @@ static void sot_consider(const drift_session_t *s, int64_t now_us)
     int64_t half_us = (s->off_hi_us - s->off_lo_us) / 2;
     bool validated = source_validated(p, s->preferred_source);
     drift_sot_t cand;
-    if (validated && s->n_windows >= 2 &&
+    if (validated && anchor_quality_ok() && s->n_windows >= 2 &&
         half_us <= (int64_t)p->accurate_half_us) {
         sot_fill(&cand, s, p, DRIFT_Q_QUALIFIED, now_us);
         if (cand.computed_at_ms && cand.reference_at_ms) {
@@ -1571,7 +1591,8 @@ void drift_sess_eval(drift_session_t *s, int64_t now_us)
     s->flag_bits &= ~(DF_NO_ANCHOR | DF_BACKWARD | DF_STEP |
                       DF_CONTRADICTION | DF_UNVALIDATED |
                       DF_TZ_UNRESOLVED | DF_FNAME_ORIGIN |
-                      DF_CYCLE_AMBIG | DF_SOURCE_DISAGREE);
+                      DF_CYCLE_AMBIG | DF_SOURCE_DISAGREE |
+                      DF_ANCHOR_BEST);
 
     bool have_acc = false;
     int64_t alo = 0, ahi = 0, ref = 0;
@@ -1757,6 +1778,9 @@ void drift_sess_eval(drift_session_t *s, int64_t now_us)
     s->n_segments = have_acc ? seg + 1 : seg;
     s->n_splits = splits;
     s->anchor_used = anch;
+    if (anch && !anchor_quality_ok()) {
+        s->flag_bits |= DF_ANCHOR_BEST;
+    }
 
     int64_t half = s->est_bound_valid
                  ? (s->off_hi_us - s->off_lo_us) / 2 : 0;
@@ -1765,8 +1789,9 @@ void drift_sess_eval(drift_session_t *s, int64_t now_us)
         (src == DRIFT_SRC_FNAME_CREATE && p->filename_create_validated) ||
         (src == DRIFT_SRC_FNAME_PERIODIC && p->filename_periodic_validated);
     int need_obs = src == DRIFT_SRC_MTIME ? 2 : 2;
-    if (s->est_bound_valid && anch && s->n_windows >= need_obs &&
-        src_validated && half <= (int64_t)p->accurate_half_us) {
+    if (s->est_bound_valid && anch && anchor_quality_ok() &&
+        s->n_windows >= need_obs && src_validated &&
+        half <= (int64_t)p->accurate_half_us) {
         s->tier = ACC_ACCURATE;
     } else if (s->est_bound_valid) {
         s->tier = ACC_APPROXIMATE;

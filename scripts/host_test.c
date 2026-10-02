@@ -628,6 +628,21 @@ static void test_drift(void)
                            1000 + 6LL * 1000 * 1000) == ESP_OK,
           "expired pending entry does not block id reuse");
 
+    /* A source above the qualified bound is still usable for best-effort
+     * mapping; it must carry its honest uncertainty rather than being
+     * silently clamped to 100 ms.                                      */
+    drift_reset();
+    CHECK(drift_time_begin(20, 20000000, 150000, 50, 400) == ESP_OK,
+          "best-effort exchange begin");
+    drift_time_reply_tsp(20, 420);
+    ar = drift_time_commit(20, 20050000, host_now_us, &unc);
+    CHECK(ar == ANCHOR_EPOCH || ar == ANCHOR_OK,
+          "best-effort anchor accepted");
+    CHECK(unc > 150000, "best-effort uncertainty preserved");
+    CHECK(drift_map_utc(410, &lo, &hi) && hi - lo > 300000,
+          "best-effort anchor maps with widened interval");
+    drift_reset();
+
     /* ---- stamp parsing (U4): card rows are space-padded ---- */
     int64_t ms, ms2;
     CHECK(drift_stamp_parse("2026- 9-30   14: 9:52", &ms), "stamp parse");
@@ -1029,6 +1044,50 @@ static void test_sot(void)
     /* empty combo: no session ever -> pub invalid -> estimate null   */
     drift_reset();
     CHECK(!drift_pub_get(NULL), "no session -> estimate null");
+
+    /* Best-effort anchors (>100 ms source bound) may produce a usable
+     * provisional SOT, but must not satisfy the qualified tier.       */
+    drift_reset();
+    nvs_stub_reset();
+    cat_init();
+    drift_sot_invalidate();
+    drift_test_anchor(0, U, 150000, 11);
+    drift_test_anchor(900LL * 1000 * 1000,
+                      U + 900LL * 1000 * 1000, 150000, 11);
+    fmt_stamp(U / 1000000 + 200 + D, ts);
+    fs[0] = mk("20240103_220000_BRP.edf", 4096, ts, false);
+    cat_feed_day("20240103", fs, 1, 200000000, &df);
+    cat_feed_day("20240103", fs, 1, 219740000, &df);
+    w = U + 220LL * 1000 * 1000 + D * 1000000LL;
+    fmt_stamp((w / 1000000 / 2) * 2, ts);
+    strcpy(fs[0].timestamp_raw, ts);
+    fs[0].size = 6144;
+    cat_feed_day("20240103", fs, 1, 220240000, &df);
+    drift_live_begin("20240103");
+    ls = drift_live();
+    drift_feed_scan(ls, "20240103", fs, 1, &df, 220240000, 220480000);
+    cat_feed_day("20240103", fs, 1, 279740000, &df);
+    drift_feed_scan(ls, "20240103", fs, 1, &df, 279740000, 279980000);
+    w = U + 280LL * 1000 * 1000 + D * 1000000LL;
+    fmt_stamp((w / 1000000 / 2) * 2, ts);
+    strcpy(fs[0].timestamp_raw, ts);
+    fs[0].size = 8192;
+    cat_feed_day("20240103", fs, 1, 280240000, &df);
+    drift_feed_scan(ls, "20240103", fs, 1, &df, 280240000, 280480000);
+    cat_feed_day("20240103", fs, 1, 339740000, &df);
+    drift_feed_scan(ls, "20240103", fs, 1, &df, 339740000, 339980000);
+    w = U + 340LL * 1000 * 1000 + D * 1000000LL;
+    fmt_stamp((w / 1000000 / 2) * 2, ts);
+    strcpy(fs[0].timestamp_raw, ts);
+    fs[0].size = 10240;
+    cat_feed_day("20240103", fs, 1, 340240000, &df);
+    drift_feed_scan(ls, "20240103", fs, 1, &df, 340240000, 340480000);
+    drift_sess_eval(ls, 340500000);
+    CHECK(ls->tier == ACC_APPROXIMATE, "best-effort anchor not accurate");
+    CHECK(ls->flag_bits & DF_ANCHOR_BEST, "best-effort anchor flagged");
+    CHECK(!drift_sot_view(&sot), "best-effort anchor cannot qualify");
+    CHECK(drift_sot_best(&sot) && sot.quality == DRIFT_Q_PROVISIONAL,
+          "best-effort provisional SOT available");
 
     drift_profile_set(&base);        /* restore the build profile     */
 }

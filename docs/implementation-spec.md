@@ -356,7 +356,7 @@ anchor_utc_us = (t1 + t4) / 2
 anchor_uncertainty_us = source_uncertainty_us + rtt_us / 2 + timestamp_allowance_us
 ```
 
-Require a non-negative RTT ≤250 ms, a source uncertainty ≤100 ms, and no SomnoTrace NTP step between t1 and t4. Include timestamp/stack-submission delay measured on-device; initial allowance 5 ms is provisional, never a demonstrated guarantee. The ~10–30 ms BLE figure in the proposal is a target, not a constant to stamp into every anchor.
+Require a non-negative RTT ≤250 ms and no SomnoTrace NTP step between t1 and t4. Source uncertainty ≤100 ms remains required for qualified anchors. A bounded source uncertainty up to 500 ms may be accepted for provisional/best-effort mapping and SOT, with its full uncertainty carried into intervals and a machine-readable `anchor_best_effort` flag. Reject source uncertainty >500 ms rather than silently shrinking it. Include timestamp/stack-submission delay measured on-device; initial allowance 5 ms is provisional, never a demonstrated guarantee. The ~10–30 ms BLE figure in the proposal is a target, not a constant to stamp into every anchor.
 
 Reject stale exchange commits (>5 seconds), wrong correlation, impossible times, and samples from a connection that has lost authorization. A time-source discontinuity creates a new anchor interval; never interpolate across an NTP step or reboot. SomnoTrace explicitly reports its time-source epoch in TIME_REQUEST; this is time discipline, not catalog generation/versioning. Even with an unchanged reported epoch, an anchor inconsistent with the prior clock mapping beyond the combined uncertainty/oscillator bounds must create a time-discontinuity flag and must not be interpolated through as ordinary drift.
 

@@ -32,7 +32,8 @@ extern "C" {
 
 #define DRIFT_ANCHORS_MAX      24
 #define DRIFT_RTT_MAX_US       250000      /* reject slower exchanges   */
-#define DRIFT_SRC_UNC_MAX_US   100000      /* reject worse source unc.  */
+#define DRIFT_SRC_QUAL_MAX_US  100000      /* qualified-source bound    */
+#define DRIFT_SRC_UNC_MAX_US   500000      /* best-effort source bound  */
 #define DRIFT_STAMP_ALLOW_US   5000        /* provisional, §8.1         */
 #define DRIFT_EXTRAP_PPM       40.0        /* outside-bracket bound     */
 #define DRIFT_NO_ANCHOR_US     (2LL*3600*1000000LL) /* ±2 h evidence    */
@@ -41,13 +42,14 @@ typedef struct {
     int64_t  mono_us;
     int64_t  utc_us;
     uint32_t uncertainty_us;
+    uint32_t src_uncertainty_us;
     uint32_t source_epoch;
 } drift_anchor_t;
 
 typedef enum {
     ANCHOR_OK = 0,
     ANCHOR_RTT,           /* rtt > 250 ms or negative                 */
-    ANCHOR_UNCERTAIN,     /* source uncertainty > 100 ms              */
+    ANCHOR_UNCERTAIN,     /* source uncertainty > 500 ms              */
     ANCHOR_STALE,         /* commit arrived >5 s after exchange       */
     ANCHOR_EPOCH,         /* accepted but starts new segment          */
     ANCHOR_DISCONTINUITY, /* inconsistent with prior mapping          */
@@ -192,6 +194,7 @@ typedef enum {
 #define DF_FNAME_ORIGIN   (1u<<10)  /* filename origin bound missing  */
 #define DF_CYCLE_AMBIG    (1u<<11)  /* flush cycle index ambiguous    */
 #define DF_SOURCE_DISAGREE (1u<<12) /* offset candidates do not meet  */
+#define DF_ANCHOR_BEST    (1u<<13)  /* source exceeds qualified bound */
 
 typedef enum {
     DRIFT_SRC_NONE = 0,

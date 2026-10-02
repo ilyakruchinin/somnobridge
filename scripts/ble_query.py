@@ -46,7 +46,8 @@ HDR_LEN = HDR.size
 DEFAULT_ADDR = "8C:FD:49:93:74:76"
 TIMESTAMP_ALLOWANCE_US = 5000           # §8.1 provisional 5 ms
 RTT_MAX_US = 250000
-SRC_UNC_MAX_US = 100000
+SRC_QUAL_UNC_MAX_US = 100000
+SRC_UNC_MAX_US = 500000
 
 
 def frame(kind, rid, offset, flags, payload=b""):
@@ -74,7 +75,7 @@ class SomnoPal:
         self._ack_pending = False
         # rotate the request_id base per run so a retry never collides
         # with a still-cached exchange from a previous invocation
-        self._rid = int(time.time()) & 0xFFFFF0
+        self._rid = int(time.time_ns() // 1000) & 0xFFFFF0
 
     # ---------- plumbing ----------
 
@@ -255,8 +256,8 @@ class SomnoPal:
         """rounds x (TIME_REQUEST -> TIME_REPLY), then commit the best.
 
         The host time source is measured unless an explicit bounded override is
-        supplied. A high source bound still returns raw exchanges for offline
-        mapping; it merely prevents device-side anchor commitment.
+        supplied. A >100 ms source is accepted only as best-effort evidence;
+        >500 ms prevents device-side anchor commitment entirely.
 
         TIME_REPLY is an ATT indication, so a new request sent before the
         previous one is confirmed gets no reply (NimBLE EBUSY) — hence the
@@ -314,6 +315,7 @@ class SomnoPal:
                 TIMESTAMP_ALLOWANCE_US,
                 "usable": (0 <= rtt <= RTT_MAX_US and
                            src_unc_us <= SRC_UNC_MAX_US and not stepped),
+                "qualified_source": src_unc_us <= SRC_QUAL_UNC_MAX_US,
             })
 
         response = {"source": source, "exchanges": results}
@@ -324,7 +326,7 @@ class SomnoPal:
             return response
         if not usable:
             response.update({"committed": None,
-                             "why": "no usable exchange (source<=100ms and "
+                             "why": "no usable exchange (source<=500ms and "
                                     "rtt<=250ms required)"})
             return response
 
@@ -610,7 +612,8 @@ def print_time_sync(r):
         print(f"  #{i} rid={ex['rid']} rtt={ex['rtt_us'] / 1000:.2f} ms  "
               f"on-device={ex['proc_us'] / 1000:.2f} ms  "
               f"unc=±{ex['unc_us'] / 1000:.2f} ms  "
-              f"{'usable' if ex['usable'] else 'REJECTED'}"
+              f"{('usable/qualified' if ex.get('qualified_source') else
+                 'usable/best-effort') if ex['usable'] else 'REJECTED'}"
               f"{' host_step' if ex.get('host_clock_step') else ''}")
     best = r.get("committed")
     if not best:
