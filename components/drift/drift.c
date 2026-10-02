@@ -1150,19 +1150,32 @@ static void sot_offer(drift_sot_slot_t slot, const drift_sot_t *cand)
                      cand->lo_ms > cur->hi_ms)) {
         replace = true;
     }
+    /* Rejection signature per slot: the same steady-state bound gets
+     * offered every refit (~1 s); journalling each identical reject
+     * floods the ring (~256 records ≈ 4 min of history) and evicts
+     * real evidence. Only a *changed* rejection is evidence.       */
+    static int64_t s_last_rej[DRIFT_SOT_N];
+    static int     s_last_rej_src[DRIFT_SOT_N];
+    int64_t sig = cand->accuracy_half_ms / 10;
+    bool same_rej = !replace &&
+                    s_last_rej[slot] == sig &&
+                    s_last_rej_src[slot] == (int)cand->source;
     if (replace) {
         uint32_t seq = cur->persisted_seq;
         *cur = *cand;
         cur->persisted_seq = seq;
         cur->dirty = true;
         s_sot_dirty[slot] = true;
+        s_last_rej[slot] = INT64_MIN;   /* next reject is new info   */
         drift_jrn("sot", "\"e\":\"promote\",\"q\":\"%s\",\"src\":\"%s\","
                          "\"half\":%lld,\"n\":%u",
                   drift_quality_name(cand->quality),
                   drift_source_name(cand->source),
                   (long long)cand->accuracy_half_ms,
                   (unsigned)cand->observations);
-    } else {
+    } else if (!same_rej) {
+        s_last_rej[slot] = sig;
+        s_last_rej_src[slot] = (int)cand->source;
         drift_jrn("sot", "\"e\":\"reject\",\"q\":\"%s\",\"src\":\"%s\","
                          "\"half\":%lld",
                   drift_quality_name(cand->quality),

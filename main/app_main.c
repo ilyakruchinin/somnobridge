@@ -220,6 +220,31 @@ void app_main(void)
     }
     heap_ck("sot_load");
 
+    /* card worker task — the only HTTP owner (spec §13.1). Created
+     * BEFORE netw/BLE init: the 16 KiB stack is one of the largest
+     * contiguous internal-RAM allocations, and post-NimBLE the heap
+     * is fragmented enough that xTaskCreate can fail silently — a
+     * dead card task means no catalog, no therapy detection, while
+     * BLE keeps answering (observed in the field). The task only
+     * idles on its queue until the link comes up.                 */
+    if (xTaskCreate(card_task, "card", 16384, NULL, 5, NULL)
+            != pdPASS) {
+        sched_note_task_created(false);
+        ESP_LOGE(TAG, "card task create failed");
+        lcd_ui_row(9, "CARD TASK FAIL", 1);
+        char rec[96];
+        snprintf(rec, sizeof(rec),
+                 "\"e\":\"card_task_fail\",\"int_free\":%lu,"
+                 "\"int_largest\":%lu",
+                 (unsigned long)heap_caps_get_free_size(
+                     MALLOC_CAP_INTERNAL),
+                 (unsigned long)heap_caps_get_largest_free_block(
+                     MALLOC_CAP_INTERNAL));
+        jrn_put("event", rec);
+    } else {
+        sched_note_task_created(true);
+    }
+
     /* 4. WiFi — STA with stored config, or fall back to setup AP     */
     err = netw_init();
     if (err != ESP_OK) {
@@ -253,9 +278,6 @@ void app_main(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 #endif
-
-    /* 6. card worker task — the only HTTP owner (spec §13.1)         */
-    xTaskCreate(card_task, "card", 16384, NULL, 5, NULL);
 
     esp_task_wdt_add(NULL);
 

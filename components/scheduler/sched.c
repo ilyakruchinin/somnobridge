@@ -479,7 +479,10 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
         ESP_LOGI(TAG, "heap_ck entries_alloc=%p: %s", (void *)r->entries,
                  heap_caps_check_integrity_all(false) ? "OK" : "CORRUPT");
 #endif
-        if (!r->entries) { r->err = ESP_ERR_NO_MEM; return; }
+        if (!r->entries) {
+            ESP_LOGW(TAG, "entries alloc failed (parent)");
+            r->err = ESP_ERR_NO_MEM; return;
+        }
         r->err = ezs_list_dir("A:\\DATALOG", r->entries,
                               &r->n_entries, &r->obs);
         if (r->err == ESP_OK) {
@@ -501,7 +504,10 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
         memcpy(canon, "A:\\DATALOG\\", 11);
         memcpy(canon + 11, j->dir, CAT_DAY_STR);   /* day is NUL-term */
         r->entries = malloc(EZS_ENTRIES_MAX * sizeof(ezs_entry_t));
-        if (!r->entries) { r->err = ESP_ERR_NO_MEM; return; }
+        if (!r->entries) {
+            ESP_LOGW(TAG, "entries alloc failed (day %s)", j->dir);
+            r->err = ESP_ERR_NO_MEM; return;
+        }
         r->err = ezs_list_dir(canon, r->entries, &r->n_entries, &r->obs);
         if (r->err == ESP_OK) {
             svc_note(r->obs.req_start_us, r->obs.resp_end_us);
@@ -763,7 +769,15 @@ esp_err_t sched_init(void)
     if (!s_q) {
         return ESP_ERR_NO_MEM;
     }
-    s_jobs = malloc(Q_LEN * sizeof(*s_jobs));
+    /* The job snapshot buffer is ~10 KiB of ordinary RAM — keep it in
+     * PSRAM so internal SRAM stays free for task stacks (the card
+     * task's 16 KiB stack has been observed to fail allocation when
+     * created after the WiFi/BLE stacks).                            */
+    s_jobs = heap_caps_malloc(Q_LEN * sizeof(*s_jobs),
+                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_jobs) {
+        s_jobs = malloc(Q_LEN * sizeof(*s_jobs));
+    }
     if (!s_jobs) {
         vQueueDelete(s_q);
         s_q = NULL;
@@ -820,7 +834,11 @@ esp_err_t sched_submit(const sched_job_t *job)
     strncpy(q.dir, job->dir, JOB_DIR_MAX - 1);
     strncpy(q.name, job->name, JOB_NAME_MAX - 1);
 
-    qjob_t *held = malloc(Q_LEN * sizeof(*held));
+    qjob_t *held = heap_caps_malloc(Q_LEN * sizeof(*held),
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!held) {
+        held = malloc(Q_LEN * sizeof(*held));
+    }
     if (!held) {
         q_drop(&q, ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
@@ -928,14 +946,46 @@ static void q_requeue(qjob_t *jobs, int n, int skip)
     }
 }
 
+/* DIAG: loop liveness/position for the silent-stall investigation —
+ * s_diag_stage records how far the last iteration progressed:
+ *   1 top, 2 post-estim, 3 post-checkpoint, 4 post-rx, 5 planned,
+ *   6 picked, 7 executing job                                             */
+static volatile uint32_t s_diag_iters;
+static volatile int      s_diag_stage;
+static volatile int      s_diag_picked_kind = -1;
+static volatile int64_t  s_diag_exec_us;
+static volatile int      s_diag_created = -1;   /* -1 unknown, 0 fail */
+
+void sched_note_task_created(bool ok) { s_diag_created = ok ? 1 : 0; }
+
+int sched_diag_json(char *buf, size_t cap)
+{
+    return snprintf(buf, cap,
+        "\"loop\":{\"iters\":%lu,\"stage\":%d,\"link\":%d,"
+        "\"qlen\":%u,\"ckpt_age_ms\":%lld,\"budget_ok\":%d,"
+        "\"picked\":%d,\"exec_ms\":%lld,\"created\":%d}",
+        (unsigned long)s_diag_iters, (int)s_diag_stage,
+        (int)s_link_up,
+        (unsigned)(s_q ? uxQueueMessagesWaiting(s_q) : 0xFFFF),
+        (long long)((esp_timer_get_time() - s_ckpt_ok_us) / 1000),
+        (int)sched_budget_ok(), (int)s_diag_picked_kind,
+        (long long)(s_diag_exec_us / 1000), (int)s_diag_created);
+}
+
 void sched_run_forever(void)
 {
+    s_diag_stage = -1;               /* entered before any logging   */
+    ESP_LOGI(TAG, "sched loop start q=%p jobs=%p",
+             (void *)s_q, (void *)s_jobs);
+    s_diag_stage = 0;
     s_next_plan_us = 0;
 #if !defined(CONFIG_HEAP_POISONING_DISABLED)
     static uint32_t s_iter;                /* DIAG: corruption watch   */
 #endif
     for (;;) {
         int64_t now = esp_timer_get_time();
+        s_diag_iters++;
+        s_diag_stage = 1;
 #if !defined(CONFIG_HEAP_POISONING_DISABLED)
         s_iter++;
         if (s_iter <= 240 && (s_iter % 2) == 1) {
@@ -948,6 +998,7 @@ void sched_run_forever(void)
         therapy_tick(now);
         estim_track_therapy(now);      /* session open/close on FSM   */
         estim_housekeeping(now);       /* refit cadence + SOT persist */
+        s_diag_stage = 2;
 #if !defined(CONFIG_HEAP_POISONING_DISABLED)
         if (s_iter <= 240) {
             ESP_LOGI(TAG, "heap_ck post_estim: %s",
@@ -972,6 +1023,7 @@ void sched_run_forever(void)
         if (now - s_ckpt_ok_us >= CKPT_PERIOD_US) {
             ledger_checkpoint(now);
         }
+        s_diag_stage = 3;
 
         /* journal phase-tracker transitions and misses (update2 §7) */
         if ((int)s_ph.st != s_ph_logged ||
@@ -993,6 +1045,7 @@ void sched_run_forever(void)
         qjob_t *jobs = s_jobs;
         qjob_t first;
         bool have = xQueueReceive(s_q, &first, pdMS_TO_TICKS(50)) == pdTRUE;
+        s_diag_stage = 4;
         int njobs = 0;
         if (have) {
             jobs[njobs++] = first;
@@ -1012,6 +1065,7 @@ void sched_run_forever(void)
                     s_next_plan_us = s_ph_due_us;
                 }
             }
+            s_diag_stage = 5;
             continue;
         }
         if (!have) {
@@ -1032,6 +1086,8 @@ void sched_run_forever(void)
             continue;
         }
         qjob_t j = jobs[pick];
+        s_diag_stage = 6;
+        s_diag_picked_kind = (int)j.kind;
         q_requeue(jobs, njobs, pick);
 
         /* §6.1 + update2 §5: requests suspend when the budget is
@@ -1041,6 +1097,9 @@ void sched_run_forever(void)
         bool checkpoint_fresh =
             now - s_ckpt_ok_us < CKPT_PERIOD_US;
         if (!sched_budget_ok() || !checkpoint_fresh) {
+            ESP_LOGW(TAG, "drop k=%d: budget=%d ckpt_age=%lld ms",
+                     (int)j.kind, (int)sched_budget_ok(),
+                     (long long)((now - s_ckpt_ok_us) / 1000));
             q_drop(&j, ESP_ERR_NO_MEM);
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
@@ -1050,6 +1109,8 @@ void sched_run_forever(void)
             phase_submitted(&s_ph);   /* pull token consumed on start */
         }
         sched_result_t r;
+        s_diag_stage = 7;
+        s_diag_exec_us = esp_timer_get_time();
         exec_job(&j, &r);
         if (j.kind == JOB_PARENT || j.kind == JOB_DAY ||
             j.kind == JOB_VERSION) {
