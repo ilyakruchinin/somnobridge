@@ -259,5 +259,39 @@ and added no card polls beyond SomnoPal's own scheduler.
   re-evaluated under the new filename origin, producing an invalid creation
   interval and `source_disagreement`; this prevented a fresh provisional SOT
   from replacing a stale record. A filename-origin generation tag was added in
-  source, host tests and target build pass, and the corrected image was **not**
-  flashed.
+  source, host tests and target build pass, and the corrected image was flashed.
+
+## 10. Model-rev4 best-effort three-session run (2026-10-03)
+
+After flashing the model-rev4 image, `--time-sync` used the real chrony source
+bound (≈±155 ms). The device accepted the best exchange at ±184.237 ms as a
+best-effort/provisional anchor, not a qualified anchor. Three 10-minute masked
+therapy sessions were then run with ~2-minute gaps; all were started and stopped
+through SomnoTrace's documented RPC bridge.
+
+- Evidence: `/tmp/somnopal-validation-kxss4a0n/evidence.jsonl`; analysis:
+  `/tmp/somnopal-validation-kxss4a0n/analysis.json` (private timing metadata).
+- Collection: 404 SomnoPal snapshots, 120 bracketed `GetDateTime` references,
+  five BLE exchange groups (15 exchanges), four journal replays, and ten
+  session metadata records including the three new sessions. BLE reconnects: 0.
+- Analyzer domain handling: 84 journal observations from before the post-flash
+  boot marker were excluded; 36 unique post-boot observations remained.
+- Offset coverage: all 36 observations scored `reference_contained`; offset
+  midpoint residual range was −588 to +1,852 ms, median +116 ms.
+- Residual timestamp→visibility delay hull: **[−4,457, +6,011] ms**. All 36
+  intervals contain zero; none proves a nonzero delay, so this remains support
+  for—not proof of—immediate visibility.
+- Final live estimate: `[−509,093, −506,458] ms`, half-width **1,317 ms**,
+  30 windows. Latest score: `reference_contained`, midpoint delta **+366 ms**.
+- New completed-session references: −508,158, −508,187, and −508,181 ms; all
+  were contained in the retained model-rev4 interval.
+- Persisted provisional SOT: `[−509,344, −506,501] ms`, half-width **1,421 ms**,
+  `model_rev=4`, non-stale and applicable. The tighter 1,317 ms live estimate
+  did not replace it because the 250 ms persistence hysteresis was not met.
+- Qualified SOT remains absent: `source_of_truth` is null, while
+  `best_available_offset` returns the provisional record. Flags remain
+  `anchor_best_effort` and `timing_unvalidated`.
+
+This establishes the requested best-effort SOT path end to end. It does not
+change the formal qualification gate: the residual-delay evidence is still too
+broad to certify the timestamp/visibility channel.

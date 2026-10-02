@@ -1,13 +1,14 @@
 # SomnoPal — implementation update 5: independent scoring and qualification
 
-Status: host-side collector/scorer implemented; the beacon-generation firmware
-fix is build-verified and has been flashed by the maintainer; firmware
-qualification remains pending. Written after the 2026-10-02 update-4 run and
-updated after the host-tooling smoke test and first automated live session. This document
-records the supplied run, read-only live checks, implemented analysis plumbing,
-and remaining requirements. It does not authorize therapy control, flashing,
-profile certification, or changes to SomnoTrace. The base implementation
-contract and update-4 timing semantics remain in force.
+Status: host-side collector/scorer and the model-rev4 best-effort anchor path
+are implemented, build-verified, and flashed; qualified firmware certification
+remains pending. Written after the 2026-10-02 update-4 run and updated after the
+host-tooling smoke test, first automated live session, and the three-session
+model-rev4 run. This document records the supplied runs, read-only live checks,
+implemented analysis plumbing, and remaining requirements. It does not by
+itself authorize therapy control, flashing, profile certification, or changes
+to SomnoTrace. The base implementation contract and update-4 timing semantics
+remain in force.
 
 Implemented host tooling:
 
@@ -156,9 +157,10 @@ Required changes:
    unsynchronized/unknown sources, and never silently default to 1 ms.
 2. Explicit source overrides require provenance and a warning; they are not a
    knob for forcing acceptance. Retain actual raw exchanges and source bounds.
-3. Preserve the existing 100 ms source acceptance limit. If the measured source
-   exceeds it, report why and keep exchanges for offline interval mapping;
-   do not commit a knowingly understated bound or relax the firmware gate.
+3. Preserve a two-tier source policy. ≤100 ms remains the qualified-source
+   gate; >100 ms through 500 ms may commit only an explicitly marked
+   best-effort/provisional anchor, carrying its full uncertainty into mapped
+   intervals; >500 ms is rejected rather than silently shrunk.
 4. Detect wall-clock steps and source-epoch changes. Map only within one
    uninterrupted domain, with accepted anchors and oscillator expansion.
 5. Refresh anchors at a bounded cadence where the source is usable. Preserve
@@ -457,7 +459,59 @@ record that had been marked stale. A filename-origin generation was added to
 each event so only same-generation events feed filename candidates. Host tests
 and the ESP32-S3 build pass; the maintainer subsequently flashed the fix.
 
-## 10. Proposed implementation sequence
+## 10. Best-effort model-rev4 run (2026-10-03)
+
+The model-rev4 firmware was flashed after the beacon-generation fix and the
+two-tier anchor policy. `ble_query.py --time-sync` used the host's real chrony
+bound (≈±155 ms), committed the best RTT exchange at ±184.237 ms, and the
+journal recorded the old revision-3 provisional record as model-incompatible.
+This is intentionally `anchor_best_effort`, not a qualified anchor.
+
+Three controlled masked sessions were then run for ten minutes each with
+approximately two-minute gaps. Evidence is private mode-0600 timing metadata
+only: `/tmp/somnopal-validation-kxss4a0n/evidence.jsonl`; scored output is
+`/tmp/somnopal-validation-kxss4a0n/analysis.json`.
+
+| Item | Result |
+|---|---|
+| SomnoPal snapshots | 404 |
+| Bracketed `GetDateTime` references | 120 |
+| BLE exchange groups / usable exchanges | 5 / 15 |
+| Journal replays | 4 |
+| Session metadata records | 10 total, including the three new runs |
+| BLE reconnects | 0 |
+| Unique post-boot observations | 36 |
+| Pre-boot journal observations excluded | 84 |
+| Observation/reference relation | 36/36 `reference_contained` |
+| Residual delay hull | [−4,457, +6,011] ms |
+| Delay intervals containing zero | 36/36 |
+| Final live estimate | [−509,093, −506,458] ms, half-width 1,317 ms |
+| Final live score | `reference_contained`, midpoint delta +366 ms |
+| Persisted provisional SOT | seq 9, [−509,344, −506,501] ms, half-width 1,421 ms, `model_rev=4` |
+| Qualified SOT | none; `timing_unvalidated` remains set |
+
+The three planned completed-session references were −508,158, −508,187, and
+−508,181 ms; all were contained in the retained model-rev4 interval. A short
+automatic post-therapy record also appeared, but it was not needed for the
+planned three-session decision. The live 1,317 ms estimate did not replace the
+1,421 ms persisted provisional SOT because the 250 ms hysteresis was not met;
+this is intended NVS-write avoidance, not a failure.
+
+The run therefore verifies the requested **best-effort, explicitly labelled**
+path end to end. `GET_DRIFT` with `best_available` returns a non-stale,
+applicable provisional interval while `source_of_truth` remains empty and
+`timing_unvalidated`/`anchor_best_effort` remain visible.
+
+Two analyzer correctness issues were fixed while scoring this run:
+
+- Journal `timing_obs` records preceding the newest `boot` marker are excluded
+  from post-boot BLE-anchor mapping; monotonic timestamps cannot be compared
+  across a reset.
+- Observation deduplication uses the DATALOG folder day rather than the date
+  embedded in the filename, preventing duplicate keys across midnight/noon-day
+  boundaries.
+
+## 11. Proposed implementation sequence
 
 1. Correct host anchor provenance and improve qualification/SOT explanations.
    Done for collection/offline mapping; on-device anchor acceptance remains
@@ -467,7 +521,8 @@ and the ESP32-S3 build pass; the maintainer subsequently flashed the fix.
 3. Add minimal replay/domain/scope diagnostics needed to prevent evidence loss.
    The filename-generation fix is implemented; cursor replay and explicit SOT
    blocker fields remain open.
-4. The corrected firmware has been flashed; repeat ordinary-session collection
-   and held-out scoring on this build.
+4. The corrected model-rev4 firmware has been flashed and the three-session
+   best-effort run is scored. Further ordinary-session collection remains
+   useful for held-out evidence.
 5. Only after review install characterized semantics, bump model identity, and
    verify compatible qualified SOT behavior. No width-threshold relaxation.

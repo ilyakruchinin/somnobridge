@@ -739,7 +739,10 @@ def unique_observations(rows):
             estimate = ((row.get("drift") or {}).get("estimate") or {})
             files = estimate.get("files") or []
             beacon = files[0].get("name") if files else None
-            beacon_day = beacon[:8] if beacon else None
+            day_match = re.search(r"(\d{8})",
+                                  files[0].get("dir", "")) if files else None
+            beacon_day = day_match.group(1) if day_match else \
+                (beacon[:8] if beacon else None)
             session = estimate.get("session_start_as10")
             model = estimate.get("timing_model") or {}
             for obs in estimate.get("recent_observations") or []:
@@ -752,8 +755,15 @@ def unique_observations(rows):
                                "observation_source": "get_drift"})
                 observations[key] = merged
         elif row["kind"] == "journal_replay":
-            for rec in row.get("records") or []:
+            records = row.get("records") or []
+            boot_i = None
+            for i, rec in enumerate(records):
+                if rec.get("k") == "event" and rec.get("e") == "boot":
+                    boot_i = i
+            for i, rec in enumerate(records):
                 if rec.get("k") != "timing_obs":
+                    continue
+                if boot_i is not None and i < boot_i:
                     continue
                 obs_us = rec.get("obs_us") or []
                 if len(obs_us) != 2:
@@ -783,6 +793,23 @@ def unique_observations(rows):
                 key = (rec.get("day"), rec.get("beacon"), rec.get("seq"))
                 observations.setdefault(key, obs)
     return list(observations.values())
+
+
+def journal_preboot_observations(rows):
+    count = 0
+    for row in rows:
+        if row["kind"] != "journal_replay":
+            continue
+        records = row.get("records") or []
+        boot_i = None
+        for i, rec in enumerate(records):
+            if rec.get("k") == "event" and rec.get("e") == "boot":
+                boot_i = i
+        if boot_i is None:
+            continue
+        count += sum(1 for i, rec in enumerate(records)
+                     if i < boot_i and rec.get("k") == "timing_obs")
+    return count
 
 
 def score_update5(rows):
@@ -882,6 +909,7 @@ def score_update5(rows):
     delay_values = [d["delay_ms"] for d in delays]
     summary = {
         "observations": len(observations),
+        "journal_preboot_observations": journal_preboot_observations(rows),
         "ble_anchor_exchanges": len(anchors),
         "clock_references": len(references),
         "delay_intervals": delays,
@@ -1021,8 +1049,13 @@ def self_test():
                   "unch_req_us": 10000000, "chg_resp_us": 10000500,
                   "visibility_utc_ms": [1000500, 1000700],
                   "offset_interval_ms": [-1500, 700]}]}}}]
+    rows.append({"kind": "journal_replay", "records": [
+        {"k": "timing_obs", "t": 1000, "seq": 99, "stamp_s": 999,
+         "obs_us": [1, 2]},
+        {"k": "event", "e": "boot", "t": 2000}]})
     score = score_update5(rows)
     assert score["observations"] == 1 and score["ble_anchor_exchanges"] == 1
+    assert score["journal_preboot_observations"] == 1
     assert score["delay_containing_zero"] == 1
     assert score["latest_estimate_score"]["relation"] == "reference_contained"
     print("synthetic self-tests passed")
