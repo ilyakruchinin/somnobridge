@@ -1,12 +1,13 @@
 # SomnoPal — implementation update 5: independent scoring and qualification
 
-Status: host-side collector/scorer implemented; firmware qualification still
-pending. Written after the 2026-10-02 update-4 run and updated after the
-host-tooling smoke test. This document records the supplied run, read-only
-live checks, implemented analysis plumbing, and remaining requirements. It
-does not authorize therapy control, flashing, profile certification, or
-changes to SomnoTrace. The base implementation contract and update-4 timing
-semantics remain in force.
+Status: host-side collector/scorer implemented; one beacon-generation firmware
+fix is implemented and build-verified but not flashed; firmware qualification
+still pending. Written after the 2026-10-02 update-4 run and updated after the
+host-tooling smoke test and first automated live session. This document
+records the supplied run, read-only live checks, implemented analysis plumbing,
+and remaining requirements. It does not authorize therapy control, flashing,
+profile certification, or changes to SomnoTrace. The base implementation
+contract and update-4 timing semantics remain in force.
 
 Implemented host tooling:
 
@@ -83,7 +84,8 @@ Current qualification logic in `components/drift/drift.c`:
 - Provisional SOT: the safety conditions above, at least three observations,
   and half-width no greater than five seconds, without source certification.
 - The legacy `source_of_truth` view intentionally selects qualified SOT only.
-  The provisional slot is separate; explicit best-available opt-in can expose it.
+  The provisional slot is separate; explicit best-available opt-in can expose a
+  non-stale applicable provisional record.
 
 A SOT **was** promoted, but into the provisional slot: model revision 3,
 [−508,795, −506,228] ms, half-width 1,283 ms. The old revision-1 slot correctly
@@ -379,16 +381,53 @@ Acceptance tests:
    varied start phases, pause/resume, listing sizes, reconnects, and loads;
    retain scope and independent reference bounds, not just a passing count.
 
-## 9. Proposed implementation sequence
+## 9. First automated live result
+
+A masked session (`20261002_164953`-era SomnoTrace metadata; SomnoPal beacon
+`20261002_164826_BRP.edf`) was collected passively after the user confirmed
+mask placement. SomnoTrace `EnterTherapy` was acknowledged; the user stopped
+therapy manually. No card writes or additional card polls were added.
+
+| Item | Result |
+|---|---|
+| SomnoPal snapshots | 216 |
+| Bracketed `GetDateTime` references | 69 |
+| BLE exchange groups | 3, host-side only; source bound ≈ ±148–150 ms |
+| Journal replays | 4; final replay reported no gaps/truncation |
+| Deduplicated timing observations | 29 across retained sessions |
+| BLE reconnects | 0 |
+| Final live estimate | [−509,889, −506,943] ms, half-width 1,473 ms |
+| Completed-session reference | −508,036 ms, measured 9.8 s after the estimate reference |
+| Latest interval score | `reference_contained`; midpoint delta −391 ms |
+| Session-reference score | `reference_contained`; midpoint delta −380 ms |
+| Fresh delay hull | [−2,904, +5,867] ms over 15 contemporaneous observations |
+| Delay outcomes | 29/29 compatible with zero; none prove a nonzero delay |
+
+This is strong coverage evidence for the current model on this session, but it
+is not yet enough to certify `assumed_immediate`/`assumed_zero`. The measured
+delay intervals are still broad enough to admit substantial positive delay, and
+the run is only one post-tooling session. H2-style multi-session coverage and
+held-out bounds remain open.
+
+The run exposed a separate correctness bug: when a same-day restart selected a
+new beacon, old create/periodic events were re-evaluated against the new
+filename origin. That yielded an invalid creation interval, set
+`source_disagreement`, and prevented a fresh provisional SOT from replacing a
+record that had been marked stale. A filename-origin generation was added to
+each event so only same-generation events feed filename candidates. Host tests
+and the ESP32-S3 build pass; the fix was not flashed in this task.
+
+## 10. Proposed implementation sequence
 
 1. Correct host anchor provenance and improve qualification/SOT explanations.
+   Done for collection/offline mapping; on-device anchor acceptance remains
+   intentionally limited by source quality.
 2. Upgrade passive capture/analyze to retain GET_DRIFT evidence and independent
-   bounded references, including session-close timing metadata.
+   bounded references, including session-close timing metadata. Done.
 3. Add minimal replay/domain/scope diagnostics needed to prevent evidence loss.
-4. Run ordinary-session collection and held-out scoring; report violations and
-   attainable physical bounds before changing profile certification.
+   The filename-generation fix is implemented; cursor replay and explicit SOT
+   blocker fields remain open.
+4. Flash the corrected firmware only with explicit authorization, then repeat
+   ordinary-session collection and held-out scoring.
 5. Only after review install characterized semantics, bump model identity, and
    verify compatible qualified SOT behavior. No width-threshold relaxation.
-
-Only this proposal was written in this task. Firmware, recorder behavior,
-validation flags, and active SOT were not changed.

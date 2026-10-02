@@ -739,12 +739,14 @@ def unique_observations(rows):
             estimate = ((row.get("drift") or {}).get("estimate") or {})
             files = estimate.get("files") or []
             beacon = files[0].get("name") if files else None
+            beacon_day = beacon[:8] if beacon else None
             session = estimate.get("session_start_as10")
             model = estimate.get("timing_model") or {}
             for obs in estimate.get("recent_observations") or []:
-                key = (session, beacon, obs.get("seq"))
+                key = (beacon_day, beacon, obs.get("seq"))
                 merged = dict(obs)
                 merged.update({"session_start_as10": session,
+                               "day": beacon_day,
                                "beacon": beacon,
                                "timing_model": model,
                                "observation_source": "get_drift"})
@@ -900,6 +902,13 @@ def score_update5(rows):
                                                  for d in delay_values)
         summary["delay_entirely_negative"] = sum(d[1] < 0
                                                  for d in delay_values)
+        fresh = [d["delay_ms"] for d in delays
+                 if d.get("reference_age_ms") is not None and
+                 d["reference_age_ms"] <= 120000]
+        if fresh:
+            summary["delay_hull_fresh_ms"] = [
+                min(d[0] for d in fresh), max(d[1] for d in fresh)]
+            summary["fresh_delay_samples"] = len(fresh)
     return summary
 
 

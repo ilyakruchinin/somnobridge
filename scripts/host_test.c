@@ -1120,6 +1120,47 @@ static void test_update3(void)
               "candidate JSON emitted");
     }
 
+    /* Beacon swaps start a new filename-origin generation. Older create
+     * events remain valid mtime history, but must not be re-scored
+     * against the new filename. This guards the observed same-day
+     * stop/restart case that otherwise produces source_disagreement.   */
+    {
+        drift_session_t s;
+        drift_sess_begin(&s, 0, 0);
+        memcpy(s.day, "20240103", sizeof(s.day));
+        cat_init();
+        cat_feed_day("20240103", NULL, 0, 10000000, &df);
+        drift_feed_scan(&s, "20240103", NULL, 0, &df,
+                        10000000, 10200000);
+
+        fmt_stamp(F / 1000000, ts);
+        ezs_entry_t one[1] = {
+            mk("20240103_220000_BRP.edf", 4096, ts, false)
+        };
+        cat_feed_day("20240103", one, 1, 10500000, &df);
+        drift_feed_scan(&s, "20240103", one, 1, &df,
+                        10500000, 10700000);
+
+        fmt_stamp(F / 1000000 + 600, ts);
+        ezs_entry_t two[2] = {
+            mk("20240103_220000_BRP.edf", 4096, ts, false),
+            mk("20240103_221000_BRP.edf", 4096, ts, false)
+        };
+        strcpy(two[0].timestamp_raw, ts);
+        cat_feed_day("20240103", two, 2, 20000000, &df);
+        drift_feed_scan(&s, "20240103", two, 2, &df,
+                        20000000, 20200000);
+        drift_sess_eval(&s, 20300000);
+        CHECK(s.n_ev == 2 && s.n_create_ev == 1,
+              "beacon swap keeps only same-generation filename evidence");
+        CHECK(s.ev[0].fname_gen != s.ev[1].fname_gen,
+              "events record their filename generation");
+        CHECK(!(s.flag_bits & DF_SOURCE_DISAGREE),
+              "old filename origin cannot poison new source selection");
+        CHECK(s.create_lo_us <= s.create_hi_us,
+              "creation candidate remains ordered");
+    }
+
     /* Periodic filename candidate: each transition must resolve to one
      * cycle by intersecting the filename/period model with its mtime
      * bin; an inconsistent stamp makes the candidate unavailable.      */
@@ -1127,6 +1168,7 @@ static void test_update3(void)
         drift_session_t s;
         drift_sess_begin(&s, 0, 0);
         memcpy(s.day, "20240103", sizeof(s.day));
+        cat_init();
         fmt_stamp(F / 1000000, ts);
         ezs_entry_t fs[1] = {
             mk("20240103_220000_BRP.edf", 4096, ts, false)

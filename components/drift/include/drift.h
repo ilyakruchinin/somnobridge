@@ -214,7 +214,8 @@ typedef struct {
     int64_t obs_hi_us;    /* actual changed response end              */
     int64_t stamp_s;      /* new listing mtime in device-domain secs  */
     uint8_t kind;
-    uint8_t pad[7];
+    uint8_t fname_gen;    /* filename-origin generation at feed time  */
+    uint8_t pad[6];
 } drift_ev_t;
 
 /* Bounded diagnostic ring: one record per estimator event, retaining
@@ -283,6 +284,7 @@ typedef struct {
 
     /* filename-origin evidence and per-source candidates            */
     bool     fname_known;
+    uint8_t  fname_gen;              /* incremented per beacon reset  */
     int64_t  fname_lo_us, fname_hi_us; /* UTC-shaped device interval  */
     int      n_create_ev;
     int      n_periodic_ev;

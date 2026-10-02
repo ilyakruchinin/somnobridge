@@ -225,3 +225,39 @@ Important scope note: zero cache and immediate visibility remain explicit
 assumptions, not independently proven hardware behavior. Consequently narrower
 intervals are conditional/provisional; `stamp_channel_validated` remains false
 and no qualified SOT may promote under this semantic model alone.
+
+## 9. Update-5 automated observer run (2026-10-02)
+
+A masked session was collected with `validate_timing.py observe` after mask
+confirmation. SomnoTrace `EnterTherapy` was acknowledged through the documented
+RPC bridge; the user stopped therapy manually. The observer made no card writes
+and added no card polls beyond SomnoPal's own scheduler.
+
+- Evidence: `/tmp/somnopal-validation-epa3tku1/evidence.jsonl`
+  (private mode-0600 timing metadata only).
+- Collection: 216 SomnoPal snapshots, 69 bracketed `GetDateTime` references,
+  three host-side BLE exchange groups, four journal replays, and four
+  completed-session metadata records. Final journal replay reported no gaps or
+  truncation; BLE reconnects were zero.
+- Live estimate at session close: `[−509,889, −506,943] ms`, half-width
+  **1,473 ms**, 26 windows, one segment.
+- Independent reference: completed SomnoTrace session metadata reported
+  `clock_drift_ms=-508036` 9.8 s after the estimate reference; the reference
+  interval remained inside SomnoPal's interval (`reference_contained`,
+  midpoint delta **−380 ms**). Contemporaneous live references similarly
+  remained contained (`−391 ms` midpoint delta).
+- Offset coverage across retained observations: 17 `reference_contained`,
+  12 `overlap`, no disjoint result.
+- Fresh timestamp→visibility delay hull: **[−2,904, +5,867] ms** over 15
+  contemporaneous observations. All 29 retained delay intervals contain zero;
+  none proves a nonzero delay. This supports the immediate-visibility model but
+  does not yet bound it tightly enough for certification.
+- Qualification remains blocked: `stamp_channel_validated=false`, and this is
+  still only one post-tooling run. The ≥10-session/varied-phase hardware gate
+  remains open.
+- Firmware bug found: after a same-day beacon swap, old filename evidence was
+  re-evaluated under the new filename origin, producing an invalid creation
+  interval and `source_disagreement`; this prevented a fresh provisional SOT
+  from replacing a stale record. A filename-origin generation tag was added in
+  source, host tests and target build pass, and the corrected image was **not**
+  flashed.

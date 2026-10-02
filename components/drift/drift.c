@@ -654,6 +654,7 @@ static void beacon_reset(drift_session_t *s, const char *name, int prio)
     s->beacon[sizeof(s->beacon) - 1] = '\0';
     s->beacon_prio = prio;
     s->have_tuple = false;
+    s->fname_gen++;
     s->fname_known = filename_device_interval(name, &s->fname_lo_us,
                                                 &s->fname_hi_us);
     if (!s->fname_known) {
@@ -815,6 +816,7 @@ static void push_ev(drift_session_t *s, drift_ev_kind_t kind,
     s->ev[s->n_ev++] = (drift_ev_t){
         .obs_lo_us = obs_lo, .obs_hi_us = obs_hi,
         .stamp_s = stamp_s, .kind = (uint8_t)kind,
+        .fname_gen = s->fname_gen,
     };
 }
 
@@ -1638,7 +1640,8 @@ void drift_sess_eval(drift_session_t *s, int64_t now_us)
             ref = e->obs_hi_us;
 
             if (e->kind == DRIFT_EV_CREATE) {
-                if (s->fname_known && p->filename_origin_bounded &&
+                if (e->fname_gen == s->fname_gen &&
+                    s->fname_known && p->filename_origin_bounded &&
                     p->fname_create_lo_us <= p->fname_create_hi_us) {
                     int64_t tlo = wlo - p->fname_create_hi_us;
                     int64_t thi = whi - p->fname_create_lo_us;
@@ -1653,6 +1656,7 @@ void drift_sess_eval(drift_session_t *s, int64_t now_us)
                     n_create++;
                 }
             } else if (e->kind == DRIFT_EV_TRANSITION &&
+                       e->fname_gen == s->fname_gen &&
                        s->fname_known && p->filename_periodic_bounded &&
                        p->fname_period_lo_us <= p->fname_period_hi_us) {
                 uint32_t k;
