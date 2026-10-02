@@ -9,6 +9,8 @@
 
 #include "esp_check.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
+#include "esp_mac.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "lwip/inet.h"
@@ -55,7 +57,17 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id,
     if (base != WIFI_EVENT) {
         return;
     }
-    if (id == WIFI_EVENT_STA_DISCONNECTED) {
+    if (id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t *ev = data;
+        ESP_LOGI(TAG, "AP sta joined " MACSTR " aid=%u int_free=%lu",
+                 MAC2STR(ev->mac), (unsigned)ev->aid,
+                 (unsigned long)esp_get_free_internal_heap_size());
+    } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t *ev = data;
+        ESP_LOGW(TAG, "AP sta left " MACSTR " aid=%u reason=%u int_free=%lu",
+                 MAC2STR(ev->mac), (unsigned)ev->aid, ev->reason,
+                 (unsigned long)esp_get_free_internal_heap_size());
+    } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
         s_st.sta_connected = false;
         s_st.ezshare_reachable = false;
         if (s_link_cb) {
@@ -227,17 +239,24 @@ esp_err_t netw_enter_ap(void)
     if (s_ap_pass[0]) {
         memcpy(w.ap.password, s_ap_pass, strlen(s_ap_pass));
         w.ap.authmode = WIFI_AUTH_WPA2_PSK;
+        w.ap.pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
     } else {
         w.ap.authmode = WIFI_AUTH_OPEN;
     }
-    w.ap.max_connection = 1;
+    w.ap.max_connection = 4;          /* ghost station slots must not
+                                         DoS the setup window        */
     w.ap.channel = 6;
+    w.ap.beacon_interval = 100;
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), TAG, "ap mode");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &w), TAG, "ap cfg");
     ESP_RETURN_ON_ERROR(ensure_wifi_started(), TAG, "ap start");
     set_mode(NETW_MODE_AP);
-    ESP_LOGI(TAG, "setup AP %s", s_ap_ssid);
+    ESP_LOGI(TAG, "setup AP %s int_free=%lu largest=%lu",
+             s_ap_ssid,
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_largest_free_block(
+                 MALLOC_CAP_INTERNAL));
 
     portal_note_start();             /* absolute 15-min window (§4.1) */
     dns_server_start();              /* captive-portal redirection    */

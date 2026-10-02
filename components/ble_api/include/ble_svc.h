@@ -17,6 +17,8 @@ extern "C" {
 
 esp_err_t ble_svc_init(void);
 void      ble_svc_advertise(void);
+void      ble_svc_suspend(void);   /* SETUP AP: yield the radio      */
+void      ble_svc_resume(void);
 
 /** Open the 120-s physical pairing window (§3.1). Only callable from
  * the app after a button press; denied if a peer is already bonded. */

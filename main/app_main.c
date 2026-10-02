@@ -257,6 +257,7 @@ void app_main(void)
     } else {
         /* unconfigured: straight to setup AP so the user can pair    */
         netw_enter_ap();
+        ble_svc_suspend();           /* give the setup AP the radio   */
         show_setup_ap();
     }
     heap_ck("netw");
@@ -291,8 +292,10 @@ void app_main(void)
             if (netw_mode() == NETW_MODE_AP) {
                 lcd_ui_row(11, "LEAVING SETUP", 1);
                 netw_leave_ap();
+                ble_svc_resume();
             } else {
                 netw_enter_ap();
+                ble_svc_suspend();
                 show_setup_ap();
             }
         } else if (ev == BOARD_BTN_SHORT) {
@@ -322,6 +325,7 @@ void app_main(void)
              portal_age_us() > 15LL * 60 * 1000000)) {
             lcd_ui_row(11, "SETUP TIMEOUT", 1);
             netw_leave_ap();
+            ble_svc_resume();
             if (settings_load(&cfg) == ESP_OK && cfg.magic_valid) {
                 netw_enter_sta(&cfg);
             }
@@ -334,6 +338,7 @@ void app_main(void)
                 lcd_ui_row(11, "SAVED - JOINING", 1);
                 drift_timezone_set(cfg.as10_tz, cfg.timezone_confirmed);
                 netw_leave_ap();
+                ble_svc_resume();
                 netw_enter_sta(&cfg);
                 provisioned = true;
             }

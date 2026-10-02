@@ -21,7 +21,10 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# 4096 (not the 16384 default): mid-size allocs (httpd/NVS/lwIP buffers)
+# must not burn internal RAM — the WiFi driver needs ~10+ KB free internal
+# for per-station attach/mgmt TX in SoftAP mode or clients see auth storms.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 # BLE: NimBLE host, single connection, Secure Connections, persistent bonds

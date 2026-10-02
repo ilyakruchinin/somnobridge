@@ -60,6 +60,7 @@ static int64_t  s_pairing_deadline_us;
 static int64_t  s_pairing_attempt_us;
 static int      s_pairing_fails;
 static bool     s_have_peer;
+static bool     s_suspended;         /* SETUP AP window: radio yielded */
 
 /* ---------------- access gate ---------------- */
 
@@ -402,6 +403,9 @@ void ble_svc_forget_peer(void)
 
 void ble_svc_advertise(void)
 {
+    if (s_suspended) {
+        return;
+    }
     struct ble_gap_adv_params p = {0};
     struct ble_hs_adv_fields f = {0};
 
@@ -422,6 +426,29 @@ void ble_svc_advertise(void)
     p.itvl_max = BLE_GAP_ADV_ITVL_MS(150);
     ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
                       &p, gap_event, NULL);
+}
+
+/* ---------------- setup-mode suspend ----------------
+ * The setup AP shares the antenna with BLE (SW coexist). An active
+ * bonded connection's conn events starve AP auth/assoc exchanges —
+ * observed as `wifi:m f auth` / `rm mis` client-reject storms.
+ * §4.1.1 permits dropping BLE during SETUP ("may remain").        */
+
+void ble_svc_suspend(void)
+{
+    s_suspended = true;
+    ble_gap_adv_stop();
+    if (s_conn != BLE_HS_CONN_HANDLE_NONE) {
+        /* DISCONNECT event re-invokes advertise() — suspended guard
+         * keeps it off until ble_svc_resume()                       */
+        ble_gap_terminate(s_conn, BLE_ERR_REM_USER_CONN_TERM);
+    }
+}
+
+void ble_svc_resume(void)
+{
+    s_suspended = false;
+    ble_svc_advertise();
 }
 
 /* ---------------- notifications / streaming ---------------- */
