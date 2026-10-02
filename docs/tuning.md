@@ -58,8 +58,8 @@ All live in the `s_prof` literal, `components/drift/drift.c`:
 Prerequisites:
 
 - Host clock disciplined: `chronyc tracking` → leap normal, root distance
-  ≲ 100 ms for firmware anchor qualification (at ±150 ms anchors are still
-  recorded for offline mapping — usable for characterization).
+  ≲ 100 ms for qualified anchors. A bound up to 500 ms can still be committed
+  as explicitly marked best-effort/provisional evidence.
 - Device bonded to this host; card link healthy (`GET_STATUS` shows
   `sta_connected`, no `budget.backoff_ms`).
 - A real therapy session (masked — unmasked sessions produce no sampled

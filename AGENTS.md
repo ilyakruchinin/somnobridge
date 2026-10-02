@@ -110,8 +110,9 @@ or start/stop therapy. It owns the serial reader: stop capture before flashing.
 The current LIST_DAY `scan_age_us` field actually contains the device's
 last scan-start monotonic timestamp, not an age. The recorder accounts for
 this legacy behavior. Host time-source uncertainty comes from chrony's root
-distance; if it exceeds 100 ms, firmware anchors cannot qualify, though
-exchange timings remain available for offline analysis. These observations
+distance; above 100 ms the anchor is best-effort/provisional rather than
+qualified, and above 500 ms it is rejected. Exchange timings remain available
+for offline analysis either way. These observations
 alone do not establish a high-precision write-latency bound.
 
 ## Host tests
