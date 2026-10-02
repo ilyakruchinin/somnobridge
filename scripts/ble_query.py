@@ -20,6 +20,7 @@
 
 import argparse
 import json
+import math
 import struct
 import sys
 import time
@@ -27,6 +28,8 @@ import time
 import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
+
+from clock_source import clock_source
 
 SVC_UUID = "8ba7d100-6e4b-4bb4-9f1d-7306766e6f50"
 CTRL_UUID = "8ba7d101-6e4b-4bb4-9f1d-7306766e6f50"
@@ -194,9 +197,10 @@ class SomnoPal:
                 self._done[rid] = bytes(buf).decode("utf-8", "replace")
                 self._rx.pop(rid, None)
         elif kind == K_TIME_REPLY:
-            # t4 = receipt of the *complete* reply (§8.1) — stamp it here,
-            # not after the pump loop, or host polling inflates the RTT.
-            self._time_reply[rid] = (payload, time.time_ns() // 1000)
+            # t4 = receipt of the *complete* reply (§8.1) — stamp UTC and
+            # monotonic together here, not after the pump loop.
+            self._time_reply[rid] = (payload, time.time_ns() // 1000,
+                                     time.monotonic_ns() // 1000)
         elif kind in (K_FILE_BYTES, K_EV_BYTES):
             if off > len(self._stream):
                 self._stream.extend(b"\x00" * (off - len(self._stream)))
@@ -246,24 +250,36 @@ class SomnoPal:
 
     # ---------- §8.1 time exchange ----------
 
-    def time_exchange(self, unc_us=1000, epoch=1, rounds=5, timeout=2.0,
-                      gap=0.15):
+    def time_exchange(self, unc_us=None, epoch=None, rounds=5, timeout=2.0,
+                      gap=0.15, source=None, commit=True):
         """rounds x (TIME_REQUEST -> TIME_REPLY), then commit the best.
+
+        The host time source is measured unless an explicit bounded override is
+        supplied. A high source bound still returns raw exchanges for offline
+        mapping; it merely prevents device-side anchor commitment.
 
         TIME_REPLY is an ATT indication, so a new request sent before the
         previous one is confirmed gets no reply (NimBLE EBUSY) — hence the
         gap. The commit must land within 5 s of the chosen exchange (§8.1)
         so a missing reply must fail fast, not stall the whole round.
         """
+        if source is None:
+            source = clock_source(None if unc_us is None else unc_us / 1000,
+                                  epoch)
+        src_unc_us = int(math.ceil(source["uncertainty_ms"] * 1000))
+        src_epoch = int(epoch if epoch is not None
+                        else source.get("epoch", 1)) & 0xffffffff
         results = []
         for i in range(rounds):
             if i:
                 self._pump(gap)
             rid = self._next_rid()
             t1 = time.time_ns() // 1000
+            m1 = time.monotonic_ns() // 1000
             self._write(self.ctrl_path, self._ctrl,
                         frame(K_TIME_REQ, rid, 0, FLAG_START | FLAG_END,
-                              struct.pack("<QII", t1, unc_us, epoch)))
+                              struct.pack("<QII", t1, src_unc_us,
+                                          src_epoch)))
             end = time.monotonic() + timeout
             while time.monotonic() < end and rid not in self._time_reply \
                     and rid not in self._done:
@@ -277,7 +293,7 @@ class SomnoPal:
                 results.append({"rid": rid, "ok": False,
                                 "why": "no reply"})
                 continue
-            raw, t4 = raw
+            raw, t4, m4 = raw
             if len(raw) < 28:      # §10.4: t1,m2,m3 (u64) + epoch (u32)
                 results.append({"rid": rid, "ok": False,
                                 "why": f"malformed TIME_REPLY ({len(raw)} B, "
@@ -285,31 +301,47 @@ class SomnoPal:
                 continue
             t1r, m2, m3, ep = struct.unpack("<QQQI", raw[:28])
             rtt = (t4 - t1r) - (m3 - m2)
+            step_us = abs((t4 - t1r) - (m4 - m1))
+            stepped = step_us > 10000
             results.append({
                 "rid": rid, "ok": True, "t1": t1r, "t4": t4,
+                "t1_mono_us": m1, "t4_mono_us": m4,
                 "m2": m2, "m3": m3, "epoch": ep, "rtt_us": rtt,
-                "proc_us": m3 - m2,
-                "unc_us": unc_us + max(rtt, 0) // 2 + TIMESTAMP_ALLOWANCE_US,
-                "usable": 0 <= rtt <= RTT_MAX_US and unc_us <= SRC_UNC_MAX_US,
+                "proc_us": m3 - m2, "host_clock_step_us": step_us,
+                "host_clock_step": stepped,
+                "source_uncertainty_us": src_unc_us,
+                "unc_us": src_unc_us + max(rtt, 0) // 2 +
+                TIMESTAMP_ALLOWANCE_US,
+                "usable": (0 <= rtt <= RTT_MAX_US and
+                           src_unc_us <= SRC_UNC_MAX_US and not stepped),
             })
 
+        response = {"source": source, "exchanges": results}
         usable = [r for r in results if r.get("usable")]
+        if not commit:
+            response.update({"committed": None,
+                             "why": "commit_disabled"})
+            return response
         if not usable:
-            return {"exchanges": results, "committed": None,
-                    "why": "no usable exchange (rtt<=250ms required)"}
+            response.update({"committed": None,
+                             "why": "no usable exchange (source<=100ms and "
+                                    "rtt<=250ms required)"})
+            return response
 
         best = min(usable, key=lambda r: r["rtt_us"])
-        commit = frame(K_TIME_COMMIT, best["rid"], 0, FLAG_START | FLAG_END,
-                       struct.pack("<QQI", best["t1"], best["t4"],
-                                   best["epoch"]))
-        self._write(self.ctrl_path, self._ctrl, commit)
+        commit_frame = frame(K_TIME_COMMIT, best["rid"], 0,
+                             FLAG_START | FLAG_END,
+                             struct.pack("<QQI", best["t1"], best["t4"],
+                                         best["epoch"]))
+        self._write(self.ctrl_path, self._ctrl, commit_frame)
         end = time.monotonic() + timeout
         ack = None
         while time.monotonic() < end and best["rid"] not in self._done:
             self._pump(0.05)
         if best["rid"] in self._done:
             ack = json.loads(self._done.pop(best["rid"]))
-        return {"exchanges": results, "committed": best, "ack": ack}
+        response.update({"committed": best, "ack": ack})
+        return response
 
     # ---------- evidence stream ----------
 
@@ -392,12 +424,25 @@ def print_status(r):
     ph = res.get("phase")
     if ph:
         print(f"  phase: st={ph.get('st')} day={ph.get('day')} "
-              f"armed={ph.get('armed')} pulls={ph.get('pulls')}")
+              f"armed={ph.get('armed')} pulls={ph.get('pulls')} "
+              f"strategy={ph.get('strategy')}")
         print(f"         bracket={ph.get('bracket_ms')} ms "
-              f"iunc={ph.get('iunc_ms')} ms "
+              f"prediction_iunc={ph.get('prediction_iunc_ms',
+                                              ph.get('iunc_ms'))} ms "
               f"period={ph.get('period_ms')} ms "
               f"mark_in={ph.get('mark_in_ms')} ms "
               f"brackets={ph.get('brackets')} misses={ph.get('misses')}")
+    http = res.get("http")
+    if http:
+        last = http.get("last") or {}
+        svc = http.get("service_us") or {}
+        print(f"  http: last={last.get('purpose')} ok={last.get('ok')} "
+              f"service={last.get('service_us')} us "
+              f"req={last.get('req_start_us')} "
+              f"resp={last.get('resp_end_us')}")
+        print(f"       service_us n={svc.get('n')} "
+              f"min={svc.get('min')} median={svc.get('median')} "
+              f"max={svc.get('max')} failures={svc.get('failures')}")
 
 
 def print_catalog(r):
@@ -447,7 +492,7 @@ def print_ls(r, directory):
 
 
 def print_drift(r):
-    """U10 envelope: {"schema":2,"estimate":{...}|null,
+    """U10 envelope: {"schema":4,"estimate":{...}|null,
                      "source_of_truth":{...}|null}."""
     res = r.get("result", {})
     hr("GET_DRIFT")
@@ -486,6 +531,23 @@ def print_drift(r):
         print(f"    unavailable: create="
               f"{est.get('filename_creation_reason')} periodic="
               f"{est.get('filename_periodic_reason')}")
+        tm = est.get("timing_model") or {}
+        print(f"    timing_model: rev={tm.get('model_rev')} "
+              f"cache={tm.get('cache_policy')} "
+              f"cache_us={tm.get('cache_bound_us')} "
+              f"visibility={tm.get('visibility_policy')} "
+              f"delay_us={tm.get('visibility_delay_us')} "
+              f"jitter_us={tm.get('jitter_us')} "
+              f"dev_rate_ppm={tm.get('dev_rate_ppm')}")
+        obs = est.get("recent_observations") or []
+        print(f"    recent_observations={len(obs)}")
+        for ob in obs:
+            print(f"      obs {ob.get('seq')} {ob.get('kind')} "
+                  f"bracket={ob.get('bracket_us')} us "
+                  f"svc={ob.get('unchanged_service_us')}/"
+                  f"{ob.get('changed_service_us')} us "
+                  f"utc={ob.get('visibility_utc_ms')} "
+                  f"off={ob.get('offset_interval_ms')}")
         print(f"    windows={est.get('n_windows')} "
               f"segments={est.get('segments')}")
         flags = est.get("flags") or []
@@ -502,7 +564,12 @@ def print_drift(r):
         print(f"    computed_at_ms    = {fmt_ms(sot.get('computed_at_ms'))}  "
               f"reference_at_ms = {fmt_ms(sot.get('reference_at_ms'))}")
         print(f"    quality={sot.get('quality')} source={sot.get('source')} "
+              f"stale={sot.get('stale')} applicable={sot.get('applicable')} "
               f"freshness_unknown={sot.get('freshness_unknown')}")
+        print(f"    model_rev={sot.get('model_rev')} "
+              f"cache={sot.get('cache_policy')} "
+              f"visibility={sot.get('visibility_policy')} "
+              f"delay_us={sot.get('visibility_delay_us')}")
         print("    note: source_of_truth stays qualified-only; request "
               "best_available for provisional records")
     prov = res.get("provisional_source_of_truth")
@@ -513,7 +580,8 @@ def print_drift(r):
         else:
             print(f"    interval={fmt_iv(prov.get('interval_ms'))} "
                   f"half={fmt_ms(prov.get('accuracy_half_ms'))} "
-                  f"source={prov.get('source')}")
+                  f"source={prov.get('source')} stale={prov.get('stale')} "
+                  f"model_rev={prov.get('model_rev')}")
     best = res.get("best_available_offset")
     if best is not None:
         print("  best_available_offset:")
@@ -530,6 +598,11 @@ def print_drift(r):
 
 def print_time_sync(r):
     hr("TIME SYNC (§8.1)")
+    src = r.get("source") or {}
+    if src:
+        print(f"  source={src.get('source')} "
+              f"uncertainty=±{src.get('uncertainty_ms')} ms "
+              f"epoch={src.get('epoch')}")
     for i, ex in enumerate(r.get("exchanges", []), 1):
         if not ex.get("ok"):
             print(f"  #{i} rid={ex['rid']} FAILED ({ex.get('why')})")
@@ -537,7 +610,8 @@ def print_time_sync(r):
         print(f"  #{i} rid={ex['rid']} rtt={ex['rtt_us'] / 1000:.2f} ms  "
               f"on-device={ex['proc_us'] / 1000:.2f} ms  "
               f"unc=±{ex['unc_us'] / 1000:.2f} ms  "
-              f"{'usable' if ex['usable'] else 'REJECTED'}")
+              f"{'usable' if ex['usable'] else 'REJECTED'}"
+              f"{' host_step' if ex.get('host_clock_step') else ''}")
     best = r.get("committed")
     if not best:
         print(f"  committed: none — {r.get('why')}")
@@ -602,6 +676,12 @@ def main():
     ap.add_argument("--time-sync", type=int, nargs="?", const=5, default=None,
                     metavar="N",
                     help="run N exchanges and commit the best anchor (§8.1)")
+    ap.add_argument("--source-uncertainty-ms", type=float,
+                    help="explicit host UTC source bound (default: measured chrony bound)")
+    ap.add_argument("--source-epoch", type=lambda x: int(x, 0),
+                    help="explicit time-source epoch for §8.1 anchors")
+    ap.add_argument("--no-time-commit", action="store_true",
+                    help="collect TIME exchanges without committing an anchor")
     ap.add_argument("--evidence", action="store_true",
                     help="replay the evidence journal (GET_EVIDENCE)")
     ap.add_argument("--json", action="store_true", help="print raw JSON")
@@ -654,7 +734,10 @@ def main():
             print(json.dumps(r, indent=2)) if args.json else print_drift(r)
 
         if args.time_sync is not None:
-            r = dev.time_exchange(rounds=args.time_sync)
+            source = clock_source(args.source_uncertainty_ms,
+                                  args.source_epoch)
+            r = dev.time_exchange(rounds=args.time_sync, source=source,
+                                  commit=not args.no_time_commit)
             print(json.dumps(r, indent=2)) if args.json else print_time_sync(r)
 
         if args.evidence:

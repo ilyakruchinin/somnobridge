@@ -80,26 +80,41 @@ anchor_result_t drift_time_commit(uint32_t request_id, uint64_t t4_utc_us,
 bool drift_map_utc(int64_t mono_us, int64_t *utc_lo, int64_t *utc_hi);
 int  drift_anchor_count(void);
 
-/* ---------------- characterization profile (U5, update2) ----------
- * Build/run-time record of what this card combination is allowed to
- * claim. The uncharacterized defaults keep the estimator honest:
- * latency bound stays conservative, the stamp channel is
- * unvalidated, and phase tracking runs with the 0.2 s refinement
- * stage off. Characterization under the update2 schedule is what may
- * tighten these.                                                  */
+/* ---------------- characterization profile (U5/update4) ----------
+ * Build-time record of what this card combination is allowed to claim.
+ * Residual cache/visibility terms are explicit model assumptions until
+ * independently characterized; actual listing request intervals are
+ * measured separately and are not represented by these bounds. Phase
+ * tracking/refinement is scheduler policy, not a profile switch.      */
 typedef enum {
     DRIFT_ENC_UNKNOWN = 0,       /* union of truncate/round bins      */
     DRIFT_ENC_TRUNCATED,         /* filename second is [F,F+1 s)      */
     DRIFT_ENC_ROUNDED,           /* filename second is [F-0.5,F+0.5]  */
 } drift_filename_enc_t;
 
+/* Explicit semantics for the two residual terms. The listing request
+ * interval itself is measured from ESP request start through completed
+ * response; these bounds cover only uncertainty not represented by
+ * those endpoints.                                                    */
+typedef enum {
+    DRIFT_CACHE_BOUNDED = 0,      /* nonzero conservative bound       */
+    DRIFT_CACHE_ASSUMED_ZERO,     /* scoped operating assumption      */
+    DRIFT_CACHE_CHARACTERIZED,    /* independently supported bound    */
+} drift_cache_policy_t;
+
+typedef enum {
+    DRIFT_VIS_BOUNDED = 0,        /* finite prior/characterized bound */
+    DRIFT_VIS_ASSUMED_IMMEDIATE,  /* scoped operating assumption      */
+    DRIFT_VIS_CHARACTERIZED,      /* independently supported bound    */
+} drift_visibility_policy_t;
+
 typedef struct {
     bool     stamp_channel_validated; /* U5 gate 4 — mtime source     */
-    bool     phase_track_enabled;     /* phase schedule may arm grids */
-    bool     phase_refine_enabled;    /* optional shifted-grid refine */
-    uint32_t cache_bound_us;          /* listing freshness bound C    */
+    uint8_t  cache_policy;            /* drift_cache_policy_t         */
+    uint8_t  visibility_policy;       /* drift_visibility_policy_t    */
+    uint32_t cache_bound_us;          /* additional freshness bound C */
     uint32_t jitter_us;               /* separate per-edge allowance  */
-    uint32_t latency_lo_us;           /* write→visibility delay bound */
+    uint32_t latency_lo_us;           /* residual visibility delay    */
     uint32_t latency_hi_us;
     uint32_t dev_rate_ppm;            /* AS11 rate bound — re-refer-  */
                                       /* ences intervals across gaps */
@@ -191,9 +206,9 @@ typedef enum {
 } drift_ev_kind_t;
 
 /* One stamp observation: the beacon's stamp read `stamp_s` was first
- * visible inside the monotonic window [req_lo_us, resp_hi_us] — the
- * previous unchanged scan's start minus cache bound minus the latency
- * prior, through the changed response's end (U4).                    */
+ * visible inside the actual monotonic listing interval [unchanged
+ * request start, changed response end]. Residual cache/visibility model
+ * terms are applied at evaluation; this record stays raw/recomputable. */
 typedef struct {
     int64_t obs_lo_us;    /* actual unchanged request start           */
     int64_t obs_hi_us;    /* actual changed response end              */
@@ -202,11 +217,44 @@ typedef struct {
     uint8_t pad[7];
 } drift_ev_t;
 
+/* Bounded diagnostic ring: one record per estimator event, retaining
+ * the actual ESP-side listing endpoints so offline replay can audit the
+ * observation interval without mixing in BLE transport time.          */
+#define DRIFT_OBS_DIAG_CAP 12
+typedef struct {
+    uint32_t seq;                /* transition diagnostic sequence    */
+    uint32_t unch_seq;           /* unchanged-scan sequence (0 none)  */
+    uint32_t chg_seq;            /* changed-scan sequence             */
+    int32_t  ev_index;           /* drift_ev index; -1 when capped    */
+    uint8_t  kind;               /* drift_ev_kind_t                   */
+    int64_t  stamp_s;            /* stamped second (device domain)    */
+    int64_t  unch_req_us;        /* unchanged listing request start   */
+    int64_t  unch_resp_us;       /* unchanged response end (0 unknown)*/
+    int64_t  chg_req_us;         /* changed listing request start     */
+    int64_t  chg_resp_us;        /* changed response end              */
+} drift_obs_diag_t;
+
+/* Compact published copy with the event's contribution mapped under
+ * the active profile.                                                */
+#define DRIFT_OBS_PUB_MAX 4
+typedef struct {
+    uint32_t seq, unch_seq, chg_seq;
+    int32_t  ev_index;
+    uint8_t  kind;
+    bool     mapped;
+    int64_t  stamp_s;
+    int64_t  unch_req_us, unch_resp_us;
+    int64_t  chg_req_us, chg_resp_us;
+    int64_t  utc_lo_ms, utc_hi_ms;
+    int64_t  offset_lo_ms, offset_hi_ms;
+} drift_obs_pub_t;
+
 #define DRIFT_EV_CAP 96
 
 typedef struct {
     uint32_t cache_bound_us;
     uint32_t jitter_us;
+    bool     use_profile_bounds;  /* live sessions follow profile      */
 
     /* binding: one day folder, one sampled beacon                    */
     char     day[9];             /* CAT_DAY_STR                      */
@@ -219,7 +267,15 @@ typedef struct {
     bool     stamp_ok;
     int64_t  stamp_s;
     int64_t  prev_scan_us;        /* req_start of the previous feed   */
+    int64_t  prev_resp_us;        /* resp_end of the previous feed    */
+    uint32_t prev_scan_seq;       /* previous feed sequence           */
+    uint32_t scan_seq;            /* feeds for this session/day       */
+    uint32_t obs_seq;             /* transition diagnostic sequence   */
     bool     baseline_bounded;    /* a pre-open scan bound existed    */
+
+    drift_obs_diag_t obs_diag[DRIFT_OBS_DIAG_CAP];
+    uint8_t  obs_diag_next;
+    uint8_t  n_obs_diag;
 
     drift_ev_t ev[DRIFT_EV_CAP];
     int      n_ev;
@@ -320,6 +376,14 @@ typedef struct {
     uint8_t     source;             /* selected drift_source_t      */
     char        source_reason[48];
     char        model_id[24];
+    uint16_t    model_rev;
+    uint8_t     cache_policy;         /* drift_cache_policy_t        */
+    uint8_t     visibility_policy;    /* drift_visibility_policy_t   */
+    uint32_t    cache_bound_us;
+    uint32_t    visibility_lo_us;
+    uint32_t    visibility_hi_us;
+    uint32_t    jitter_us;
+    uint32_t    dev_rate_ppm;
     uint64_t    assumptions;
     bool        observation_closed;
     bool        has_drift;
@@ -345,6 +409,8 @@ typedef struct {
     char        beacon[96];
     char        day[9];
     char        session_start_as10[24];
+    uint8_t     n_observations;
+    drift_obs_pub_t observations[DRIFT_OBS_PUB_MAX];
 } drift_record_t;
 
 /* The sched task publishes the evaluated record under a sequence
@@ -390,6 +456,8 @@ typedef struct {
     uint8_t  origin;
     uint32_t model_rev;
     uint64_t assumptions;
+    uint8_t  cache_policy;         /* drift_cache_policy_t           */
+    uint8_t  visibility_policy;    /* drift_visibility_policy_t      */
     uint32_t anchor_epoch;
     uint32_t dev_rate_ppm;
     uint32_t cache_bound_us;

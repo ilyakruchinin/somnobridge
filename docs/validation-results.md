@@ -181,3 +181,47 @@ Private JSONL evidence (mode 0600, timing metadata only):
 (self-test, history, capture, cycle, analyze modes). Diagnostic firmware
 additions: `INSPECT_EDF_HEADER` BLE op, listing-derived download resolver,
 per-scan request timestamps — all uncommitted.
+
+## 7. Follow-up — 2026-10-02 masked session (capture lt_hjhvx)
+
+Passive capture, 210 catalog snapshots @5 s, ~18 flush cycles. Patient data
+untouched (timing/size metadata only).
+
+- **Flush period:** exactly 60.0 s across BRP (18/18), PLD (18/18), SA2
+  (18/18); single 56 s (PLD) and 58 s (SA2) outliers at first flush.
+- **Create delay** (filename instant → listing appearance, drift-corrected):
+  CSL/EVE −0.5..+5.1 s; PLD/SA2/BRP +0.1..+5.8 s — window includes the 5 s
+  poll quantum. Profile bound set to [−3 s, +10 s].
+- **Periodic residual** (`stamp − (filename + k·60 s)`): **−1 s** for
+  BRP/SA2, **−3 s** for PLD, stable across all 18 cycles. Profile bound set
+  to [−5 s, +1 s]. PLD differs from BRP/SA2 — any per-type bound must
+  account for this.
+- **Filename encoding:** not separable from this data (needs EDF header
+  `starttime` comparison); `DRIFT_ENC_UNKNOWN` retained.
+- **Filename channels still lose to mtime at 5 s polling:** candidate width
+  = observation window + filename quantum + bound ≈ 9–20 s vs mtime's ~6.5 s.
+  They provide the source-agreement cross-check, not a tighter estimate.
+  Reaching the ≤2 s qualified gate needs a dense-poll window (~1–2 s
+  spacing) to shrink the per-event observation window, plus a measured
+  write→visibility bound to tighten `latency_hi_us`/`cache_bound_us`
+  (F8 remains loose at [≈0, ≈50 s]).
+- Profile installed: `filename_origin_bounded`, `filename_periodic_bounded`.
+
+## 8. Update-4 timing model implementation (2026-10-02)
+
+The update-4 model removes the unexplained `cache_bound_us=2 s` and residual
+`latency_hi_us=2 s` defaults for the tested AS11+EZShare scope:
+
+- `cache_policy=assumed_zero`, `cache_bound_us=0`
+- `visibility_policy=assumed_immediate`, `latency_lo/hi_us=0`
+- `model_rev=3`; persisted SOT from a different model, policy, or stored
+  timing/source bound now loads as stale/inapplicable rather than silently
+  applying.
+- Actual request endpoints and service durations are exported via GET_STATUS;
+  recent raw transition brackets are exported via GET_DRIFT and journaled as
+  bounded `timing_obs` evidence.
+
+Important scope note: zero cache and immediate visibility remain explicit
+assumptions, not independently proven hardware behavior. Consequently narrower
+intervals are conditional/provisional; `stamp_channel_validated` remains false
+and no qualified SOT may promote under this semantic model alone.

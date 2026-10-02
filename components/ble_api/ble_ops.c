@@ -233,12 +233,19 @@ static void op_get_status(uint32_t rid, cJSON *args)
 {
     const therapy_status_t *t = therapy_status();
     const netw_status_t *n = netw_status();
-    char phj[400];
-    int pn = sched_phase_json(phj, sizeof(phj));
+    char *inner = malloc(2600);
+    char *phj = malloc(640);
+    char *tj = malloc(640);
     char dj[192];
-    sched_diag_json(dj, sizeof(dj));
-    char inner[1344];
-    snprintf(inner, sizeof(inner),
+    if (!inner || !phj || !tj) {
+        free(inner); free(phj); free(tj);
+        send_error(rid, OP_GET_STATUS, EC_RESOURCE_LIMIT);
+        return;
+    }
+    int pn = sched_phase_json(phj, 640);
+    int tn = sched_timing_json(tj, 640);
+    int dn = sched_diag_json(dj, sizeof(dj));
+    int sn = snprintf(inner, 2600,
         "{\"fw\":\"1\",\"proto\":1,"
         "\"security\":\"%s\","
         "\"mode\":\"%s\",\"sta_connected\":%s,\"rssi\":%d,"
@@ -250,7 +257,7 @@ static void op_get_status(uint32_t rid, cJSON *args)
         "\"reason\":\"%s\",\"transfer_allowed\":%s},"
         "\"budget\":{\"active_8h\":\"%lu\",\"backoff_ms\":%lu,"
         "\"cap\":%d},"
-        "%s,%s}",
+        "%s,%s,%s}",
         settings_security_label(),
         n->mode == NETW_MODE_STA ? "STA" :
         n->mode == NETW_MODE_AP ? "AP" : "DOWN",
@@ -267,8 +274,15 @@ static void op_get_status(uint32_t rid, cJSON *args)
         t->transfer_allowed ? "true" : "false",
         (unsigned long)sched_active_8h(),
         (unsigned long)sched_backoff_ms(), SCHED_ACTIVE_CAP_8H,
-        pn > 0 ? phj : "\"phase\":null", dj);
-    send_ok(rid, OP_GET_STATUS, inner);
+        pn > 0 ? phj : "\"phase\":null",
+        tn > 0 ? tj : "\"http\":null",
+        dn > 0 && dn < (int)sizeof(dj) ? dj : "\"loop\":null");
+    if (sn < 0 || sn >= 2600) {
+        send_error(rid, OP_GET_STATUS, EC_RESOURCE_LIMIT);
+    } else {
+        send_ok(rid, OP_GET_STATUS, inner);
+    }
+    free(inner); free(phj); free(tj);
 }
 
 /* ---------------- GET_CATALOG_STATUS ---------------- */
@@ -970,59 +984,60 @@ static void op_get_drift(uint32_t rid, cJSON *args)
         cJSON *p = cJSON_GetObjectItem(args, "include_provisional");
         best_req = cJSON_IsTrue(b) || cJSON_IsTrue(p);
     }
-    char *buf = malloc(4096);
+    const size_t dcap = 8192;
+    char *buf = malloc(dcap);
     if (!buf) {
         send_error(rid, OP_GET_DRIFT, EC_RESOURCE_LIMIT);
         return;
     }
     /* Checked serializer: every append is bounded, a truncated field
      * pins o at the cap, and an overlong payload is an explicit error
-     * rather than a clipped document (update3 §11).                */
+     * rather than a clipped document (update3 §11/update4 §7).      */
     size_t o = 0;
 #define DAPP(...)                                                     \
     do {                                                              \
-        if (o < 4096) {                                               \
-            int w_ = snprintf(buf + o, 4096 - o, __VA_ARGS__);        \
-            if (w_ >= 0 && (size_t)w_ < 4096 - o) o += (size_t)w_;    \
-            else o = 4096;                                            \
+        if (o < dcap) {                                               \
+            int w_ = snprintf(buf + o, dcap - o, __VA_ARGS__);        \
+            if (w_ >= 0 && (size_t)w_ < dcap - o) o += (size_t)w_;    \
+            else o = dcap;                                            \
         }                                                             \
     } while (0)
 #define DJSON(fn, arg)                                                \
     do {                                                              \
-        int jn_ = fn((arg), buf + (o < 4096 ? o : 4095),              \
-                     4096 - (o < 4096 ? o : 4095));                   \
-        if (jn_ < 0 || o + (size_t)jn_ >= 4096) o = 4096;             \
+        int jn_ = fn((arg), buf + (o < dcap ? o : dcap - 1),          \
+                     dcap - (o < dcap ? o : dcap - 1));               \
+        if (jn_ < 0 || o + (size_t)jn_ >= dcap) o = dcap;             \
         else o += (size_t)jn_;                                        \
     } while (0)
-    DAPP("{\"schema\":3,\"estimate\":");
+    DAPP("{\"schema\":4,\"estimate\":");
     drift_record_t rec;
-    if (o < 4096 && drift_pub_get(&rec)) {
+    if (o < dcap && drift_pub_get(&rec)) {
         DJSON(drift_estimate_json, &rec);
     } else {
         DAPP("null");
     }
     DAPP(",\"source_of_truth\":");
     drift_sot_t sot;
-    if (o < 4096 && drift_sot_view(&sot)) {
+    if (o < dcap && drift_sot_view(&sot)) {
         DJSON(drift_sot_json, &sot);
     } else {
         DAPP("null");
     }
     DAPP(",\"qualified_source_of_truth\":");
-    if (o < 4096 && drift_sot_slot_view(DRIFT_SOT_QUALIFIED, &sot)) {
+    if (o < dcap && drift_sot_slot_view(DRIFT_SOT_QUALIFIED, &sot)) {
         DJSON(drift_sot_json, &sot);
     } else {
         DAPP("null");
     }
     DAPP(",\"provisional_source_of_truth\":");
-    if (o < 4096 && drift_sot_slot_view(DRIFT_SOT_PROVISIONAL, &sot)) {
+    if (o < dcap && drift_sot_slot_view(DRIFT_SOT_PROVISIONAL, &sot)) {
         DJSON(drift_sot_json, &sot);
     } else {
         DAPP("null");
     }
     DAPP(",\"best_available_opt_in_required\":true,"
          "\"best_available_offset\":");
-    bool have_best = o < 4096 && best_req && drift_sot_best(&sot);
+    bool have_best = o < dcap && best_req && drift_sot_best(&sot);
     if (have_best) {
         DJSON(drift_sot_json, &sot);
     } else {
@@ -1032,12 +1047,12 @@ static void op_get_drift(uint32_t rid, cJSON *args)
          !best_req ? "client_opt_in_required" :
          have_best ? "selected_by_quality_then_width" :
                      "no_persisted_record");
-    if (o >= 4095) {
+    if (o >= dcap - 1) {
         send_error(rid, OP_GET_DRIFT, EC_RESOURCE_LIMIT);
         free(buf);
         return;
     }
-    snprintf(buf + o, 4096 - o, "}");
+    snprintf(buf + o, dcap - o, "}");
     send_ok(rid, OP_GET_DRIFT, buf);
     free(buf);
 #undef DAPP

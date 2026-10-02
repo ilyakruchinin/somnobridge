@@ -21,7 +21,7 @@ static const char *TAG = "drift";
 
 static void drift_jrn(const char *kind, const char *fmt, ...)
 {
-    char body[192];
+    char body[384];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(body, sizeof(body), fmt, ap);
@@ -50,6 +50,12 @@ static void sot_anchor_ready(void);
 static void sot_mark_stale(bool filename_only);
 static uint64_t assumption_mask(const drift_session_t *s,
                                 const drift_profile_t *p);
+static int64_t us_floor_ms(int64_t us);
+static int64_t us_ceil_ms(int64_t us);
+static bool event_window(const drift_session_t *s,
+                         const drift_profile_t *p,
+                         const drift_ev_t *e,
+                         int64_t *wlo_us, int64_t *whi_us);
 
 void drift_reset(void)
 {
@@ -228,40 +234,105 @@ void drift_test_anchor(int64_t mono_us, int64_t utc_us,
 
 static bool s_prof_initialized;
 static drift_profile_t s_prof = {
-    /* Conservative comparison model: provisional intervals keep the
-     * broad cache/visibility priors until source-specific evidence
-     * qualifies a tighter revision. Filename origin/cycle bounds stay
-     * unresolved by default; no zero-D assumption is installed.       */
+    /* Update4 scoped operating model for AS11 + EZShare: the observed
+     * listing has not shown a cache layer, so no additional cache term
+     * is carried. HTTP request time is not an extra residual bound — it
+     * is already represented by actual request-start/response-end
+     * endpoints. Zero timestamp→visibility delay remains an explicit,
+     * unvalidated assumption and therefore cannot qualify the stamp
+     * channel by itself.                                               */
     .stamp_channel_validated = false,
-    .phase_track_enabled     = true,
-    .phase_refine_enabled    = true,
-    .cache_bound_us          = 2000000,
+    .cache_policy            = DRIFT_CACHE_ASSUMED_ZERO,
+    .visibility_policy       = DRIFT_VIS_ASSUMED_IMMEDIATE,
+    .cache_bound_us          = 0,
     .jitter_us               = 0,
     .latency_lo_us           = 0,
-    .latency_hi_us           = 2000000,
+    .latency_hi_us           = 0,
     .dev_rate_ppm            = 500,
     .accurate_half_us        = 2000000,
     .provisional_half_us     = 5000000,
     .cadence_step_us         = 90000000,
-    .model_rev               = 1,
+    /* AS11 + EZShare bounds measured 2026-10-02 (masked session, 18 flush
+     * cycles, capture evidence somnopal-validation-lt_hjhvx):
+     * create: filename instant -> listing appearance measured -0.5..+5.8 s
+     *         (incl. poll window + visibility latency); bound [-3,+10] s.
+     * periodic: stamp - (filename + k*60 s) residual measured -1 s
+     *           (BRP/SA2) and -3 s (PLD); bound [-5,+1] s covers both.
+     * filename seconds encoding not separable from this data -> UNKNOWN.
+     * *_validated stay false: bounds are honest but wide; nothing reaches
+     * the 2 s qualified gate until dense-poll latency characterization. */
+    .model_rev               = 3,
     .filename_encoding       = DRIFT_ENC_UNKNOWN,
-    .filename_origin_bounded = false,
-    .fname_create_lo_us      = 0,
-    .fname_create_hi_us      = 0,
-    .filename_periodic_bounded = false,
-    .fname_period_lo_us      = 0,
-    .fname_period_hi_us      = 0,
+    .filename_origin_bounded = true,
+    .fname_create_lo_us      = -3000000,
+    .fname_create_hi_us      = 10000000,
+    .filename_periodic_bounded = true,
+    .fname_period_lo_us      = -5000000,
+    .fname_period_hi_us      = 1000000,
     .filename_create_validated = false,
     .filename_periodic_validated = false,
 };
 
 const drift_profile_t *drift_profile(void) { return &s_prof; }
 
+static void profile_normalize(drift_profile_t *p)
+{
+    /* Keep the semantic flags truthful even for test-constructed
+     * profiles: a zero bound without a characterized provenance is an
+     * assumption, while a nonzero bound is not "immediate".           */
+    if (!p->cache_bound_us &&
+        p->cache_policy != DRIFT_CACHE_CHARACTERIZED) {
+        p->cache_policy = DRIFT_CACHE_ASSUMED_ZERO;
+    } else if (p->cache_bound_us &&
+               p->cache_policy == DRIFT_CACHE_ASSUMED_ZERO) {
+        p->cache_policy = DRIFT_CACHE_BOUNDED;
+    }
+    if (!p->latency_lo_us && !p->latency_hi_us &&
+        p->visibility_policy != DRIFT_VIS_CHARACTERIZED) {
+        p->visibility_policy = DRIFT_VIS_ASSUMED_IMMEDIATE;
+    } else if ((p->latency_lo_us || p->latency_hi_us) &&
+               p->visibility_policy == DRIFT_VIS_ASSUMED_IMMEDIATE) {
+        p->visibility_policy = DRIFT_VIS_BOUNDED;
+    }
+}
+
+/* A persisted SOT is valid only for the model that produced it. The
+ * revision is the intended version knob; comparing the semantic fields
+ * too keeps a same-revision test/debug profile from silently changing
+ * the meaning of an already-vouched interval.                        */
+static bool profile_same_model(const drift_profile_t *a,
+                               const drift_profile_t *b)
+{
+    return a->model_rev == b->model_rev &&
+           a->cache_policy == b->cache_policy &&
+           a->visibility_policy == b->visibility_policy &&
+           a->cache_bound_us == b->cache_bound_us &&
+           a->jitter_us == b->jitter_us &&
+           a->latency_lo_us == b->latency_lo_us &&
+           a->latency_hi_us == b->latency_hi_us &&
+           a->dev_rate_ppm == b->dev_rate_ppm &&
+           a->accurate_half_us == b->accurate_half_us &&
+           a->provisional_half_us == b->provisional_half_us &&
+           a->cadence_step_us == b->cadence_step_us &&
+           a->stamp_channel_validated == b->stamp_channel_validated &&
+           a->filename_encoding == b->filename_encoding &&
+           a->filename_origin_bounded == b->filename_origin_bounded &&
+           a->fname_create_lo_us == b->fname_create_lo_us &&
+           a->fname_create_hi_us == b->fname_create_hi_us &&
+           a->filename_periodic_bounded == b->filename_periodic_bounded &&
+           a->fname_period_lo_us == b->fname_period_lo_us &&
+           a->fname_period_hi_us == b->fname_period_hi_us &&
+           a->filename_create_validated == b->filename_create_validated &&
+           a->filename_periodic_validated == b->filename_periodic_validated;
+}
+
 void drift_profile_set(const drift_profile_t *p)
 {
-    bool model_change = s_prof_initialized && p &&
-                        p->model_rev != s_prof.model_rev;
-    if (p) s_prof = *p;
+    drift_profile_t next = p ? *p : s_prof;
+    profile_normalize(&next);
+    bool model_change = s_prof_initialized &&
+                        !profile_same_model(&s_prof, &next);
+    s_prof = next;
     s_prof_initialized = true;
     if (model_change) {
         sot_mark_stale(false);
@@ -521,6 +592,7 @@ void drift_live_begin(const char *day)
 {
     const drift_profile_t *p = drift_profile();
     drift_sess_begin(&s_live_sess, p->cache_bound_us, p->jitter_us);
+    s_live_sess.use_profile_bounds = true;
     s_closed = false;
     memset(s_live_sess.day, 0, sizeof(s_live_sess.day));
     if (day) {
@@ -657,6 +729,81 @@ static void note_cadence(drift_session_t *s, int64_t ddev_s)
     }
 }
 
+static const char *obs_kind_name(uint8_t kind)
+{
+    return kind == DRIFT_EV_CREATE ? "create" :
+           kind == DRIFT_EV_TRANSITION ? "transition" : "unknown";
+}
+
+/* Retain the raw ESP-side observation that produced an estimator event.
+ * `ev_index` points at the interval event, or -1 when the bounded event
+ * array is already full; the diagnostic still records the transition so
+ * long sessions retain recent evidence.                               */
+static void obs_note(drift_session_t *s, drift_ev_kind_t kind,
+                     int64_t stamp_s,
+                     int64_t unch_req_us, int64_t unch_resp_us,
+                     uint32_t unch_seq,
+                     int64_t chg_req_us, int64_t chg_resp_us,
+                     uint32_t chg_seq)
+{
+    drift_obs_diag_t o = {
+        .seq = ++s->obs_seq,
+        .unch_seq = unch_seq,
+        .chg_seq = chg_seq,
+        .ev_index = s->n_ev < DRIFT_EV_CAP ? s->n_ev : -1,
+        .kind = (uint8_t)kind,
+        .stamp_s = stamp_s,
+        .unch_req_us = unch_req_us,
+        .unch_resp_us = unch_resp_us,
+        .chg_req_us = chg_req_us,
+        .chg_resp_us = chg_resp_us,
+    };
+    s->obs_diag[s->obs_diag_next] = o;
+    s->obs_diag_next = (uint8_t)((s->obs_diag_next + 1) %
+                                 DRIFT_OBS_DIAG_CAP);
+    if (s->n_obs_diag < DRIFT_OBS_DIAG_CAP) s->n_obs_diag++;
+
+    int64_t alo, ahi, blo, bhi;
+    bool mapped = drift_map_utc(unch_req_us, &alo, &ahi) &&
+                  drift_map_utc(chg_resp_us, &blo, &bhi);
+    if (mapped) {
+        drift_jrn("timing_obs",
+                  "\"seq\":%lu,\"day\":\"%.8s\",\"beacon\":\"%.40s\","
+                  "\"kind\":\"%s\",\"ev\":%ld,"
+                  "\"scans\":[%lu,%lu],\"stamp_s\":%lld,"
+                  "\"obs_us\":[%lld,%lld],"
+                  "\"unchanged_service_us\":%lld,"
+                  "\"changed_service_us\":%lld,"
+                  "\"utc_ms\":[%lld,%lld]",
+                  (unsigned long)o.seq, s->day, s->beacon,
+                  obs_kind_name(kind), (long)o.ev_index,
+                  (unsigned long)unch_seq, (unsigned long)chg_seq,
+                  (long long)stamp_s,
+                  (long long)unch_req_us, (long long)chg_resp_us,
+                  (long long)(unch_resp_us > unch_req_us
+                              ? unch_resp_us - unch_req_us : 0),
+                  (long long)(chg_resp_us - chg_req_us),
+                  (long long)us_floor_ms(alo),
+                  (long long)us_ceil_ms(bhi));
+    } else {
+        drift_jrn("timing_obs",
+                  "\"seq\":%lu,\"day\":\"%.8s\",\"beacon\":\"%.40s\","
+                  "\"kind\":\"%s\",\"ev\":%ld,"
+                  "\"scans\":[%lu,%lu],\"stamp_s\":%lld,"
+                  "\"obs_us\":[%lld,%lld],"
+                  "\"unchanged_service_us\":%lld,"
+                  "\"changed_service_us\":%lld,\"utc_ms\":null",
+                  (unsigned long)o.seq, s->day, s->beacon,
+                  obs_kind_name(kind), (long)o.ev_index,
+                  (unsigned long)unch_seq, (unsigned long)chg_seq,
+                  (long long)stamp_s,
+                  (long long)unch_req_us, (long long)chg_resp_us,
+                  (long long)(unch_resp_us > unch_req_us
+                              ? unch_resp_us - unch_req_us : 0),
+                  (long long)(chg_resp_us - chg_req_us));
+    }
+}
+
 static void push_ev(drift_session_t *s, drift_ev_kind_t kind,
                     int64_t stamp_s, int64_t obs_lo, int64_t obs_hi)
 {
@@ -679,9 +826,14 @@ int drift_feed_scan(drift_session_t *s, const char *day,
     if (!s || !day || strcmp(day, s->day)) {
         return 0;
     }
+    uint32_t scan_seq = ++s->scan_seq;
     int64_t prev = s->prev_scan_us;
+    int64_t prev_resp = s->prev_resp_us;
+    uint32_t prev_seq = s->prev_scan_seq;
     if (!prev && diff && diff->prev_scan_us) {
         prev = diff->prev_scan_us;   /* resident listing pre-open bound */
+        prev_resp = 0;               /* catalog kept no response edge   */
+        prev_seq = 0;
     }
     int before = s->n_ev;
     if (diff && diff->overflowed) {
@@ -719,6 +871,9 @@ int drift_feed_scan(drift_session_t *s, const char *day,
                 if (e->new_stamp_ok &&
                     drift_stamp_parse(e->new_stamp, &m_new)) {
                     if (prev) {
+                        obs_note(s, DRIFT_EV_CREATE, m_new,
+                                 prev, prev_resp, prev_seq,
+                                 req_start_us, resp_end_us, scan_seq);
                         push_ev(s, DRIFT_EV_CREATE, m_new,
                                 prev, resp_end_us);
                     } else {
@@ -743,6 +898,9 @@ int drift_feed_scan(drift_session_t *s, const char *day,
                 }
                 note_cadence(s, m_new - m_old);
                 if (prev) {
+                    obs_note(s, DRIFT_EV_TRANSITION, m_new,
+                             prev, prev_resp, prev_seq,
+                             req_start_us, resp_end_us, scan_seq);
                     push_ev(s, DRIFT_EV_TRANSITION, m_new,
                             prev, resp_end_us);
                 } else {
@@ -766,6 +924,9 @@ int drift_feed_scan(drift_session_t *s, const char *day,
             int64_t d = s->stamp_ok ? ms - s->stamp_s : 0;
             note_cadence(s, d);
             if (prev) {
+                obs_note(s, DRIFT_EV_TRANSITION, ms,
+                         prev, prev_resp, prev_seq,
+                         req_start_us, resp_end_us, scan_seq);
                 push_ev(s, DRIFT_EV_TRANSITION, ms,
                         prev, resp_end_us);
             } else {
@@ -779,6 +940,8 @@ int drift_feed_scan(drift_session_t *s, const char *day,
         set_tuple(s, cur->size, cur->has_timestamp, cur->timestamp_raw);
     }
     s->prev_scan_us = req_start_us;
+    s->prev_resp_us = resp_end_us;
+    s->prev_scan_seq = scan_seq;
     if (!prev) {
         s->baseline_bounded = false;
     }
@@ -848,12 +1011,21 @@ static void publish(const drift_session_t *s, int64_t now_us)
                              sizeof(r.session_start_as10));
     }
 
+    const drift_profile_t *p = drift_profile();
     r.source = s->preferred_source;
     r.quality = s->tier == ACC_ACCURATE ? DRIFT_Q_QUALIFIED :
                 s->est_bound_valid ? DRIFT_Q_PROVISIONAL : DRIFT_Q_NONE;
-    snprintf(r.model_id, sizeof(r.model_id), "u3_profile_%u",
-             (unsigned)drift_profile()->model_rev);
-    r.assumptions = assumption_mask(s, drift_profile());
+    snprintf(r.model_id, sizeof(r.model_id), "u4_profile_%u",
+             (unsigned)p->model_rev);
+    r.model_rev = p->model_rev;
+    r.cache_policy = p->cache_policy;
+    r.visibility_policy = p->visibility_policy;
+    r.cache_bound_us = p->cache_bound_us;
+    r.visibility_lo_us = p->latency_lo_us;
+    r.visibility_hi_us = p->latency_hi_us;
+    r.jitter_us = p->jitter_us;
+    r.dev_rate_ppm = p->dev_rate_ppm;
+    r.assumptions = assumption_mask(s, p);
     strncpy(r.source_reason, s->source_reason, sizeof(r.source_reason) - 1);
     if (s->est_bound_valid) {
         r.has_drift = true;
@@ -935,6 +1107,49 @@ static void publish(const drift_session_t *s, int64_t now_us)
         }
     }
 
+    /* Recent transition evidence, oldest→newest. The raw monotonic
+     * endpoints stay auditable; mapped UTC and per-event offset bounds
+     * are recomputed under the active model, never persisted as stale
+     * interpretation.                                                   */
+    int take = s->n_obs_diag < DRIFT_OBS_PUB_MAX
+               ? s->n_obs_diag : DRIFT_OBS_PUB_MAX;
+    int start = (s->obs_diag_next + DRIFT_OBS_DIAG_CAP - take) %
+                DRIFT_OBS_DIAG_CAP;
+    for (int i = 0; i < take; i++) {
+        const drift_obs_diag_t *d =
+            &s->obs_diag[(start + i) % DRIFT_OBS_DIAG_CAP];
+        drift_obs_pub_t *o = &r.observations[r.n_observations++];
+        *o = (drift_obs_pub_t){
+            .seq = d->seq,
+            .unch_seq = d->unch_seq,
+            .chg_seq = d->chg_seq,
+            .ev_index = d->ev_index,
+            .kind = d->kind,
+            .stamp_s = d->stamp_s,
+            .unch_req_us = d->unch_req_us,
+            .unch_resp_us = d->unch_resp_us,
+            .chg_req_us = d->chg_req_us,
+            .chg_resp_us = d->chg_resp_us,
+        };
+        drift_ev_t e = {
+            .obs_lo_us = d->unch_req_us,
+            .obs_hi_us = d->chg_resp_us,
+            .stamp_s = d->stamp_s,
+            .kind = d->kind,
+        };
+        int64_t wlo, whi;
+        int64_t alo, ahi, blo, bhi;
+        if (event_window(s, p, &e, &wlo, &whi) &&
+            drift_map_utc(d->unch_req_us, &alo, &ahi) &&
+            drift_map_utc(d->chg_resp_us, &blo, &bhi)) {
+            o->mapped = true;
+            o->utc_lo_ms = us_floor_ms(alo);
+            o->utc_hi_ms = us_ceil_ms(bhi);
+            o->offset_lo_ms = us_floor_ms(wlo - (d->stamp_s + 2) * 1000000LL);
+            o->offset_hi_ms = us_ceil_ms(whi - d->stamp_s * 1000000LL);
+        }
+    }
+
     /* state */
     if (!s->n_ev) {
         r.state = EST_PENDING;
@@ -997,6 +1212,24 @@ const char *drift_quality_name(uint8_t quality)
     case DRIFT_Q_PROVISIONAL: return "provisional";
     case DRIFT_Q_QUALIFIED: return "qualified";
     default: return "none";
+    }
+}
+
+static const char *cache_policy_name(uint8_t policy)
+{
+    switch (policy) {
+    case DRIFT_CACHE_ASSUMED_ZERO: return "assumed_zero";
+    case DRIFT_CACHE_CHARACTERIZED: return "characterized";
+    default: return "bounded_prior";
+    }
+}
+
+static const char *visibility_policy_name(uint8_t policy)
+{
+    switch (policy) {
+    case DRIFT_VIS_ASSUMED_IMMEDIATE: return "assumed_immediate";
+    case DRIFT_VIS_CHARACTERIZED: return "characterized";
+    default: return "bounded_prior";
     }
 }
 
@@ -1110,8 +1343,10 @@ static void sot_fill(drift_sot_t *r, const drift_session_t *s,
     r->ref_mono_us = s->ref_mono_us;
     r->observations = s->n_windows;
     r->model_rev = p->model_rev;
-    snprintf(r->model_id, sizeof(r->model_id), "u3_profile_%u",
+    snprintf(r->model_id, sizeof(r->model_id), "u4_profile_%u",
              (unsigned)p->model_rev);
+    r->cache_policy = p->cache_policy;
+    r->visibility_policy = p->visibility_policy;
     r->quality = quality;
     r->source = s->preferred_source;
     r->filename_encoding = p->filename_encoding;
@@ -1261,9 +1496,10 @@ void drift_card_fw_note(const char *fw)
 }
 
 /* True instant when a write became list-visible, derived from the raw
- * observation bounds and the active timing profile. The card cache is
- * a one-sided staleness extension of the unchanged edge; visibility
- * delay is a separate model term.                                 */
+ * observation bounds and the active timing profile. The measured HTTP
+ * service interval is already inside [unchanged request start, changed
+ * response end]; only an explicit residual cache/visibility model may
+ * widen that interval.                                                */
 static bool event_window(const drift_session_t *s,
                          const drift_profile_t *p,
                          const drift_ev_t *e,
@@ -1275,10 +1511,12 @@ static bool event_window(const drift_session_t *s,
         return false;
     }
     (void)ahi; (void)blo;
-    *w_lo = alo - (int64_t)s->cache_bound_us
-          - (int64_t)p->latency_hi_us - (int64_t)s->jitter_us;
-    *w_hi = bhi - (int64_t)p->latency_lo_us
-          + (int64_t)s->jitter_us;
+    int64_t cache = s->use_profile_bounds ? p->cache_bound_us
+                                         : s->cache_bound_us;
+    int64_t jitter = s->use_profile_bounds ? p->jitter_us
+                                           : s->jitter_us;
+    *w_lo = alo - cache - (int64_t)p->latency_hi_us - jitter;
+    *w_hi = bhi - (int64_t)p->latency_lo_us + jitter;
     return true;
 }
 
@@ -1614,6 +1852,8 @@ static bool sot_record_sane(const sot_v2_blob_t *b,
            b->encoding <= DRIFT_ENC_ROUNDED &&
            b->lo_ms <= b->hi_ms && b->half_ms >= 0 &&
            b->ref_ms != 0 && b->comp_ms != 0 &&
+           b->rsv1[0] <= DRIFT_CACHE_CHARACTERIZED &&
+           b->rsv1[1] <= DRIFT_VIS_CHARACTERIZED &&
            b->cache_us <= 10000000 && b->latency_lo_us >= 0 &&
            b->latency_hi_us >= b->latency_lo_us &&
            b->jitter_us <= 10000000 && b->rate_ppm <= 10000 &&
@@ -1647,7 +1887,9 @@ static void sot_from_blob(drift_sot_slot_t slot, const sot_v2_blob_t *b)
     r->fname_lo_us = b->fname_lo_us;
     r->fname_hi_us = b->fname_hi_us;
     r->model_rev = b->model_rev;
-    snprintf(r->model_id, sizeof(r->model_id), "u3_profile_%u",
+    r->cache_policy = b->rsv1[0];
+    r->visibility_policy = b->rsv1[1];
+    snprintf(r->model_id, sizeof(r->model_id), "u4_profile_%u",
              (unsigned)b->model_rev);
     r->persisted_seq = b->seq;
     r->origin = DRIFT_SOT_NVS;
@@ -1657,6 +1899,25 @@ static void sot_from_blob(drift_sot_slot_t slot, const sot_v2_blob_t *b)
     r->card_fw[sizeof(r->card_fw) - 1] = '\0';
     s_sot_persist_seq[slot] = b->seq;
     s_sot_committed_half[slot] = b->half_ms;
+}
+
+static bool sot_model_matches(const sot_v2_blob_t *b,
+                              const drift_profile_t *p)
+{
+    int64_t flo = b->source == DRIFT_SRC_FNAME_PERIODIC
+                ? p->fname_period_lo_us : p->fname_create_lo_us;
+    int64_t fhi = b->source == DRIFT_SRC_FNAME_PERIODIC
+                ? p->fname_period_hi_us : p->fname_create_hi_us;
+    return b->model_rev == p->model_rev &&
+           b->rsv1[0] == p->cache_policy &&
+           b->rsv1[1] == p->visibility_policy &&
+           b->cache_us == p->cache_bound_us &&
+           b->latency_lo_us == (int32_t)p->latency_lo_us &&
+           b->latency_hi_us == (int32_t)p->latency_hi_us &&
+           b->jitter_us == p->jitter_us &&
+           b->rate_ppm == p->dev_rate_ppm &&
+           b->encoding == p->filename_encoding &&
+           b->fname_lo_us == flo && b->fname_hi_us == fhi;
 }
 
 static esp_err_t sot_load_slot(nvs_handle_t h, drift_sot_slot_t slot)
@@ -1673,6 +1934,22 @@ static esp_err_t sot_load_slot(nvs_handle_t h, drift_sot_slot_t slot)
     }
     sot_from_blob(slot, &b);
     s_sot_dirty[slot] = false;
+    const drift_profile_t *p = drift_profile();
+    bool incompatible = !sot_model_matches(&b, p);
+    if (incompatible) {
+        /* Model semantics are part of the persisted bound's identity:
+         * a record produced by another cache/visibility model may be
+         * inspected, but must never be applied as current truth.      */
+        s_sot[slot].stale = true;
+        s_sot[slot].applicable = false;
+        s_sot[slot].dirty = true;
+        s_sot_dirty[slot] = true;
+        drift_jrn("sot", "\"e\":\"model_incompatible\",\"q\":\"%s\","
+                         "\"blob_rev\":%lu,\"active_rev\":%lu",
+                  drift_quality_name(b.quality),
+                  (unsigned long)b.model_rev,
+                  (unsigned long)p->model_rev);
+    }
     drift_jrn("sot", "\"e\":\"restore\",\"q\":\"%s\",\"seq\":%lu",
               drift_quality_name(b.quality), (unsigned long)b.seq);
     return ESP_OK;
@@ -1706,7 +1983,12 @@ static esp_err_t sot_load_legacy(nvs_handle_t h)
     r->source = DRIFT_SRC_MTIME;
     r->dev_rate_ppm = s_prof.dev_rate_ppm;
     r->observations = 2;
+    r->model_rev = 0;
+    r->cache_policy = DRIFT_CACHE_BOUNDED;
+    r->visibility_policy = DRIFT_VIS_BOUNDED;
     r->assumptions = DRIFT_A_LEGACY_MODEL;
+    r->stale = true;               /* unknown model is not applicable  */
+    r->applicable = false;
     strncpy(r->model_id, "legacy_v1", sizeof(r->model_id) - 1);
     strncpy(r->source_reason, "legacy_v1_migration",
             sizeof(r->source_reason) - 1);
@@ -1756,6 +2038,8 @@ static esp_err_t sot_commit_slot(nvs_handle_t h, drift_sot_slot_t slot,
     b.source = r->source;
     b.encoding = r->filename_encoding;
     b.stale = r->stale;
+    b.rsv1[0] = r->cache_policy;
+    b.rsv1[1] = r->visibility_policy;
     b.seq = s_sot_persist_seq[slot] + 1;
     b.model_rev = r->model_rev;
     b.assumptions = r->assumptions;
@@ -1956,8 +2240,69 @@ int drift_estimate_json(const drift_record_t *r, char *buf, size_t cap)
     JAPP(buf, cap, o,
         "\"sigma_start_ms\":null,\"sigma_drift_ms\":null,"
         "\"systematic_components\":[\"stamp_quantization\","
-        "\"poll_visibility\",\"latency_prior\",\"cache_bound\","
-        "\"anchor_uncertainty\"],");
+        "\"request_bracket\",\"visibility_delay_model\","
+        "\"cache_policy\",\"anchor_uncertainty\"],"
+        "\"timing_model\":{\"model_rev\":%u,"
+        "\"cache_policy\":\"%s\",\"cache_bound_us\":%lu,"
+        "\"visibility_policy\":\"%s\","
+        "\"visibility_delay_us\":[%ld,%ld],"
+        "\"jitter_us\":%lu,\"dev_rate_ppm\":%lu,"
+        "\"request_interval\":\"esp_measured\","
+        "\"http_rtt_compensation\":\"none\"},",
+        (unsigned)r->model_rev,
+        cache_policy_name(r->cache_policy),
+        (unsigned long)r->cache_bound_us,
+        visibility_policy_name(r->visibility_policy),
+        (long)r->visibility_lo_us, (long)r->visibility_hi_us,
+        (unsigned long)r->jitter_us,
+        (unsigned long)r->dev_rate_ppm);
+    JAPP(buf, cap, o, "\"recent_observations\":[");
+    for (int i = 0; i < r->n_observations; i++) {
+        const drift_obs_pub_t *ob = &r->observations[i];
+        JAPP(buf, cap, o,
+            "%s{\"seq\":%lu,\"kind\":\"%s\",\"ev\":%ld,"
+            "\"scans\":[%lu,%lu],\"stamp_s\":%lld,"
+            "\"unchanged_req_us\":%lld,\"unchanged_resp_us\":",
+            i ? "," : "", (unsigned long)ob->seq,
+            obs_kind_name(ob->kind), (long)ob->ev_index,
+            (unsigned long)ob->unch_seq,
+            (unsigned long)ob->chg_seq,
+            (long long)ob->stamp_s,
+            (long long)ob->unch_req_us);
+        if (ob->unch_resp_us) {
+            JAPP(buf, cap, o, "%lld", (long long)ob->unch_resp_us);
+        } else {
+            JAPP(buf, cap, o, "null");
+        }
+        JAPP(buf, cap, o,
+            ",\"changed_req_us\":%lld,\"changed_resp_us\":%lld,"
+            "\"unchanged_service_us\":",
+            (long long)ob->chg_req_us, (long long)ob->chg_resp_us);
+        if (ob->unch_resp_us) {
+            JAPP(buf, cap, o, "%lld",
+                 (long long)(ob->unch_resp_us - ob->unch_req_us));
+        } else {
+            JAPP(buf, cap, o, "null");
+        }
+        JAPP(buf, cap, o,
+            ",\"changed_service_us\":%lld,\"bracket_us\":%lld,",
+            (long long)(ob->chg_resp_us - ob->chg_req_us),
+            (long long)(ob->chg_resp_us - ob->unch_req_us));
+        if (ob->mapped) {
+            JAPP(buf, cap, o,
+                "\"visibility_utc_ms\":[%lld,%lld],"
+                "\"offset_interval_ms\":[%lld,%lld]}",
+                (long long)ob->utc_lo_ms, (long long)ob->utc_hi_ms,
+                (long long)ob->offset_lo_ms,
+                (long long)ob->offset_hi_ms);
+        } else {
+            JAPP(buf, cap, o,
+                "\"visibility_utc_ms\":null,"
+                "\"offset_interval_ms\":null}");
+        }
+        if (o >= cap) return -1;
+    }
+    JAPP(buf, cap, o, "],");
     emit_ll_or_null(buf, cap, &o, "flush_period_ms",
                     r->has_period, r->flush_period_ms);
     emit_iv_or_null(buf, cap, &o, "flush_period_interval_ms",
@@ -2001,6 +2346,8 @@ int drift_sot_json(const drift_sot_t *s, char *buf, size_t cap)
         "\"applicable\":%s,\"freshness_unknown\":%s,\"stale\":%s,"
         "\"current_half_ms\":%lld,\"observations\":%u,"
         "\"assumptions\":%llu,\"model_rev\":%lu,\"model_id\":\"%s\","
+        "\"cache_policy\":\"%s\",\"visibility_policy\":\"%s\","
+        "\"cache_us\":%lu,\"visibility_delay_us\":[%ld,%ld],"
         "\"dirty\":%s,\"last_error\":%d,\"source_reason\":\"%s\","
         "\"filename_encoding\":%u,",
         (long long)s->clock_drift_ms, (long long)s->lo_ms,
@@ -2016,6 +2363,10 @@ int drift_sot_json(const drift_sot_t *s, char *buf, size_t cap)
         (long long)s->current_half_ms, (unsigned)s->observations,
         (unsigned long long)s->assumptions,
         (unsigned long)s->model_rev, s->model_id,
+        cache_policy_name(s->cache_policy),
+        visibility_policy_name(s->visibility_policy),
+        (unsigned long)s->cache_bound_us,
+        (long)s->latency_lo_us, (long)s->latency_hi_us,
         s->dirty ? "true" : "false", (int)s->last_error,
         s->source_reason,
         (unsigned)s->filename_encoding);

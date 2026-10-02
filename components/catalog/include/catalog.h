@@ -129,8 +129,9 @@ esp_err_t cat_feed_parent(const ezs_entry_t *entries, int n,
  * per-file events carry old/new (size, timestamp_raw) tuples for the
  * timestamp-first estimator (U3/U4). Events are emitted only across a
  * RESIDENT->RESIDENT transition — a first-ever listing is a baseline,
- * not evidence of writes. `prev_scan_us` is the previous feed's scan
- * time (the estimator's "previous unchanged observation" bound).   */
+ * not evidence of writes. `prev_scan_us` is the previous feed's
+ * request-start monotonic timestamp (the estimator's previous
+ * unchanged-observation bound).                                      */
 esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
                        const ezs_entry_t *entries, int n,
                        int64_t now_us, cat_diff_t *diff);

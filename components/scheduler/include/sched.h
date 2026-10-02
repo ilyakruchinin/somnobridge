@@ -111,6 +111,11 @@ uint32_t sched_backoff_ms(void);       /* current HTTP backoff       */
  * clock-offset accuracy. Returns bytes written, 0 on truncation.   */
 int      sched_phase_json(char *buf, size_t cap);
 
+/* ESP-side EZShare listing timing for GET_STATUS (update4): emits
+ * {"http":{...}} with actual request/response monotonic timestamps and
+ * bounded service-time statistics for this card association.         */
+int      sched_timing_json(char *buf, size_t cap);
+
 /* DIAG: loop liveness/stage for the silent-stall investigation —
  * emits {"loop":{"iters":N,"stage":S,...}}                            */
 int      sched_diag_json(char *buf, size_t cap);

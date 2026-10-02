@@ -80,6 +80,27 @@ static uint32_t s_ph_miss_logged;       /* last journaled miss count  */
 static int64_t  s_svc_us[SVC_WINDOW];   /* day-listing service times  */
 static int      s_svc_n;
 
+/* Bounded listing-timing summary for diagnostics: actual ESP request
+ * endpoints, aggregate service duration, and failures within the
+ * current card-link association.                                       */
+typedef struct {
+    uint32_t n_ok;
+    uint32_t n_fail;
+    int64_t  min_us;
+    int64_t  max_us;
+    int64_t  last_req_us;
+    int64_t  last_resp_us;
+    int64_t  last_service_us;
+    int64_t  service_us[SVC_WINDOW];
+    int      service_n;
+    uint8_t  last_kind;
+    bool     last_ok;
+} listing_timing_t;
+
+static listing_timing_t s_listing;
+static int64_t svc_median_us(void);
+static int64_t listing_median_us(void);
+
 static const uint32_t s_backoff_ms_ladder[] =
     {2000, 4000, 8000, 16000, 30000, 60000};
 
@@ -200,22 +221,28 @@ int sched_phase_json(char *buf, size_t cap)
     }
     int n = snprintf(buf, cap,
         "\"phase\":{\"st\":\"%s\",\"day\":\"%.8s\",\"armed\":%s,"
+        "\"strategy\":\"phase_shifted\",\"mandatory\":true,"
         "\"pulls\":[%d,%d],\"bracket_ms\":%lld,"
+        "\"last_bracket_us\":[%lld,%lld],"
         "\"common_width_ms\":%s,\"prediction_width_ms\":%lld,"
         "\"period_ms\":%lld,\"period_interval_ms\":[%lld,%lld],"
         "\"cycle\":%lu,\"cycle_ambiguous\":%s,"
-        "\"iunc_ms\":%lld,\"mark_in_ms\":%lld,\"brackets\":%lu,"
-        "\"misses\":%lu,\"reacq_reason\":\"%s\",\"model\":\"u3_interval_v1\"}",
+        "\"iunc_ms\":%lld,\"prediction_iunc_ms\":%lld,"
+        "\"mark_in_ms\":%lld,\"brackets\":%lu,"
+        "\"misses\":%lu,\"reacq_reason\":\"%s\",\"model\":\"u4_interval_v1\"}",
         phase_state_name(s_ph.st), s_ph.day,
         s_ph.armed ? "true" : "false",
         s_ph.pull_sent, s_ph.pull_total,
-        (long long)br_ms, common_txt,
+        (long long)br_ms,
+        (long long)s_ph.last_br_lo_us, (long long)s_ph.last_br_hi_us,
+        common_txt,
         (long long)pred_ms,
         (long long)(s_ph.period_us / 1000),
         (long long)(s_ph.per_lo_us / 1000),
         (long long)(s_ph.per_hi_us / 1000),
         (unsigned long)s_ph.last_cycle,
         s_ph.cycle_ambig ? "true" : "false",
+        (long long)(s_ph.iunc_us / 1000),
         (long long)(s_ph.iunc_us / 1000), (long long)mark_in,
         (unsigned long)s_ph.n_brackets,
         (unsigned long)s_ph.n_misses,
@@ -223,35 +250,103 @@ int sched_phase_json(char *buf, size_t cap)
     return n > 0 && n < (int)cap ? n : 0;
 }
 
+int sched_timing_json(char *buf, size_t cap)
+{
+    static const char *purpose[] = {"parent", "day", "file", "live",
+                                    "version"};
+    int64_t now = esp_timer_get_time();
+    const char *p = "none";
+    if (s_listing.last_req_us &&
+        s_listing.last_kind < sizeof(purpose) / sizeof(purpose[0])) {
+        p = purpose[s_listing.last_kind];
+    }
+    int n = snprintf(buf, cap,
+        "\"http\":{\"scope\":\"esp_monotonic\",\"association\":\"current_link\","
+        "\"last\":{\"purpose\":\"%s\",\"ok\":%s,"
+        "\"req_start_us\":%lld,\"resp_end_us\":%lld,"
+        "\"service_us\":%lld,\"age_us\":%lld},"
+        "\"service_us\":{\"n\":%lu,\"min\":%lld,\"median\":%lld,"
+        "\"max\":%lld,\"failures\":%lu}}",
+        p, s_listing.last_ok ? "true" : "false",
+        (long long)s_listing.last_req_us,
+        (long long)s_listing.last_resp_us,
+        (long long)s_listing.last_service_us,
+        (long long)(s_listing.last_req_us
+                    ? now - s_listing.last_req_us : 0),
+        (unsigned long)s_listing.n_ok,
+        (long long)s_listing.min_us,
+        (long long)listing_median_us(),
+        (long long)s_listing.max_us,
+        (unsigned long)s_listing.n_fail);
+    return n > 0 && n < (int)cap ? n : 0;
+}
+
 /* ---------------- spacing / budget gates ---------------- */
 
-/* Median of recent day-listing service times — the U9 guard that
- * widens burst spacing when the folder approaches the poll interval. */
+/* Median of a bounded service-time window; callers keep day-listing
+ * values separate for the U9 spacing guard and all listing values for
+ * diagnostics so each published statistic covers the same sample set. */
+static int64_t median_i64(const int64_t *v, int n)
+{
+    if (!n) return 0;
+    int64_t s[SVC_WINDOW];
+    memcpy(s, v, (size_t)n * sizeof(s[0]));
+    for (int i = 1; i < n; i++) {          /* insertion sort, n <= 8  */
+        int64_t x = s[i];
+        int j = i - 1;
+        while (j >= 0 && s[j] > x) { s[j + 1] = s[j]; j--; }
+        s[j + 1] = x;
+    }
+    return s[n / 2];
+}
+
+static void service_push(int64_t *win, int *n, int64_t d)
+{
+    if (*n < SVC_WINDOW) {
+        win[(*n)++] = d;
+    } else {
+        memmove(win, win + 1, (SVC_WINDOW - 1) * sizeof(int64_t));
+        win[SVC_WINDOW - 1] = d;
+    }
+}
+
 static int64_t svc_median_us(void)
 {
-    if (!s_svc_n) return 0;
-    int64_t v[SVC_WINDOW];
-    int n = s_svc_n < SVC_WINDOW ? s_svc_n : SVC_WINDOW;
-    memcpy(v, s_svc_us, (size_t)n * sizeof(v[0]));
-    for (int i = 1; i < n; i++) {          /* insertion sort, n <= 8  */
-        int64_t x = v[i];
-        int j = i - 1;
-        while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
-        v[j + 1] = x;
-    }
-    return v[n / 2];
+    return median_i64(s_svc_us, s_svc_n);
+}
+
+static int64_t listing_median_us(void)
+{
+    return median_i64(s_listing.service_us, s_listing.service_n);
 }
 
 static void svc_note(int64_t req_us, int64_t resp_us)
 {
     int64_t d = resp_us - req_us;
     if (d <= 0) return;
-    if (s_svc_n < SVC_WINDOW) {
-        s_svc_us[s_svc_n++] = d;
-    } else {
-        memmove(s_svc_us, s_svc_us + 1, (SVC_WINDOW - 1) * sizeof(int64_t));
-        s_svc_us[SVC_WINDOW - 1] = d;
+    service_push(s_svc_us, &s_svc_n, d);
+}
+
+static void listing_note(job_kind_t kind, const ezw_obs_t *obs, bool ok)
+{
+    if (!obs || !obs->req_start_us) return;
+    int64_t service = obs->resp_end_us > obs->req_start_us
+                      ? obs->resp_end_us - obs->req_start_us : 0;
+    s_listing.last_req_us = obs->req_start_us;
+    s_listing.last_resp_us = obs->resp_end_us;
+    s_listing.last_service_us = service;
+    s_listing.last_kind = (uint8_t)kind;
+    s_listing.last_ok = ok;
+    if (!ok) {
+        s_listing.n_fail++;
+        return;
     }
+    if (!s_listing.n_ok || service < s_listing.min_us) {
+        s_listing.min_us = service;
+    }
+    if (service > s_listing.max_us) s_listing.max_us = service;
+    service_push(s_listing.service_us, &s_listing.service_n, service);
+    s_listing.n_ok++;
 }
 
 /* Minimum start spacing for a job: a phase pull carries its grid's
@@ -426,9 +521,9 @@ static void estim_track_therapy(int64_t now)
                 drift_record_t dr;
                 if (drift_pub_get(&dr)) {
                     dr.observation_closed = true;
-                    char *rj = malloc(4096);
+                    char *rj = malloc(6144);
                     if (rj) {
-                        int n = drift_estimate_json(&dr, rj, 4096);
+                        int n = drift_estimate_json(&dr, rj, 6144);
                         if (n > 0) drift_meta_save(rj, (size_t)n);
                         free(rj);
                     }
@@ -513,7 +608,9 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
             svc_note(r->obs.req_start_us, r->obs.resp_end_us);
             cat_diff_t diff;
             memset(&diff, 0, sizeof(diff));
-            cat_feed_day(j->dir, r->entries, r->n_entries, now, &diff);
+            cat_feed_day(j->dir, r->entries, r->n_entries,
+                         r->obs.req_start_us ? r->obs.req_start_us : now,
+                         &diff);
             if (diff.n_events > 0) {
                 /* a RESIDENT->RESIDENT write, not a baseline relist —
                  * diff.changed alone also fires on a folder's first
@@ -529,9 +626,22 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
             /* …and the phase tracker — unchanged scans bound the
              * next transition from below (update2 §2/§3)             */
             if (s_ph.day[0] && !strcmp(j->dir, s_ph.day)) {
+                bool transition = is_periodic_change(j->dir, &diff);
                 phase_obs(&s_ph, r->obs.req_start_us,
-                          r->obs.resp_end_us,
-                          is_periodic_change(j->dir, &diff));
+                          r->obs.resp_end_us, transition);
+                if (transition) {
+                    char rec[160];
+                    snprintf(rec, sizeof(rec),
+                             "\"ev\":\"bracket\",\"st\":\"%s\","
+                             "\"req_us\":%lld,\"resp_us\":%lld,"
+                             "\"service_us\":%lld",
+                             phase_state_name(s_ph.st),
+                             (long long)r->obs.req_start_us,
+                             (long long)r->obs.resp_end_us,
+                             (long long)(r->obs.resp_end_us -
+                                         r->obs.req_start_us));
+                    jrn_put("phase", rec);
+                }
             }
             ESP_LOGI(TAG, "day %s: %d listed, ev=%d chg=%d s=%lld r=%lld",
                      j->dir, r->n_entries, diff.n_events,
@@ -574,6 +684,10 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
         /* implemented via ble_api / portal paths with explicit ctx */
         r->err = ESP_ERR_NOT_SUPPORTED;
         break;
+    }
+    if ((j->kind == JOB_PARENT || j->kind == JOB_DAY) &&
+        r->obs.req_start_us) {
+        listing_note(j->kind, &r->obs, r->err == ESP_OK);
     }
     if (j->done) {
         j->done(r, j->ctx);
@@ -625,8 +739,11 @@ static void plan_phase(int64_t now)
     phase_cfg_t cfg = {
         .watch_gap_us = 5 * 1000 * 1000,
         .rate_ppm     = prof->dev_rate_ppm,
-        .enabled      = prof->phase_track_enabled,
-        .refine       = prof->phase_refine_enabled,
+        /* update4: adaptive phase tracking/refinement is the single
+         * normal timing path. It is deliberately not profile-gated;
+         * safe watch/hunt/miss states remain the fallback machinery. */
+        .enabled      = true,
+        .refine       = true,
     };
     phase_config(&s_ph, &cfg);
 
@@ -791,7 +908,17 @@ esp_err_t sched_init(void)
 }
 
 void sched_set_card_ip(uint32_t ip) { ezs_client_set_host(ip); }
-void sched_set_link(bool up)        { s_link_up = up; }
+void sched_set_link(bool up)
+{
+    if (s_link_up && !up) {
+        /* Diagnostics and the service-time guard are association-
+         * scoped: a new card link must not inherit another link's
+         * request timing.                                             */
+        memset(&s_listing, 0, sizeof(s_listing));
+        s_svc_n = 0;
+    }
+    s_link_up = up;
+}
 
 static bool q_same_target(const qjob_t *a, const qjob_t *b)
 {

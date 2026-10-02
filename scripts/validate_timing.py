@@ -13,11 +13,12 @@ import posixpath
 import re
 import select
 import statistics
-import subprocess
 import tempfile
 import time
 import urllib.request
 from zoneinfo import ZoneInfo
+
+from clock_source import clock_bound, clock_source
 
 
 class Evidence:
@@ -34,24 +35,6 @@ class Evidence:
 
     def close(self):
         self.file.close()
-
-
-def clock_bound(override=None):
-    if override is not None:
-        if not math.isfinite(override) or override <= 0:
-            raise ValueError("source uncertainty must be finite and positive")
-        return {"source": "explicit", "uncertainty_ms": override}
-    report = subprocess.check_output(["chronyc", "tracking"], text=True, timeout=5)
-    def number(label):
-        m = re.search(r"^" + re.escape(label) + r"\s*:\s*([-\d.]+)", report, re.M)
-        if not m:
-            raise ValueError("missing chrony field: " + label)
-        return abs(float(m.group(1)))
-    if not re.search(r"Leap status\s*:\s*Normal", report):
-        raise ValueError("chrony is not synchronized")
-    bound = (number("Root delay") / 2 + number("Root dispersion") + number("System time")) * 1000
-    return {"source": "chrony_root_distance", "uncertainty_ms": math.ceil(bound + 5),
-            "rms_offset_ms": number("RMS offset") * 1000}
 
 
 def reference(host, source_uncertainty_ms, rounds=3):
@@ -267,10 +250,13 @@ def serial_observations(fd, state, evidence):
         while b"\n" in state[0]:
             line, state[0] = state[0].split(b"\n", 1)
             text = line.decode("utf-8", "replace")
-            match = re.search(r"I \((\d+)\) sched: day (\d{8}): (\d+) listed, changed=(\d) grown=(\S+)", text)
+            match = re.search(r"I \((\d+)\) sched: day (\d{8}): (\d+) listed, (.*)", text)
             if match:
+                fields = dict(re.findall(r"(\w+)=([^\s,]+)", match[4]))
+                changed = fields.get("chg", fields.get("changed", "0"))
                 evidence.put("serial_day_result", device_log_ms=int(match[1]), day=match[2],
-                             count=int(match[3]), changed=bool(int(match[4])), grown=match[5],
+                             count=int(match[3]), changed=bool(int(changed)),
+                             fields=fields,
                              timing_semantics="log_after_feed_not_http_issue")
             if "SomnoPal boot" in text or "Guru Meditation" in text:
                 evidence.put("device_discontinuity", boot="SomnoPal boot" in text,
@@ -303,9 +289,12 @@ def capture(args, evidence, bound):
                 serial_observations(serial_fd, serial_state, evidence)
             now = time.monotonic()
             if now >= next_anchor:
-                mapping = dev.time_exchange(unc_us=math.ceil(bound["uncertainty_ms"] * 1000), rounds=3)
-                evidence.put("ble_anchor_exchange", result=mapping, source_uncertainty_ms=bound["uncertainty_ms"])
-                if bound["uncertainty_ms"] > 100:
+                source = clock_source(args.source_uncertainty_ms,
+                                      getattr(args, "source_epoch", None))
+                mapping = dev.time_exchange(source=source, rounds=3)
+                evidence.put("ble_anchor_exchange", result=mapping,
+                             source=source)
+                if source["uncertainty_ms"] > 100:
                     print("BLE timing captured for offline mapping; source uncertainty exceeds firmware's 100 ms anchor limit.", flush=True)
                 else:
                     print("anchor exchange: " + ("committed" if mapping.get("committed") else mapping.get("why", "not committed")), flush=True)
@@ -350,6 +339,210 @@ def capture(args, evidence, bound):
             os.close(serial_fd)
         dev.close()
         evidence.put("capture_end", fresh_catalog_views=snapshots)
+
+
+SESSION_META_FIELDS = {
+    "id", "state", "fmt", "start_epoch_ms", "end_epoch_ms", "start_iso",
+    "end_iso", "brp_samples", "brp_mm_samples", "press_samples",
+    "sa2_samples", "pld_samples", "stream_notifications", "gap_events",
+    "gap_missing", "clock_drift_ms", "clock_drift_valid",
+    "clock_drift_source", "clock_drift_measured_at_ms",
+    "clock_drift_usable", "end_source_checkpoint_seq", "time_source"}
+
+
+def observed_day(status, drift, fallback):
+    phase = (status or {}).get("phase") or {}
+    if re.fullmatch(r"\d{8}", str(phase.get("day") or "")):
+        return phase["day"]
+    estimate = (drift or {}).get("estimate") or {}
+    for item in estimate.get("files") or []:
+        text = "\\".join(str(item.get(k, "")) for k in ("dir", "name"))
+        m = re.search(r"(?<!\d)(\d{8})(?!\d)", text)
+        if m:
+            return m.group(1)
+    return fallback
+
+
+def collect_session_references(host, day, evidence, revisions):
+    """Whitelist timing/count metadata; never fetch stream or EDF content."""
+    try:
+        with ftp_open(host) as ftp:
+            root = f"/.somnotrace/sessions/streams/{day}"
+            names = sorted(remote_names(ftp, root))
+            changed = 0
+            for name in names:
+                if not name.endswith("_session.json"):
+                    continue
+                try:
+                    raw = remote_json(ftp, posixpath.join(root, name))
+                except Exception as error:
+                    evidence.put("session_reference_error", day=day,
+                                 name=name, detail=str(error))
+                    continue
+                safe = {k: v for k, v in raw.items()
+                        if k in SESSION_META_FIELDS}
+                safe["record"] = name
+                sig = json.dumps(safe, sort_keys=True, separators=(",", ":"))
+                if revisions.get(name) != sig:
+                    revisions[name] = sig
+                    evidence.put("session_reference", day=day, **safe)
+                    changed += 1
+            return {"sessions_seen": len(revisions), "new_or_changed": changed}
+    except Exception as error:
+        evidence.put("session_reference_error", day=day, detail=str(error))
+        return {"sessions_seen": len(revisions), "new_or_changed": 0,
+                "error": str(error)}
+
+
+JOURNAL_KEEP_KINDS = {"anchor", "timing_obs", "sot", "phase", "event"}
+
+
+def collect_journal(dev, evidence):
+    """Replay bounded timing evidence without storing unrelated records."""
+    replay = dev.evidence(timeout=45)
+    raw = replay.get("raw", b"")
+    records = []
+    malformed = skipped = 0
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            malformed += 1
+            continue
+        if rec.get("k") in JOURNAL_KEEP_KINDS:
+            records.append(rec)
+        else:
+            skipped += 1
+    evidence.put("journal_replay",
+                 begin=(replay.get("begin") or {}).get("result"),
+                 end=(replay.get("end") or {}).get("result"),
+                 payload_bytes=len(raw), records=records,
+                 malformed_records=malformed, skipped_records=skipped)
+    return records
+
+
+def observe(args, evidence, bound):
+    """Passive multi-session collector: cached BLE reads + references only."""
+    dev = ble_connect(args.address)
+    serial_fd = None
+    serial_state = [b""]
+    session_revisions = {}
+    snapshots = reconnects = 0
+    status = drift = None
+    end = time.monotonic() + args.duration
+    next_snap = next_reference = next_anchor = next_meta = next_journal = 0
+    try:
+        if args.serial:
+            serial_fd = os.open(args.serial, os.O_RDONLY | os.O_NONBLOCK |
+                                os.O_NOCTTY)
+        evidence.put("observe_start", duration_s=args.duration,
+                     card_reads_added=False, therapy_control=False)
+        print("OBSERVE READY: passive status/drift/reference collection.",
+              flush=True)
+        while time.monotonic() < end:
+            if serial_fd is not None:
+                serial_observations(serial_fd, serial_state, evidence)
+            now = time.monotonic()
+            if now >= next_snap:
+                u1, m1 = time.time_ns() // 1000000, time.monotonic_ns()
+                try:
+                    status = result(dev, "GET_STATUS")
+                    drift = result(dev, "GET_DRIFT",
+                                   {"best_available": True})
+                except Exception as error:
+                    evidence.put("observer_error", stage="ble_poll",
+                                 detail=str(error))
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+                    try:
+                        dev = ble_connect(args.address)
+                        reconnects += 1
+                        evidence.put("observer_reconnect", count=reconnects)
+                    except Exception as reconnect_error:
+                        evidence.put("observer_error", stage="reconnect",
+                                     detail=str(reconnect_error))
+                    next_snap = time.monotonic() + 10
+                    continue
+                u2, m2 = time.time_ns() // 1000000, time.monotonic_ns()
+                snapshots += 1
+                evidence.put("somnopal_snapshot", request_utc_ms=u1,
+                             request_mono_ns=m1, response_utc_ms=u2,
+                             response_mono_ns=m2, status=status, drift=drift)
+                therapy = (status.get("therapy") or {})
+                estimate = (drift.get("estimate") or {})
+                phase = (status.get("phase") or {})
+                http = ((status.get("http") or {}).get("service_us") or {})
+                active = therapy.get("state") == 1 or \
+                    not estimate.get("observation_closed", True)
+                print(json.dumps({
+                    "snapshot": snapshots, "therapy_state": therapy.get("state"),
+                    "half_ms": estimate.get("accuracy_half_ms"),
+                    "windows": estimate.get("n_windows"),
+                    "phase": phase.get("st"),
+                    "http_n": http.get("n"),
+                    "reconnects": reconnects}), flush=True)
+                next_snap = now + (args.interval if active
+                                   else args.idle_interval)
+            if now >= next_reference:
+                try:
+                    source = clock_source(args.source_uncertainty_ms,
+                                          args.source_epoch)
+                    evidence.put("clock_source", **source)
+                    for sample in reference(args.host,
+                                            source["uncertainty_ms"]):
+                        evidence.put("clock_reference", **sample)
+                except Exception as error:
+                    evidence.put("observer_error", stage="clock_reference",
+                                 detail=str(error))
+                next_reference = now + args.reference_interval
+            if now >= next_anchor:
+                try:
+                    source = clock_source(args.source_uncertainty_ms,
+                                          args.source_epoch)
+                    mapping = dev.time_exchange(
+                        source=source, rounds=args.anchor_rounds,
+                        commit=not args.no_anchor_commit)
+                    evidence.put("ble_anchor_exchange", result=mapping,
+                                 source=source)
+                except Exception as error:
+                    evidence.put("observer_error", stage="ble_time_exchange",
+                                 detail=str(error))
+                next_anchor = now + args.anchor_interval
+            day = observed_day(status, drift, args.day)
+            if now >= next_meta:
+                collect_session_references(args.host, day, evidence,
+                                           session_revisions)
+                next_meta = now + args.session_meta_interval
+            if args.journal_interval and now >= next_journal:
+                try:
+                    collect_journal(dev, evidence)
+                except Exception as error:
+                    evidence.put("observer_error", stage="journal",
+                                 detail=str(error))
+                next_journal = now + args.journal_interval
+            dev._pump(.02)
+    finally:
+        if serial_fd is not None:
+            os.close(serial_fd)
+        try:
+            collect_session_references(args.host,
+                                       observed_day(status, drift, args.day),
+                                       evidence, session_revisions)
+        except Exception:
+            pass
+        if args.journal_interval:
+            try:
+                collect_journal(dev, evidence)
+            except Exception:
+                pass
+        dev.close()
+        evidence.put("observe_end", snapshots=snapshots,
+                     reconnects=reconnects,
+                     session_metadata_revisions=len(session_revisions))
 
 
 def read_capture(path):
@@ -468,23 +661,268 @@ def cycle(args, evidence):
             raise RuntimeError("STOP RPC FAILED: physically stop therapy and check the device")
 
 
+def interval_relation(estimate, reference):
+    """Classify interval coverage; both arguments are [low, high]."""
+    if not estimate or not reference:
+        return "unavailable"
+    if estimate[0] > estimate[1] or reference[0] > reference[1]:
+        return "invalid"
+    if reference[0] >= estimate[0] and reference[1] <= estimate[1]:
+        return "reference_contained"
+    if estimate[0] >= reference[0] and estimate[1] <= reference[1]:
+        return "estimate_contained"
+    if estimate[1] >= reference[0] and reference[1] >= estimate[0]:
+        return "overlap"
+    return "disjoint"
+
+
+def expand_time_reference(reference, at_ms, rate_ppm):
+    """Move a correction interval to another instant using a rate bound."""
+    if not reference:
+        return None
+    dt_s = abs(at_ms - reference["response_utc_ms"]) / 1000.0
+    grow_ms = dt_s * rate_ppm / 1000.0
+    lo, hi = reference["drift_interval_ms"]
+    return [lo - grow_ms, hi + grow_ms]
+
+
+def nearest_reference(references, at_ms):
+    usable = [r for r in references
+              if isinstance(r.get("drift_interval_ms"), list) and
+              not r.get("host_clock_step")]
+    if not usable:
+        return None
+    return min(usable,
+               key=lambda r: abs(r.get("response_utc_ms", 0) - at_ms))
+
+
+def ble_anchor_points(rows):
+    anchors = []
+    for row in rows:
+        if row["kind"] != "ble_anchor_exchange":
+            continue
+        result = row.get("result") or {}
+        source = result.get("source") or row.get("source") or {}
+        for ex in result.get("exchanges") or []:
+            if not ex.get("ok") or ex.get("host_clock_step"):
+                continue
+            anchors.append({
+                "mono_us": (ex["m2"] + ex["m3"]) / 2,
+                "utc_us": (ex["t1"] + ex["t4"]) / 2,
+                "unc_us": ex["unc_us"],
+                "source_uncertainty_us": ex.get("source_uncertainty_us"),
+                "source_epoch": ex.get("epoch"),
+                "source": source,
+            })
+    anchors.sort(key=lambda a: a["mono_us"])
+    return anchors
+
+
+def map_with_anchor(obs_lo_us, obs_hi_us, anchors, rate_ppm=500):
+    """Conservative nearest-anchor map; no interpolation across domains."""
+    if not anchors:
+        return None
+    mid = (obs_lo_us + obs_hi_us) / 2
+    anchor = min(anchors, key=lambda a: abs(a["mono_us"] - mid))
+    d_lo = obs_lo_us - anchor["mono_us"]
+    d_hi = obs_hi_us - anchor["mono_us"]
+    pad_lo = abs(d_lo) * rate_ppm / 1000000.0
+    pad_hi = abs(d_hi) * rate_ppm / 1000000.0
+    return [(anchor["utc_us"] - anchor["unc_us"] + d_lo - pad_lo) / 1000.0,
+            (anchor["utc_us"] + anchor["unc_us"] + d_hi + pad_hi) / 1000.0]
+
+
+def unique_observations(rows):
+    observations = {}
+    for row in rows:
+        if row["kind"] == "somnopal_snapshot":
+            estimate = ((row.get("drift") or {}).get("estimate") or {})
+            files = estimate.get("files") or []
+            beacon = files[0].get("name") if files else None
+            session = estimate.get("session_start_as10")
+            model = estimate.get("timing_model") or {}
+            for obs in estimate.get("recent_observations") or []:
+                key = (session, beacon, obs.get("seq"))
+                merged = dict(obs)
+                merged.update({"session_start_as10": session,
+                               "beacon": beacon,
+                               "timing_model": model,
+                               "observation_source": "get_drift"})
+                observations[key] = merged
+        elif row["kind"] == "journal_replay":
+            for rec in row.get("records") or []:
+                if rec.get("k") != "timing_obs":
+                    continue
+                obs_us = rec.get("obs_us") or []
+                if len(obs_us) != 2:
+                    continue
+                unchanged_service = rec.get("unchanged_service_us")
+                changed_service = rec.get("changed_service_us")
+                scans = rec.get("scans") or [None, None]
+                obs = {
+                    "seq": rec.get("seq"), "kind": rec.get("kind"),
+                    "ev": rec.get("ev"), "unch_seq": scans[0],
+                    "chg_seq": scans[1], "stamp_s": rec.get("stamp_s"),
+                    "unch_req_us": obs_us[0],
+                    "unch_resp_us": (obs_us[0] + unchanged_service
+                                     if unchanged_service is not None else None),
+                    "chg_req_us": (obs_us[1] - changed_service
+                                   if changed_service is not None else None),
+                    "chg_resp_us": obs_us[1],
+                    "observation_source": "journal",
+                    "day": rec.get("day"), "beacon": rec.get("beacon"),
+                }
+                if rec.get("utc_ms"):
+                    obs["visibility_utc_ms"] = rec["utc_ms"]
+                    m = obs["stamp_s"] * 1000
+                    obs["offset_interval_ms"] = [
+                        rec["utc_ms"][0] - (m + 2000),
+                        rec["utc_ms"][1] - m]
+                key = (rec.get("day"), rec.get("beacon"), rec.get("seq"))
+                observations.setdefault(key, obs)
+    return list(observations.values())
+
+
+def score_update5(rows):
+    references = [r for r in rows if r["kind"] == "clock_reference"]
+    anchors = ble_anchor_points(rows)
+    observations = unique_observations(rows)
+    delays = []
+    offset_relations = {}
+    residuals_ms = []
+    for obs in observations:
+        stamp_s = obs.get("stamp_s")
+        lo_us = obs.get("unch_req_us", obs.get("unchanged_req_us"))
+        hi_us = obs.get("chg_resp_us", obs.get("changed_resp_us"))
+        if stamp_s is None or lo_us is None or hi_us is None:
+            continue
+        model = obs.get("timing_model") or {}
+        rate_ppm = model.get("dev_rate_ppm") or 500
+        mapped = map_with_anchor(lo_us, hi_us, anchors, rate_ppm)
+        visibility = mapped or obs.get("visibility_utc_ms")
+        visibility_source = "ble_exchange" if mapped else \
+            "device_anchor" if visibility else "unavailable"
+        if not visibility:
+            continue
+        vis_mid = sum(visibility) / 2
+        ref = nearest_reference(references, vis_mid)
+        ref_iv = expand_time_reference(ref, vis_mid, rate_ppm)
+        stamp_ms = int(stamp_s) * 1000
+        delay = None
+        if ref_iv:
+            stamp_iv = [stamp_ms + ref_iv[0],
+                        stamp_ms + 2000 + ref_iv[1]]
+            delay = [visibility[0] - stamp_iv[1],
+                     visibility[1] - stamp_iv[0]]
+            delays.append({"seq": obs.get("seq"), "kind": obs.get("kind"),
+                           "delay_ms": delay,
+                           "visibility_source": visibility_source,
+                           "reference_age_ms": abs(
+                               vis_mid - ref["response_utc_ms"]),
+                           "reference_rtt_ms": ref.get("rtt_ms")})
+        est_iv = obs.get("offset_interval_ms")
+        relation = interval_relation(est_iv, ref_iv)
+        offset_relations[relation] = offset_relations.get(relation, 0) + 1
+        if est_iv and ref_iv:
+            residuals_ms.append((sum(est_iv) / 2) - (sum(ref_iv) / 2))
+
+    estimate_scores = []
+    seen_estimate_scores = set()
+    for row in rows:
+        if row["kind"] != "somnopal_snapshot":
+            continue
+        estimate = ((row.get("drift") or {}).get("estimate") or {})
+        interval = estimate.get("drift_interval_ms")
+        if not interval:
+            continue
+        at = estimate.get("reference_at_ms") or row["host_utc_ms"]
+        model = estimate.get("timing_model") or {}
+        rate_ppm = model.get("dev_rate_ppm") or 500
+        ref = nearest_reference(references, at)
+        ref_iv = expand_time_reference(ref, at, rate_ppm)
+        score = {"at_ms": at, "estimate_ms": interval,
+                 "half_ms": estimate.get("accuracy_half_ms"),
+                 "timing_model": model,
+                 "relation": interval_relation(interval, ref_iv)}
+        if ref_iv:
+            score["reference_ms"] = ref_iv
+            score["midpoint_delta_ms"] = sum(interval) / 2 - sum(ref_iv) / 2
+            score["reference_age_ms"] = abs(at - ref["response_utc_ms"])
+        key = (tuple(interval), at,
+               tuple(ref_iv) if ref_iv else None)
+        if key not in seen_estimate_scores:
+            seen_estimate_scores.add(key)
+            estimate_scores.append(score)
+
+    session_scores = []
+    estimates = [s for s in estimate_scores if s.get("estimate_ms")]
+    latest = estimates[-1] if estimates else None
+    for row in rows:
+        if row["kind"] != "session_reference" or not latest:
+            continue
+        if not row.get("clock_drift_valid") or not row.get("clock_drift_usable"):
+            continue
+        point = row.get("clock_drift_ms")
+        at = row.get("clock_drift_measured_at_ms") or row.get("end_epoch_ms")
+        if point is None or at is None:
+            continue
+        model = (((latest or {}).get("timing_model")) or {})
+        rate_ppm = model.get("dev_rate_ppm") or 500
+        grow = abs(at - latest["at_ms"]) * rate_ppm / 1000000.0
+        ref_iv = [point - grow, point + grow]
+        session_scores.append({
+            "record": row.get("record"), "point_ms": point,
+            "at_ms": at, "estimate_ms": latest["estimate_ms"],
+            "relation": interval_relation(latest["estimate_ms"], ref_iv),
+            "midpoint_delta_ms": sum(latest["estimate_ms"]) / 2 - point,
+            "reference_age_ms": abs(at - latest["at_ms"])})
+
+    delay_values = [d["delay_ms"] for d in delays]
+    summary = {
+        "observations": len(observations),
+        "ble_anchor_exchanges": len(anchors),
+        "clock_references": len(references),
+        "delay_intervals": delays,
+        "offset_relations": offset_relations,
+        "offset_midpoint_delta_ms": {
+            "min": min(residuals_ms), "max": max(residuals_ms),
+            "median": statistics.median(residuals_ms)} if residuals_ms else None,
+        "latest_estimate_score": latest,
+        "estimate_scores": estimate_scores[-20:],
+        "session_reference_scores": session_scores,
+    }
+    if delay_values:
+        summary["delay_hull_ms"] = [min(d[0] for d in delay_values),
+                                    max(d[1] for d in delay_values)]
+        summary["delay_containing_zero"] = sum(d[0] <= 0 <= d[1]
+                                               for d in delay_values)
+        summary["delay_entirely_positive"] = sum(d[0] > 0
+                                                 for d in delay_values)
+        summary["delay_entirely_negative"] = sum(d[1] < 0
+                                                 for d in delay_values)
+    return summary
+
+
 def analyze(path):
     counts = {}
     samples = []
     transitions = {}
     serial_polls = 0
     states = set()
+    rows = []
     with open(path) as source:
         for line in source:
             row = json.loads(line)
+            rows.append(row)
             kind = row["kind"]
             counts[kind] = counts.get(kind, 0) + 1
             if kind == "clock_reference" and not row["host_clock_step"]:
                 samples.append(row)
             if kind == "serial_day_result":
                 serial_polls += 1
-            if kind == "catalog_snapshot":
-                states.add(row["status"].get("therapy", {}).get("state"))
+            if kind == "catalog_snapshot" or kind == "somnopal_snapshot":
+                status = row.get("status") or {}
+                states.add(status.get("therapy", {}).get("state"))
             if kind == "observed_catalog_transition":
                 for change in row["changes"]:
                     before, after = change["before"], change["after"]
@@ -504,6 +942,7 @@ def analyze(path):
                                 "minimum_rtt_ms": min(s["rtt_ms"] for s in samples),
                                 "interval_envelope_ms": [min(s["drift_interval_ms"][0] for s in samples),
                                                          max(s["drift_interval_ms"][1] for s in samples)]}
+    summary["update5_scoring"] = score_update5(rows)
     print(json.dumps(summary, indent=2))
 
 
@@ -553,20 +992,60 @@ def self_test():
     s["clock_drift_valid"] = False
     assert not compare_history([{"name": "20260101_000000_BRP.edf", "size": "1024",
                                  "ts": "2025-12-31 13:01:00"}], [s], zone)
+    rows = [
+        {"kind": "ble_anchor_exchange", "result": {"source": {"epoch": 7},
+            "exchanges": [{"ok": True, "m2": 10000000, "m3": 10000000,
+                           "t1": 1000500000, "t4": 1000500000,
+                           "unc_us": 50000, "host_clock_step": False,
+                           "source_uncertainty_us": 40000, "epoch": 7}]}},
+        {"kind": "clock_reference", "response_utc_ms": 1000500,
+         "rtt_ms": 50, "drift_interval_ms": [80, 120],
+         "host_clock_step": False},
+        {"kind": "somnopal_snapshot", "host_utc_ms": 1001000,
+         "drift": {"estimate": {"session_start_as10": "synthetic",
+             "timing_model": {"dev_rate_ppm": 500},
+             "drift_interval_ms": [-1500, 700],
+             "accuracy_half_ms": 1100,
+             "reference_at_ms": 1000500,
+             "recent_observations": [
+                 {"seq": 1, "kind": "transition", "stamp_s": 1000,
+                  "unch_req_us": 10000000, "chg_resp_us": 10000500,
+                  "visibility_utc_ms": [1000500, 1000700],
+                  "offset_interval_ms": [-1500, 700]}]}}}]
+    score = score_update5(rows)
+    assert score["observations"] == 1 and score["ble_anchor_exchanges"] == 1
+    assert score["delay_containing_zero"] == 1
+    assert score["latest_estimate_score"]["relation"] == "reference_contained"
     print("synthetic self-tests passed")
 
 
 def main():
     parser = argparse.ArgumentParser(description="SomnoPal / SomnoTrace timing validation; explicit cycle mode controls therapy")
-    parser.add_argument("mode", choices=["history", "capture", "cycle", "analyze", "self-test"])
+    parser.add_argument("mode", choices=["history", "capture", "observe", "cycle",
+                                       "analyze", "self-test"])
     parser.add_argument("--host", default="192.168.86.102")
     parser.add_argument("--address", default="8C:FD:49:93:74:76")
     parser.add_argument("--day", default="20260930")
     parser.add_argument("--timezone", default="Australia/Melbourne")
     parser.add_argument("--source-uncertainty-ms", type=float)
+    parser.add_argument("--source-epoch", type=lambda x: int(x, 0),
+                        help="explicit host time-source epoch for anchors")
     parser.add_argument("--exports", type=int, default=5)
     parser.add_argument("--duration", type=float, default=1200)
-    parser.add_argument("--interval", type=float, default=5)
+    parser.add_argument("--interval", type=float, default=5,
+                        help="active-session observation interval")
+    parser.add_argument("--idle-interval", type=float, default=30,
+                        help="observer poll interval while out of therapy")
+    parser.add_argument("--reference-interval", type=float, default=60,
+                        help="AS11 GetDateTime reference interval")
+    parser.add_argument("--anchor-interval", type=float, default=600,
+                        help="BLE host/device mapping interval")
+    parser.add_argument("--anchor-rounds", type=int, default=3)
+    parser.add_argument("--no-anchor-commit", action="store_true",
+                        help="keep TIME exchanges host-side only")
+    parser.add_argument("--session-meta-interval", type=float, default=60)
+    parser.add_argument("--journal-interval", type=float, default=600,
+                        help="seconds between bounded journal replays; 0 disables")
     parser.add_argument("--serial", default="/dev/ttyACM0")
     parser.add_argument("--output")
     parser.add_argument("--input")
@@ -591,8 +1070,16 @@ def main():
     if args.mode == "self-test":
         self_test()
         return
-    if not 0 <= args.exports <= 25 or not 1 <= args.duration <= 7200 or not 2 <= args.interval <= 60:
-        parser.error("exports must be 0..25, duration 1..7200s, interval 2..60s")
+    if not (0 <= args.exports <= 25 and 1 <= args.duration <= 7200 and
+            2 <= args.interval <= 60 and 5 <= args.idle_interval <= 600 and
+            5 <= args.reference_interval <= 3600 and
+            30 <= args.anchor_interval <= 3600 and
+            1 <= args.anchor_rounds <= 10 and
+            10 <= args.session_meta_interval <= 3600 and
+            0 <= args.journal_interval <= 3600):
+        parser.error("exports 0..25, duration 1..7200s, active interval 2..60s, "
+                     "idle/reference/session intervals within bounds, "
+                     "anchor rounds 1..10, journal interval 0..3600s")
     evidence = Evidence(args.output)
     try:
         bound = clock_bound(args.source_uncertainty_ms)
@@ -601,6 +1088,8 @@ def main():
         print("host source uncertainty: ±" + str(bound["uncertainty_ms"]) + " ms", flush=True)
         if args.mode == "history":
             history(args, evidence, bound)
+        elif args.mode == "observe":
+            observe(args, evidence, bound)
         else:
             capture(args, evidence, bound)
     except KeyboardInterrupt:

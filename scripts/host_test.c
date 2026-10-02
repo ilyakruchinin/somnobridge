@@ -895,8 +895,6 @@ static void test_sot(void)
     prof.jitter_us         = 100000;
     prof.accurate_half_us  = 2000000;
     prof.dev_rate_ppm      = 50;
-    prof.phase_track_enabled    = true;
-    prof.phase_refine_enabled   = false;
     drift_profile_set(&prof);
 
     drift_reset();
@@ -1277,17 +1275,201 @@ static void test_update3(void)
         CHECK(nvs_set_blob(settings_nvs_metadata(), "drift_sot",
                            &old, sizeof(old)) == ESP_OK, "seed legacy SOT");
         CHECK(drift_sot_load() == ESP_OK &&
-              drift_sot_view(&sot) &&
+              drift_sot_slot_view(DRIFT_SOT_QUALIFIED, &sot) &&
               sot.quality == DRIFT_Q_QUALIFIED &&
-              sot.freshness_unknown &&
+              sot.freshness_unknown && sot.stale && !sot.applicable &&
               (sot.assumptions & DRIFT_A_LEGACY_MODEL),
-              "v1 migrates to qualified slot");
+              "v1 migrates only as stale history");
         CHECK(drift_sot_commit(true, 187000000) == ESP_OK,
               "migrated SOT serializes as v2");
     }
 
     drift_timezone_set("UTC0", true);
     drift_profile_set(&base);
+}
+
+/* ---------------- update4: measured intervals + model identity ----
+ * The estimator must expose the actual ESP request endpoints and may
+ * widen only for explicit cache/visibility terms — never by subtracting
+ * the measured HTTP service time a second time.                     */
+static void test_update4(void)
+{
+    drift_profile_t base = *drift_profile();
+    drift_profile_t p = base;
+    p.model_rev = 71;
+    p.cache_bound_us = 0;
+    p.cache_policy = DRIFT_CACHE_ASSUMED_ZERO;
+    p.latency_lo_us = 0;
+    p.latency_hi_us = 0;
+    p.visibility_policy = DRIFT_VIS_ASSUMED_IMMEDIATE;
+    p.jitter_us = 0;
+    p.dev_rate_ppm = 50;
+    p.stamp_channel_validated = false;
+    p.filename_origin_bounded = false;
+    p.filename_periodic_bounded = false;
+    drift_profile_set(&p);
+
+    drift_reset();
+    nvs_stub_reset();
+    cat_init();
+    drift_sot_invalidate();
+    const int64_t U = 1700000000LL * 1000000LL;
+    const int64_t D = 100;               /* device +100 s             */
+    drift_test_anchor(0, U, 1000, 31);
+    drift_test_anchor(900LL * 1000 * 1000,
+                      U + 900LL * 1000 * 1000, 1000, 31);
+    drift_live_begin("20240103");
+    drift_session_t *ls = drift_live();
+
+    char ts[32];
+    fmt_stamp(U / 1000000 + 300 + D, ts);
+    ezs_entry_t fs[1] = {
+        mk("20240103_220000_BRP.edf", 4096, ts, false)
+    };
+    cat_diff_t df;
+    cat_feed_day("20240103", fs, 1, 100000, &df);
+    CHECK(drift_feed_scan(ls, "20240103", fs, 1, &df,
+                          100000, 120000) == 0, "baseline scan");
+
+    cat_feed_day("20240103", fs, 1, 180000, &df);
+    CHECK(drift_feed_scan(ls, "20240103", fs, 1, &df,
+                          180000, 210000) == 0, "unchanged scan");
+
+    fmt_stamp(U / 1000000 + 360 + D, ts);
+    strcpy(fs[0].timestamp_raw, ts);
+    fs[0].size = 6144;
+    cat_feed_day("20240103", fs, 1, 260000, &df);
+    CHECK(drift_feed_scan(ls, "20240103", fs, 1, &df,
+                          260000, 300000) == 1, "transition scan");
+    drift_sess_eval(ls, 310000);
+    CHECK(ls->n_ev == 1 && ls->obs_seq == 1 &&
+          ls->obs_diag[0].unch_req_us == 180000 &&
+          ls->obs_diag[0].unch_resp_us == 210000 &&
+          ls->obs_diag[0].chg_req_us == 260000 &&
+          ls->obs_diag[0].chg_resp_us == 300000,
+          "raw request endpoints retained");
+
+    /* Zero residual delay: offset edges are the actual [unchanged
+     * request start, changed response end] minus the 2 s stamp bin.
+     * Neither HTTP duration is subtracted again.                    */
+    int64_t M = (U / 1000000 + 360 + D) * 1000000LL;
+    int64_t exp_lo = U + 180000 - 1000 - (M + 2000000);
+    int64_t exp_hi = U + 300000 + 1000 - M;
+    CHECK(ls->off_lo_us == exp_lo && ls->off_hi_us == exp_hi,
+          "measured endpoints used without double counting");
+
+    /* Raw events recompute when the timing model changes.            */
+    drift_profile_t wider = p;
+    wider.model_rev = 72;
+    wider.latency_hi_us = 500000;
+    wider.visibility_policy = DRIFT_VIS_BOUNDED;
+    drift_profile_set(&wider);
+    drift_sess_eval(ls, 320000);
+    CHECK(ls->off_lo_us == exp_lo - 500000 &&
+          ls->off_hi_us == exp_hi,
+          "model revision changes recompute raw evidence");
+
+    drift_record_t rec;
+    char jb[6144];
+    CHECK(drift_pub_get(&rec) && rec.model_rev == 72 &&
+          rec.cache_policy == DRIFT_CACHE_ASSUMED_ZERO &&
+          rec.visibility_policy == DRIFT_VIS_BOUNDED &&
+          rec.n_observations == 1,
+          "published model provenance");
+    CHECK(drift_estimate_json(&rec, jb, sizeof(jb)) > 0 &&
+          json_valid(jb) &&
+          strstr(jb, "\"timing_model\"") &&
+          strstr(jb, "\"recent_observations\"") &&
+          strstr(jb, "\"changed_service_us\":40000") &&
+          strstr(jb, "\"visibility_utc_ms\""),
+          "observation JSON is replayable");
+
+    /* A persisted record from an incompatible model remains visible as
+     * history but is stale/inapplicable — it must not become truth.   */
+    typedef struct __attribute__((packed)) {
+        uint32_t magic;
+        uint8_t version, quality, source, encoding, stale, rsv1[3];
+        uint32_t seq, model_rev;
+        uint64_t assumptions;
+        uint16_t observations, rsv2;
+        int64_t drift_ms, lo_ms, hi_ms, half_ms, comp_ms, ref_ms;
+        uint32_t cache_us;
+        int32_t latency_lo_us, latency_hi_us;
+        uint32_t jitter_us, rate_ppm;
+        int32_t fname_lo_us, fname_hi_us;
+        int64_t period_us;
+        char reason[24], fw[24];
+        uint32_t crc32;
+    } sot_v2_test_t;
+    sot_v2_test_t b;
+    memset(&b, 0, sizeof(b));
+    b.magic = 0x534F5431u;
+    b.version = 2;
+    b.quality = DRIFT_Q_PROVISIONAL;
+    b.source = DRIFT_SRC_MTIME;
+    b.seq = 7;
+    b.model_rev = 71;              /* active model is now 72         */
+    b.rsv1[0] = DRIFT_CACHE_ASSUMED_ZERO;
+    b.rsv1[1] = DRIFT_VIS_ASSUMED_IMMEDIATE;
+    b.observations = 3;
+    b.drift_ms = -100000;
+    b.lo_ms = -102000;
+    b.hi_ms = -98000;
+    b.half_ms = 2000;
+    b.comp_ms = U / 1000 + 1000;
+    b.ref_ms = U / 1000 + 1000;
+    b.latency_hi_us = 0;
+    b.rate_ppm = 50;
+    b.period_us = 60000000;
+    strcpy(b.reason, "test_model");
+    strcpy(b.fw, "ezs-test");
+    b.crc32 = esp_crc32_le(0, (const uint8_t *)&b,
+                           offsetof(sot_v2_test_t, crc32));
+    CHECK(nvs_set_blob(settings_nvs_metadata(), "drift_sot_p",
+                       &b, sizeof(b)) == ESP_OK, "seed old-model SOT");
+    CHECK(drift_sot_load() == ESP_OK, "old-model blob loads");
+    drift_sot_t sot;
+    CHECK(drift_sot_slot_view(DRIFT_SOT_PROVISIONAL, &sot) &&
+          sot.model_rev == 71 && sot.stale && !sot.applicable,
+          "model-revision mismatch is inapplicable");
+    int64_t alo, ahi;
+    CHECK(!drift_sot_apply(&sot, 400000, &alo, &ahi),
+          "incompatible persisted model cannot be applied");
+
+    /* Runtime invalidation is semantic, not only a revision-number
+     * check: changing the residual bound under the same model_rev
+     * still makes an existing SOT inapplicable.                    */
+    sot_v2_test_t good = b;
+    good.seq = 8;
+    good.model_rev = 72;
+    good.rsv1[0] = DRIFT_CACHE_ASSUMED_ZERO;
+    good.rsv1[1] = DRIFT_VIS_BOUNDED;
+    good.stale = 0;
+    good.encoding = DRIFT_ENC_UNKNOWN;
+    good.latency_hi_us = 500000;
+    good.rate_ppm = 50;
+    good.fname_lo_us = (int32_t)wider.fname_create_lo_us;
+    good.fname_hi_us = (int32_t)wider.fname_create_hi_us;
+    good.crc32 = esp_crc32_le(0, (const uint8_t *)&good,
+                              offsetof(sot_v2_test_t, crc32));
+    CHECK(nvs_set_blob(settings_nvs_metadata(), "drift_sot_p",
+                       &good, sizeof(good)) == ESP_OK,
+          "seed compatible SOT");
+    CHECK(drift_sot_load() == ESP_OK, "compatible blob loads");
+    drift_test_anchor(901LL * 1000 * 1000,
+                      U + 901LL * 1000 * 1000, 1000, 31);
+    CHECK(drift_sot_slot_view(DRIFT_SOT_PROVISIONAL, &sot) &&
+          !sot.stale && sot.applicable,
+          "matching model is applicable after an anchor");
+    drift_profile_t same_rev = wider;
+    same_rev.latency_hi_us = 400000;
+    drift_profile_set(&same_rev);
+    CHECK(drift_sot_slot_view(DRIFT_SOT_PROVISIONAL, &sot) &&
+          sot.stale && !sot.applicable,
+          "same-revision semantic change invalidates SOT");
+
+    drift_profile_set(&base);
+    drift_timezone_set("UTC0", true);
 }
 
 /* ---------------- phase tracker (update2 §3) --------------------
@@ -1546,6 +1728,7 @@ int main(void)
     test_drift();
     test_sot();
     test_update3();
+    test_update4();
     test_phase();
     test_edf();
     test_journal();

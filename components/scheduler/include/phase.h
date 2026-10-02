@@ -30,7 +30,7 @@ typedef enum {
     PH_NARROW1,     /* ladder: 2 s nominal grid                         */
     PH_NARROW2,     /*         0.8 s nominal grid                       */
     PH_VERNIER,     /*         shifted grid, interval constraints       */
-    PH_REFINE,      /* optional: further shifted grids (profile-gated)  */
+    PH_REFINE,      /*         further shifted grids                    */
     PH_MAINTAIN,    /* steady: pulls around the bounded prediction      */
 } ph_state_t;
 
@@ -40,7 +40,7 @@ typedef struct {
     uint32_t watch_gap_us;   /* continuous-poll spacing (5 s)          */
     uint32_t rate_ppm;       /* device/SomnoPal rate-disagreement bound */
     bool     enabled;        /* false pins the tracker to fixed polls  */
-    bool     refine;         /* allow the optional REFINE stage        */
+    bool     refine;         /* allow the REFINE stage                  */
 } phase_cfg_t;
 
 typedef struct {

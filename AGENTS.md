@@ -98,6 +98,7 @@ upper bound — on-device processing shows up separately.
 python3 scripts/validate_timing.py self-test
 python3 scripts/validate_timing.py history --day YYYYMMDD
 python3 scripts/validate_timing.py capture --day YYYYMMDD --duration 1200
+python3 scripts/validate_timing.py observe --day YYYYMMDD --duration 7200 --no-anchor-commit
 python3 scripts/validate_timing.py analyze --input /tmp/somnopal-validation-XXXX/evidence.jsonl
 ```
 
