@@ -100,8 +100,9 @@ an open observation is active, samples SomnoTrace `GetDateTime`, replays
 bounded journal evidence, and collects whitelisted session metadata. It adds
 no card requests and never controls therapy. `--no-anchor-commit` retains raw
 BLE time exchanges for offline monotonic→UTC mapping without committing a new
-device anchor; omit it only when the host source is disciplined within the
-firmware's 100 ms acceptance limit.
+device anchor; omit it only when committing an intentionally bounded anchor —
+≤100 ms qualifies for accurate-tier evidence, while ≤500 ms produces an
+explicitly marked best-effort/provisional anchor.
 
 ### Controlled therapy cycle (optional, reproducible edges)
 
