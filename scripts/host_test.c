@@ -1753,6 +1753,30 @@ static void test_update6(void)
           !drift_sot_dirty(),
           "bounded retry persists and clears dirty");
 
+    /* ---- card version text is diagnostic-only (TODO.md appendix) --- *
+     * s_card_fw keeps 23 chars; a longer stable response previously
+     * mismatched every hourly probe and burned persisted records.      */
+    const char *xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                      "<version>9.9.9</version>";        /* >23 chars  */
+    char want_fw[24];
+    strncpy(want_fw, xml, sizeof(want_fw) - 1);
+    want_fw[sizeof(want_fw) - 1] = '\0';
+    drift_card_fw_note(xml);
+    drift_card_fw_note("<other response/>");             /* differing  */
+    drift_card_fw_note(xml);                             /* back again */
+    drift_card_fw_note("");
+    drift_card_fw_note(NULL);
+    CHECK(drift_fallback_view(&fbr) && !fbr.stale && !fbr.dirty &&
+          fbr.reference_at_ms == fb_ref,
+          "version text never invalidates the fallback");
+    CHECK(drift_select(now, &sel) && sel.valid &&
+          sel.origin == DRIFT_SEL_CURRENT,
+          "version notes leave selection usable");
+    CHECK(drift_finalize_fallback(now) &&
+          drift_fallback_view(&fbr) &&
+          !strcmp(fbr.card_fw, want_fw),
+          "non-empty version kept as provenance only");
+
     /* ---- below the save gate the old record is kept untouched ------ */
     ls->off_lo_us = mid - 2600000;   /* usable provisional, > 2 s gate */
     ls->off_hi_us = mid + 2600000;

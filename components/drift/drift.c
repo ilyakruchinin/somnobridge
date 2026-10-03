@@ -1758,27 +1758,10 @@ bool drift_sot_apply(const drift_sot_t *s, int64_t now_us,
 void drift_card_fw_note(const char *fw)
 {
     if (!fw || !fw[0]) return;
-    bool changed = s_card_fw[0] && strcmp(s_card_fw, fw);
-    for (int i = 0; i < DRIFT_SOT_N; i++) {
-        if (s_sot[i].valid && s_sot[i].card_fw[0] &&
-            strcmp(s_sot[i].card_fw, fw)) {
-            s_sot[i].stale = true;
-            s_sot[i].applicable = false;
-            s_sot[i].dirty = true;
-            s_sot_dirty[i] = true;
-        }
-    }
-    if (s_fb.valid && s_fb.card_fw[0] && strcmp(s_fb.card_fw, fw)) {
-        s_fb.stale = true;
-        s_fb.applicable = false;
-        s_fb.dirty = true;
-        s_fb_dirty = true;
-    }
-    if (changed) {
-        /* card firmware/identity changed underneath us — persisted
-         * characterization is historical for another binding.        */
-        sot_mark_stale(false);
-    }
+    /* Diagnostic provenance only. The response body is a truncated XML
+     * prolog, not a reliable card identity, and released EZShare cards
+     * have no firmware-update path; version text must never invalidate
+     * persisted timing records (docs/TODO.md appendix).               */
     strncpy(s_card_fw, fw, sizeof(s_card_fw) - 1);
     s_card_fw[sizeof(s_card_fw) - 1] = '\0';
 }

@@ -515,7 +515,7 @@ esp_err_t drift_sot_load(void);          /* boot: NVS -> RAM           */
 esp_err_t drift_sot_commit(bool force, int64_t now_us); /* throttled */
 bool      drift_sot_dirty(void);
 void      drift_sot_invalidate(void);    /* explicit evidence reset    */
-void      drift_card_fw_note(const char *fw); /* card identity check  */
+void      drift_card_fw_note(const char *fw); /* diagnostic only      */
 
 /* ---------------- current-session vs previous-session fallback ------
  * (update6 §8/§10): NVS holds the latest COMPLETED session's estimate

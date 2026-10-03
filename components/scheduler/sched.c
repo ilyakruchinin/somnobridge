@@ -30,7 +30,6 @@ static const char *TAG = "sched";
 #define REQ_GAP_NORMAL_US  (1000 * 1000)   /* 1/s ordinary spacing    */
 #define COVER_PERIOD_US    (60LL * 1000 * 1000)  /* coverage round    */
 #define COLD_PERIOD_US     (5 * 1000 * 1000)
-#define NEIGH_PERIOD_US    (3600LL * 1000 * 1000)  /* once/hour        */
 #define LEDGER_BUCKETS     481
 #define LEDGER_BUCKET_US   (60LL * 1000 * 1000)
 #define TRACK_FRESH_US     (75LL * 1000 * 1000)  /* tracked folder must
@@ -57,7 +56,6 @@ static volatile bool s_link_up;
 static int64_t  s_last_req_us;
 static int64_t  s_next_cover_us;
 static int64_t  s_next_cold_us;
-static int64_t  s_next_neigh_us;
 static int64_t  s_next_plan_us;
 static int64_t  s_ph_due_us;              /* next phase pull due      */
 static bool     s_round_active;           /* coverage round in progr. */
@@ -615,7 +613,7 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
         obs_success(r->err == ESP_OK);
         if (r->err == ESP_OK) {
             ESP_LOGI(TAG, "card fw: %s", v);
-            drift_card_fw_note(v);      /* identity check → SOT (U6)  */
+            drift_card_fw_note(v);      /* diagnostic only — no timing */
         }
         break;
     }
@@ -800,22 +798,6 @@ static void plan_cold(int64_t now)
         strncpy(d.dir, q[0], CAT_DAY_STR);
         sched_submit(&d);
     }
-}
-
-static void plan_neigh(int64_t now)
-{
-    if (now < s_next_neigh_us) {
-        return;
-    }
-    s_next_neigh_us = now + NEIGH_PERIOD_US;
-    /* once/hour housekeeping while in therapy — hot neighbours only,
-     * the active folder is handled by the liveness loop itself (§6.2) */
-
-    /* card firmware/identity check (U9): hourly, lowest priority —
-     * feeds drift_card_fw_note; a changed identity invalidates the
-     * persisted SOT                                                   */
-    sched_job_t v = { .kind = JOB_VERSION, .prio = 7 };
-    sched_submit(&v);
 }
 
 /* ---------------- task ---------------- */
@@ -1114,7 +1096,6 @@ void sched_run_forever(void)
                 plan_phase(now);
                 plan_cover(now);
                 plan_cold(now);
-                plan_neigh(now);
                 if (s_ph_due_us > now && s_ph_due_us < s_next_plan_us) {
                     s_next_plan_us = s_ph_due_us;
                 }
