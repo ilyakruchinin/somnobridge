@@ -47,13 +47,15 @@ static const struct { int64_t spacing; int min_pulls; } s_grid[] = {
     [PH_VERNIER]  = { 800000, 3},
     [PH_REFINE]   = { 500000, 3},     /* service guard may widen it */
     [PH_MAINTAIN] = {1000000, 3},
+    [PH_REFINE2]  = { 500000, 3},     /* sustained refinement (u6)  */
 };
 
 const char *phase_state_name(ph_state_t st)
 {
     static const char *n[] = {"watch", "hunt", "narrow1", "narrow2",
-                              "vernier", "refine", "maintain"};
-    return st >= 0 && st <= PH_MAINTAIN ? n[st] : "?";
+                              "vernier", "refine", "maintain",
+                              "refine2"};
+    return st >= 0 && st <= PH_REFINE2 ? n[st] : "?";
 }
 
 const char *phase_reacq_name(uint8_t reason)
@@ -361,10 +363,15 @@ static int64_t grid_shift(const phase_t *p)
     return 0;
 }
 
-/* Arm [pred_lo-margin, pred_hi+margin] on the state's shifted grid.
- * The service allowance ensures the first/last response can still
- * observe a transition just outside the request-start interval.       */
-static void win_arm(phase_t *p, int64_t svc_us)
+static void to_continuous(phase_t *p, int64_t now_us);
+
+/* Arm [pred_lo-margin, pred_hi+margin] on the state's shifted grid —
+ * the cluster is centered on the current prediction and may move in
+ * either direction cycle to cycle (never an accumulating one-way
+ * shift; update6 §5.1). The service allowance ensures the first/last
+ * response can still observe a transition just outside the
+ * request-start interval.                                             */
+static void win_arm(phase_t *p, int64_t svc_us, int64_t now_us)
 {
     int64_t spacing = s_grid[p->st].spacing;
     if (svc_us > 0 && spacing < 2 * svc_us) {
@@ -389,6 +396,13 @@ static void win_arm(phase_t *p, int64_t svc_us)
     int64_t span = p->grid_hi_us - p->grid0_us;
     int64_t n = span <= 0 ? 1 : (span + spacing - 1) / spacing + 1;
     if (n > PH_PULLS_MAX) {
+        if (p->st == PH_REFINE2) {
+            /* update6: coverage needing more than the pull cap falls
+             * back to broad-window reacquisition — never shrink the
+             * declared prediction or silently skip an edge.          */
+            to_continuous(p, now_us);
+            return;
+        }
         /* the cap must not truncate coverage: widen the grid         */
         spacing = (span + PH_PULLS_MAX - 2) / (PH_PULLS_MAX - 1);
         spacing = (spacing + 99999) / 100000 * 100000;
@@ -458,7 +472,15 @@ bool phase_due(phase_t *p, int64_t now_us, int64_t svc_us,
             *gap_us = 0;
             return true;
         }
-        win_arm(p, svc_us);
+        win_arm(p, svc_us, now_us);
+        if (!p->armed) {
+            /* coverage needed more than the pull cap: win_arm fell
+             * back to continuous reacquisition — answer for that     */
+            p->pend_due_us = now_us;
+            *due_us = now_us;
+            *gap_us = 0;
+            return true;
+        }
     }
 
     if (p->pull_sent < p->pull_total) {
@@ -572,10 +594,18 @@ void phase_obs(phase_t *p, int64_t req_us, int64_t resp_us,
             break;
         case PH_REFINE:
             if (--p->refine_left <= 0) {
-                p->st = PH_MAINTAIN;
+                /* update6: sustained refinement — the tracker keeps
+                 * polling the REFINE grid around each next-cycle
+                 * prediction instead of coarsening to MAINTAIN.      */
+                p->st = PH_REFINE2;
             } else {
                 p->shift_idx++;
             }
+            break;
+        case PH_REFINE2:
+            /* stay: the rolling estimator needs fresh brackets for the
+             * full therapy duration; misses route through the miss
+             * path (widen + reacquire) like every other state.        */
             break;
         case PH_MAINTAIN:
             if (p->cfg.refine &&

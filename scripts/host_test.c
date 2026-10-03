@@ -1316,7 +1316,9 @@ static void test_update3(void)
         int64_t w0 = sot.hi_ms - sot.lo_ms;
         CHECK(drift_sot_apply(&sot, sot.ref_mono_us + 8LL * 3600 * 1000000,
                               &alo, &ahi), "SOT can be re-referenced");
-        CHECK(ahi - alo >= w0 + 14000,
+        /* 8 h at 100 ppm widens ~2.88 s per edge (+ extrapolation
+         * slack), not the arbitrary thousands the old units bug gave  */
+        CHECK(ahi - alo >= w0 + 5500 && ahi - alo <= w0 + 6500,
               "rate uncertainty expands persisted bound");
 
         nvs_stub_fail_writes(1);
@@ -1573,6 +1575,233 @@ static void test_update4(void)
     drift_timezone_set("UTC0", true);
 }
 
+/* ---------------- update6: rolling evidence + fallback ------------
+ * Bounded rolling transitions (32), a latest-completed-session NVS
+ * fallback, and the read-time current-vs-aged-fallback selector.     */
+
+static void test_update6(void)
+{
+    drift_profile_t base = *drift_profile();
+    drift_profile_t p = base;
+    p.stamp_channel_validated = false;
+    p.cache_bound_us = 0;
+    p.jitter_us = 0;
+    p.latency_lo_us = 0;
+    p.latency_hi_us = 0;
+    p.dev_rate_ppm = 50;
+    p.filename_origin_bounded = false;
+    p.filename_periodic_bounded = false;
+    drift_profile_set(&p);
+
+    const int64_t U = 1700000000LL * 1000000LL;
+    const int64_t D = 100;                    /* device +100 s        */
+    char ts[32];
+    cat_diff_t df;
+    drift_sel_t sel;
+    drift_sot_t fbr;
+    int64_t now = 0;
+
+    /* ---- rolling window: evidence past the old 96-stop behavior --- */
+    drift_reset();
+    nvs_stub_reset();
+    cat_init();
+    drift_sot_invalidate();
+    drift_timezone_set("UTC0", true);
+    drift_test_anchor(0, U, 2000, 41);
+    drift_test_anchor(3600LL * 1000 * 1000,
+                      U + 3600LL * 1000 * 1000, 2000, 41);
+    drift_live_begin("20240103");
+    drift_session_t *ls = drift_live();
+
+    /* file appears between scans -> creation event pins session start */
+    cat_feed_day("20240103", NULL, 0, 100000, &df);
+    drift_feed_scan(ls, "20240103", NULL, 0, &df, 100000, 120000);
+    fmt_stamp(U / 1000000 + 200 + D, ts);
+    ezs_entry_t fs[1] = { mk("20240103_220000_BRP.edf", 4096, ts, false) };
+    cat_feed_day("20240103", fs, 1, 200000, &df);
+    CHECK(drift_feed_scan(ls, "20240103", fs, 1, &df,
+                          200000, 220000) == 1, "creation event fed");
+
+    /* 150 flush transitions ≈ 2.5 h — well past the old 96-stop and
+     * the 32-event rolling window                                   */
+    for (int i = 1; i <= 150; i++) {
+        int64_t rq = (int64_t)i * 60000000;
+        feed_quiet("20240103", fs, 1, &df, rq - 200000, rq, ls);
+        fmt_stamp(U / 1000000 + 200 + D + i * 60, ts);
+        strcpy(fs[0].timestamp_raw, ts);
+        fs[0].size = 4096 + i * 512;
+        cat_feed_day("20240103", fs, 1, rq + 600000, &df);
+        CHECK(drift_feed_scan(ls, "20240103", fs, 1, &df,
+                              rq + 600000, rq + 800000) == 1,
+              "transition fed past old cap");
+        now = rq + 800000;
+    }
+    drift_sess_eval(ls, now);
+    CHECK(ls->n_ev == DRIFT_EV_CAP, "rolling window saturates, not stop");
+    CHECK(ls->ev_total == 151 && ls->ev_dropped == 151 - DRIFT_EV_CAP,
+          "planned evictions counted separately");
+    CHECK(!(ls->flag_bits & DF_EV_OVERFLOW),
+          "planned eviction is not an overflow flag");
+    CHECK(ls->have_ev0, "session-start bound survives eviction");
+    CHECK(ls->est_bound_valid, "estimate valid after the old cap");
+    /* stamps encode device time U_s+300+60i vs true U+60i -> -300 s  */
+    CHECK(ls->off_lo_us <= -300000000 && ls->off_hi_us >= -300000000,
+          "rolling estimate still contains true offset");
+
+    /* ---- session-end save: usable final -> fallback replaced ------- */
+    int64_t fb_half0;
+    CHECK(drift_finalize_fallback(now), "good final estimate saved");
+    CHECK(drift_fallback_view(&fbr) &&
+          fbr.quality == DRIFT_Q_PROVISIONAL &&
+          fbr.accuracy_half_ms <= DRIFT_SAVE_GOOD_MS,
+          "fallback record retained");
+    fb_half0 = fbr.accuracy_half_ms;
+
+    /* fresh current evidence always wins over a stored fallback      */
+    CHECK(drift_select(now, &sel) && sel.valid &&
+          sel.origin == DRIFT_SEL_CURRENT &&
+          !strcmp(sel.reason, "current_good_enough") &&
+          sel.fb_present,
+          "fresh current estimate selected");
+
+    /* ---- persist + reboot: freshness gate, then usable fallback ---- */
+    CHECK(drift_sot_commit(true, now) == ESP_OK, "fallback persisted");
+    drift_live_end(now);
+    drift_reset();                    /* reboot: anchors + RAM gone    */
+    CHECK(drift_sot_load() == ESP_OK &&
+          drift_fallback_view(&fbr) && fbr.freshness_unknown &&
+          fbr.origin == DRIFT_SOT_NVS,
+          "fallback restores freshness-unknown");
+    int64_t later = now + 3600LL * 1000 * 1000;   /* +1 h, <36 h TTL   */
+    CHECK(drift_select(later, &sel) && sel.fb_present &&
+          !sel.fb_eligible,
+          "unanchored fallback is not eligible");
+    drift_test_anchor(0, U, 2000, 42);
+    drift_test_anchor(3600LL * 1000 * 1000,
+                      U + 3600LL * 1000 * 1000, 2000, 42);
+    CHECK(drift_select(later, &sel) && sel.valid &&
+          sel.origin == DRIFT_SEL_FALLBACK &&
+          !strcmp(sel.reason, "no_current_candidate") &&
+          sel.half_ms == fbr.accuracy_half_ms + DRIFT_FB_ALLOW_MS,
+          "aged fallback supplies the correction at adjusted width");
+    CHECK(sel.fb_age_ms >= 3000000, "fallback age reported");
+
+    /* a too-old fallback expires: move decision past the 36 h TTL    */
+    int64_t past = now + 37LL * 3600 * 1000 * 1000;
+    CHECK(drift_select(past, &sel) && !sel.valid &&
+          !strcmp(sel.reason, "no_usable_correction"),
+          "expired fallback reports no usable correction");
+
+    /* ---- save semantics: wider NEW final still replaces ------------- */
+    drift_live_begin("20240103");
+    ls = drift_live();
+    cat_feed_day("20240103", NULL, 0, past, &df);
+    drift_feed_scan(ls, "20240103", NULL, 0, &df, past, past + 200000);
+    fmt_stamp(U / 1000000 + 200 + D + past / 1000000, ts);
+    fs[0] = mk("20240103_230000_BRP.edf", 4096, ts, false);
+    cat_feed_day("20240103", fs, 1, past + 400000, &df);
+    drift_feed_scan(ls, "20240103", fs, 1, &df,
+                    past + 400000, past + 420000);
+    for (int i = 1; i <= 3; i++) {
+        int64_t rq = past + (int64_t)i * 60000000;
+        feed_quiet("20240103", fs, 1, &df, rq - 200000, rq, ls);
+        fmt_stamp(U / 1000000 + 200 + D + past / 1000000 + i * 60, ts);
+        strcpy(fs[0].timestamp_raw, ts);
+        fs[0].size = 4096 + i * 512;
+        cat_feed_day("20240103", fs, 1, rq + 600000, &df);
+        drift_feed_scan(ls, "20240103", fs, 1, &df,
+                        rq + 600000, rq + 800000);
+        now = rq + 800000;
+    }
+    drift_sess_eval(ls, now);
+    CHECK(ls->n_windows >= 3 && ls->est_bound_valid,
+          "second session produced usable estimate");
+    /* force a wider final width than the stored fallback's            */
+    int64_t mid = (ls->off_lo_us + ls->off_hi_us) / 2;
+    if (fb_half0 >= 1800) {          /* keep the test width ordered    */
+        ls->off_lo_us = mid - (fb_half0 + 400) * 1000;
+        ls->off_hi_us = mid + (fb_half0 + 400) * 1000;
+    } else {
+        ls->off_lo_us = mid - 1900000;
+        ls->off_hi_us = mid + 1900000;
+    }
+    int64_t want_half = (ls->off_hi_us - ls->off_lo_us) / 2000;
+    CHECK(!drift_finalize_fallback(now + 200000000),
+          "stale reference is never saved (§12.6)");
+    CHECK(drift_finalize_fallback(now),
+          "wider final estimate still saves");
+    CHECK(drift_fallback_view(&fbr) &&
+          fbr.accuracy_half_ms >= want_half - 1,
+          "latest completed session replaced regardless of width");
+    int64_t fb_ref = fbr.reference_at_ms;
+
+    /* ---- commit failure: dirty survives, bounded retry, success ---- */
+    CHECK(drift_sot_commit(true, now) == ESP_OK && !drift_sot_dirty(),
+          "pre-test commit flushes every slot");
+    CHECK(drift_finalize_fallback(now), "candidate accepted again");
+    nvs_stub_fail_writes(1);            /* only fb is dirty -> fb fails */
+    CHECK(drift_sot_commit(true, now) != ESP_OK,
+          "failed fb commit surfaces");
+    CHECK(drift_sot_dirty(), "fb record stays dirty after failure");
+    CHECK(drift_fallback_view(&fbr) && fbr.dirty &&
+          fbr.reference_at_ms == fb_ref,
+          "failed commit keeps original reference");
+    CHECK(drift_sot_commit(false, now + 5000000) == ESP_OK &&
+          drift_sot_dirty(),
+          "same-minute retry is deferred, still dirty");
+    CHECK(drift_sot_commit(false, now + 61000000) == ESP_OK &&
+          !drift_sot_dirty(),
+          "bounded retry persists and clears dirty");
+
+    /* ---- below the save gate the old record is kept untouched ------ */
+    ls->off_lo_us = mid - 2600000;   /* usable provisional, > 2 s gate */
+    ls->off_hi_us = mid + 2600000;
+    CHECK(!drift_finalize_fallback(now), "below save gate keeps old");
+    CHECK(drift_fallback_view(&fbr) &&
+          fbr.reference_at_ms == fb_ref,
+          "old fallback age is never refreshed");
+
+    /* ---- read-time selector margins --------------------------------- */
+    /* fallback adjusted = stored half + 1000 ms                       */
+    ls->off_lo_us = mid - 4400000;   /* current ~4.4 s half            */
+    ls->off_hi_us = mid + 4400000;
+    CHECK(drift_select(now, &sel) && sel.valid &&
+          sel.origin == DRIFT_SEL_FALLBACK &&
+          !strcmp(sel.reason, "fallback_materially_better"),
+          "materially better aged fallback wins");
+    ls->off_lo_us = mid - 3300000;   /* current ~3.3 s: comparable     */
+    ls->off_hi_us = mid + 3300000;
+    CHECK(drift_select(now, &sel) && sel.valid &&
+          sel.origin == DRIFT_SEL_CURRENT &&
+          !strcmp(sel.reason, "current_fresher_or_comparable"),
+          "comparable current preferred over aged fallback");
+
+    /* model incompatibility on restore marks the record ineligible   */
+    drift_sot_commit(true, now);
+    drift_profile_t bad = p;
+    bad.model_rev++;
+    drift_profile_set(&bad);
+    drift_reset();
+    CHECK(drift_sot_load() == ESP_OK &&
+          drift_fallback_view(&fbr) && fbr.stale,
+          "incompatible model marks fallback stale");
+    drift_test_anchor(0, U, 2000, 43);
+    CHECK(drift_select(now, &sel) && !sel.fb_eligible,
+          "stale fallback is never selected");
+    drift_profile_set(&p);
+
+    /* corrupt fallback blob -> ignored, never fabricated             */
+    drift_reset();
+    nvs_stub_corrupt("drift_fb");
+    drift_sot_invalidate();
+    drift_sot_load();
+    CHECK(!drift_fallback_view(&fbr),
+          "corrupt fallback blob rejected");
+
+    drift_live_end(now);
+    drift_profile_set(&base);
+}
+
 /* ---------------- phase tracker (update2 §3) --------------------
  * Drive the tracker over a synthetic 60 s flush at a fixed phase and
  * a 240 ms service time. A pull "executes" at its due instant; the
@@ -1735,6 +1964,59 @@ static void test_phase(void)
                                      .enabled = false });
     CHECK(phase_due(&p, 80000000, sim_svc_us, &due, &gap) &&
           gap == 0, "disabled -> fixed watch spacing");
+
+    /* update6: with refinement enabled the ladder ends in sustained
+     * REFINE2 — a centered 0.5 s cluster every cycle for the whole
+     * therapy duration, never the coarser long-term MAINTAIN.       */
+    phase_init(&p);
+    phase_config(&p, &(phase_cfg_t){ .watch_gap_us = 5000000,
+                                     .rate_ppm = 500, .enabled = true,
+                                     .refine = true });
+    sim_fl_next = 13700000;
+    phase_track(&p, "20240106", true);
+    now = 0;
+    sim_run(&p, &now, 420000000);
+    CHECK(p.st == PH_REFINE2, "ladder ends in sustained refine2");
+    CHECK(p.n_brackets >= 5, "ladder + refine brackets collected");
+    uint32_t b0 = p.n_brackets;
+    sim_run(&p, &now, now + 11LL * 60000000);
+    CHECK(p.st == PH_REFINE2, "refine2 persists across many cycles");
+    CHECK(p.n_brackets >= b0 + 8,
+          "refine2 keeps bracketing every cycle");
+    CHECK(!p.n_misses, "no misses under sustained refinement");
+    CHECK(p.spacing_us >= 500000,
+          "sustained spacing never below the 500 ms floor");
+    CHECK(p.pull_total >= 3, "cluster covers >= 3 starts");
+    /* the cluster centers on each next-cycle prediction: its arm
+     * instant tracks the predicted update, not a frozen offset      */
+    int64_t m0 = p.mark_us;
+    sim_run(&p, &now, now + 70000000);
+    CHECK(p.mark_us > m0, "prediction keeps moving with the card phase");
+
+    /* coverage needing more than the pull cap falls back explicitly —
+     * never a silently truncated edge                                 */
+    p.pred_hi_us = p.pred_lo_us + 6000000;   /* widen the declared fit */
+    p.armed = false;
+    now = p.pred_lo_us + 1;
+    phase_due(&p, now, sim_svc_us, &due, &gap);
+    CHECK(p.st == PH_HUNT, "over-cap coverage -> reacquire");
+
+    /* flush phase moves: refine2 still tracks, in both directions    */
+    phase_init(&p);
+    phase_config(&p, &(phase_cfg_t){ .watch_gap_us = 5000000,
+                                     .rate_ppm = 500, .enabled = true,
+                                     .refine = true });
+    sim_fl_next = 13700000;
+    phase_track(&p, "20240107", true);
+    now = 0;
+    sim_run(&p, &now, 420000000);
+    CHECK(p.st == PH_REFINE2, "refine2 reached for shift test");
+    sim_fl_next += 1500000;            /* card flush moved +1.5 s      */
+    uint32_t m0n = p.n_misses;
+    sim_run(&p, &now, now + 200000000);
+    CHECK(p.st != PH_WATCH,
+          "tracker follows the moved phase");
+    (void)m0n;
 }
 
 static void test_edf(void)
@@ -1830,6 +2112,7 @@ int main(void)
     test_sot();
     test_update3();
     test_update4();
+    test_update6();
     test_phase();
     test_edf();
     test_journal();

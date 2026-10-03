@@ -48,6 +48,7 @@ static bool            s_closed;   /* session ended, data retained    */
 static void sot_consider(const drift_session_t *s, int64_t now_us);
 static void sot_anchor_ready(void);
 static void sot_mark_stale(bool filename_only);
+static esp_err_t fb_load(nvs_handle_t h);
 static uint64_t assumption_mask(const drift_session_t *s,
                                 const drift_profile_t *p);
 static int64_t us_floor_ms(int64_t us);
@@ -278,7 +279,7 @@ static drift_profile_t s_prof = {
      * filename seconds encoding not separable from this data -> UNKNOWN.
      * *_validated stay false: bounds are honest but wide; nothing reaches
      * the 2 s qualified gate until dense-poll latency characterization. */
-    .model_rev               = 4,
+    .model_rev               = 5,
     .filename_encoding       = DRIFT_ENC_UNKNOWN,
     .filename_origin_bounded = true,
     .fname_create_lo_us      = -3000000,
@@ -768,7 +769,8 @@ static void obs_note(drift_session_t *s, drift_ev_kind_t kind,
         .seq = ++s->obs_seq,
         .unch_seq = unch_seq,
         .chg_seq = chg_seq,
-        .ev_index = s->n_ev < DRIFT_EV_CAP ? s->n_ev : -1,
+        .ev_index = (int32_t)s->ev_total,   /* monotonic event id —
+             * rolling-buffer indices are positional, never identities */
         .kind = (uint8_t)kind,
         .stamp_s = stamp_s,
         .unch_req_us = unch_req_us,
@@ -825,16 +827,28 @@ static void obs_note(drift_session_t *s, drift_ev_kind_t kind,
 static void push_ev(drift_session_t *s, drift_ev_kind_t kind,
                     int64_t stamp_s, int64_t obs_lo, int64_t obs_hi)
 {
-    if (s->n_ev >= DRIFT_EV_CAP) {
-        s->ev_overflow = true;
-        s->flag_bits |= DF_EV_OVERFLOW;
-        return;
-    }
-    s->ev[s->n_ev++] = (drift_ev_t){
+    drift_ev_t e = {
         .obs_lo_us = obs_lo, .obs_hi_us = obs_hi,
         .stamp_s = stamp_s, .kind = (uint8_t)kind,
         .fname_gen = s->fname_gen,
     };
+    if (kind == DRIFT_EV_CREATE && !s->have_ev0) {
+        /* session-start/creation metadata is pinned outside the rolling
+         * window so eviction can never erase the session origin (u6)  */
+        s->ev0 = e;
+        s->have_ev0 = true;
+    }
+    if (s->n_ev >= DRIFT_EV_CAP) {
+        /* Rolling recent evidence: drop the oldest retained event and
+         * keep collecting — a planned eviction counted in ev_dropped,
+         * NOT DF_EV_OVERFLOW (that flag stays for true diff loss).    */
+        memmove(&s->ev[0], &s->ev[1],
+                (DRIFT_EV_CAP - 1) * sizeof(s->ev[0]));
+        s->n_ev = DRIFT_EV_CAP - 1;
+        s->ev_dropped++;
+    }
+    s->ev[s->n_ev++] = e;
+    s->ev_total++;
 }
 
 int drift_feed_scan(drift_session_t *s, const char *day,
@@ -854,8 +868,9 @@ int drift_feed_scan(drift_session_t *s, const char *day,
         prev_resp = 0;               /* catalog kept no response edge   */
         prev_seq = 0;
     }
-    int before = s->n_ev;
+    int64_t before = s->ev_total;
     if (diff && diff->overflowed) {
+        s->ev_overflow = true;
         s->flag_bits |= DF_EV_OVERFLOW;
     }
 
@@ -964,7 +979,7 @@ int drift_feed_scan(drift_session_t *s, const char *day,
     if (!prev) {
         s->baseline_bounded = false;
     }
-    return s->n_ev - before;
+    return (int)(s->ev_total - before);
 }
 
 /* ---------------- estimate evaluation ---------------- */
@@ -1034,7 +1049,7 @@ static void publish(const drift_session_t *s, int64_t now_us)
     r.source = s->preferred_source;
     r.quality = s->tier == ACC_ACCURATE ? DRIFT_Q_QUALIFIED :
                 s->est_bound_valid ? DRIFT_Q_PROVISIONAL : DRIFT_Q_NONE;
-    snprintf(r.model_id, sizeof(r.model_id), "u4_profile_%u",
+    snprintf(r.model_id, sizeof(r.model_id), "u5_profile_%u",
              (unsigned)p->model_rev);
     r.model_rev = p->model_rev;
     r.cache_policy = p->cache_policy;
@@ -1057,7 +1072,10 @@ static void publish(const drift_session_t *s, int64_t now_us)
         if (!ok) r.computed_at_ms = 0;
         r.reference_at_ms = map_mid_ms(s->ref_mono_us, &ok);
         if (!ok) r.reference_at_ms = 0;
+        r.ref_mono_us = s->ref_mono_us;
     }
+    r.ev_total = s->ev_total;
+    r.ev_dropped = s->ev_dropped;
     r.candidates[0].source = DRIFT_SRC_MTIME;
     r.candidates[1].source = DRIFT_SRC_FNAME_CREATE;
     r.candidates[2].source = DRIFT_SRC_FNAME_PERIODIC;
@@ -1114,11 +1132,12 @@ static void publish(const drift_session_t *s, int64_t now_us)
         r.period_lo_ms = s->per_lo_ms;
         r.period_hi_ms = s->per_hi_ms;
     }
-    /* session-start bound: the beacon's creation window, if seen     */
-    if (s->n_ev && s->ev[0].kind == DRIFT_EV_CREATE) {
+    /* session-start bound: the beacon's creation window, if seen —
+     * pinned in ev0 so rolling eviction never erases it (u6)         */
+    if (s->have_ev0) {
         int64_t lo, hi, lo2, hi2;
-        if (drift_map_utc(s->ev[0].obs_lo_us, &lo, &hi) &&
-            drift_map_utc(s->ev[0].obs_hi_us, &lo2, &hi2)) {
+        if (drift_map_utc(s->ev0.obs_lo_us, &lo, &hi) &&
+            drift_map_utc(s->ev0.obs_hi_us, &lo2, &hi2)) {
             r.has_point = true;
             r.start_lo_ms = us_floor_ms(lo);
             r.start_hi_ms = us_ceil_ms(hi2);
@@ -1217,6 +1236,15 @@ static int64_t     s_sot_committed_half[DRIFT_SOT_N];
 static uint32_t    s_sot_persist_seq[DRIFT_SOT_N];
 static char        s_card_fw[24];
 
+/* Latest COMPLETED-session fallback (update6 §10): a single NVS record
+ * replaced wholesale at therapy end whenever the final estimate meets
+ * the save gate — never a best-ever/hysteresis record. s_sot slots
+ * remain as historical diagnostics only.                             */
+static drift_sot_t s_fb;
+static bool        s_fb_dirty;
+static int64_t     s_fb_last_store_us;
+static uint32_t    s_fb_persist_seq;
+
 const char *drift_source_name(uint8_t source)
 {
     switch (source) {
@@ -1277,7 +1305,7 @@ bool drift_sot_best(drift_sot_t *out)
 bool drift_sot_dirty(void)
 {
     return s_sot_dirty[DRIFT_SOT_PROVISIONAL] ||
-           s_sot_dirty[DRIFT_SOT_QUALIFIED];
+           s_sot_dirty[DRIFT_SOT_QUALIFIED] || s_fb_dirty;
 }
 
 static void sot_anchor_ready(void)
@@ -1290,6 +1318,11 @@ static void sot_anchor_ready(void)
             s_sot[i].freshness_unknown = false;
             s_sot[i].applicable = true;
         }
+    }
+    if (s_fb.valid && !s_fb.stale &&
+        (s_fb.quality != DRIFT_Q_QUALIFIED || anchor_quality_ok())) {
+        s_fb.freshness_unknown = false;
+        s_fb.applicable = true;
     }
 }
 
@@ -1304,6 +1337,13 @@ static void sot_mark_stale(bool filename_only)
         s_sot[i].applicable = false;
         s_sot[i].dirty = true;
         s_sot_dirty[i] = true;
+    }
+    if (s_fb.valid &&
+        !(filename_only && s_fb.source == DRIFT_SRC_MTIME)) {
+        s_fb.stale = true;
+        s_fb.applicable = false;
+        s_fb.dirty = true;
+        s_fb_dirty = true;
     }
     drift_jrn("sot", "\"e\":\"stale\",\"filename_only\":%s",
               filename_only ? "true" : "false");
@@ -1364,8 +1404,9 @@ static void sot_fill(drift_sot_t *r, const drift_session_t *s,
     if (!ok) r->reference_at_ms = 0;
     r->ref_mono_us = s->ref_mono_us;
     r->observations = s->n_windows;
+    r->anchor_epoch = s_nanchors ? s_anchors[s_nanchors - 1].source_epoch : 0;
     r->model_rev = p->model_rev;
-    snprintf(r->model_id, sizeof(r->model_id), "u4_profile_%u",
+    snprintf(r->model_id, sizeof(r->model_id), "u5_profile_%u",
              (unsigned)p->model_rev);
     r->cache_policy = p->cache_policy;
     r->visibility_policy = p->visibility_policy;
@@ -1478,6 +1519,225 @@ static void sot_consider(const drift_session_t *s, int64_t now_us)
     }
 }
 
+/* The same validity gates as sot_consider, packaged as a candidate
+ * for the update6 selector and the session-end fallback save: a valid
+ * estimate on one clock segment, anchored, with no unresolved-source
+ * contradiction and enough observations for its quality tier.       */
+static bool sess_candidate(const drift_session_t *s, int64_t now_us,
+                           drift_sot_t *cand)
+{
+    const drift_profile_t *p = drift_profile();
+    if (s->flag_bits & (DF_BACKWARD | DF_STEP)) return false;
+    bool source_unresolved =
+        (s->preferred_source == DRIFT_SRC_FNAME_CREATE &&
+         (s->flag_bits & DF_FNAME_ORIGIN)) ||
+        (s->preferred_source == DRIFT_SRC_FNAME_PERIODIC &&
+         (s->flag_bits & (DF_FNAME_ORIGIN | DF_CYCLE_AMBIG)));
+    if (!s->est_bound_valid || !s->anchor_used || s->n_segments != 1 ||
+        source_unresolved ||
+        (s->flag_bits & (DF_CONTRADICTION | DF_SOURCE_DISAGREE))) {
+        return false;
+    }
+    int64_t half_us = (s->off_hi_us - s->off_lo_us) / 2;
+    uint8_t q;
+    if (source_validated(p, s->preferred_source) &&
+        anchor_quality_ok() && s->n_windows >= 2 &&
+        half_us <= (int64_t)p->accurate_half_us) {
+        q = DRIFT_Q_QUALIFIED;
+    } else if (s->n_windows >= 3 &&
+               half_us <= (int64_t)p->provisional_half_us) {
+        q = DRIFT_Q_PROVISIONAL;
+    } else {
+        return false;
+    }
+    sot_fill(cand, s, p, q, now_us);
+    return cand->computed_at_ms && cand->reference_at_ms;
+}
+
+/* Transport a measurement interval to now_us under the configured
+ * rate-uncertainty allowance: widen each edge by elapsed*dev_rate_ppm.
+ * Returns the widened half-width in ms (0 when dt<=0).              */
+static int64_t transport_widen_ms(int64_t from_mono_us, int64_t now_us)
+{
+    int64_t dt = now_us - from_mono_us;
+    if (dt <= 0) return 0;
+    return (dt * (int64_t)drift_profile()->dev_rate_ppm +
+            999999999LL) / 1000000000LL;
+}
+
+/* ---- previous-session fallback: selection + NVS record (update6) -- */
+
+bool drift_select(int64_t now_us, drift_sel_t *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    const drift_profile_t *p = drift_profile();
+    const drift_session_t *s = drift_last();
+
+    /* current-session candidate: valid estimate on the newest
+     * reference, still fresh (reference within the live window)      */
+    drift_sot_t c;
+    bool have_c = false;
+    int64_t c_widen_ms = 0, c_eff_half = 0;
+    if (s && s->est_bound_valid) {
+        out->cur_present = true;
+        out->cur_meas_half_ms =
+            (us_ceil_ms(s->off_hi_us) - us_floor_ms(s->off_lo_us)) / 2;
+        out->cur_eff_half_ms = out->cur_meas_half_ms;
+    }
+    if (s && sess_candidate(s, now_us, &c) &&
+        c.ref_mono_us <= now_us &&
+        now_us - c.ref_mono_us <= DRIFT_CUR_REF_MAX_US) {
+        c_widen_ms = transport_widen_ms(c.ref_mono_us, now_us);
+        c_eff_half = c.accuracy_half_ms + c_widen_ms;
+        out->cur_fresh = true;
+        out->cur_meas_half_ms = c.accuracy_half_ms;
+        out->cur_eff_half_ms = c_eff_half;
+        have_c = c_eff_half <= DRIFT_USABLE_HALF_MS;
+    }
+
+    /* previous-session fallback eligibility: aged against the current
+     * UTC map, model-compatible, inside its expiry, never used at its
+     * stored width — a fixed allowance accounts for elapsed movement */
+    int64_t f_age = -1, f_adj = 0;
+    bool f_elig = false;
+    if (s_fb.valid) {
+        out->fb_present = true;
+        int64_t ulo, uhi;
+        if (!s_fb.stale && !s_fb.freshness_unknown &&
+            s_fb.reference_at_ms > 0 &&
+            s_fb.model_rev == p->model_rev &&
+            drift_map_utc(now_us, &ulo, &uhi)) {
+            f_age = us_floor_ms(uhi) - s_fb.reference_at_ms;
+            if (f_age >= 0 && f_age <= DRIFT_FB_MAX_AGE_MS) {
+                f_adj = s_fb.accuracy_half_ms + DRIFT_FB_ALLOW_MS;
+                f_elig = f_adj <= DRIFT_USABLE_HALF_MS;
+            }
+        }
+    }
+    out->fb_eligible = f_elig;
+    out->fb_age_ms = f_age;
+    out->fb_adj_half_ms = f_adj;
+
+    /* decision order (update6 §8.5): qualified current first, then a
+     * good-enough current, then a materially better eligible fallback,
+     * then a merely-usable current; nothing is never masked.         */
+    const drift_sot_t *win = NULL;
+    int64_t win_lo = 0, win_hi = 0, win_half = 0, win_adj = 0;
+    if (have_c && c.quality == DRIFT_Q_QUALIFIED &&
+        c_eff_half <= DRIFT_SAVE_GOOD_MS) {
+        out->origin = DRIFT_SEL_CURRENT;
+        snprintf(out->reason, sizeof(out->reason), "current_qualified");
+        win = &c;
+        win_lo = c.lo_ms - c_widen_ms; win_hi = c.hi_ms + c_widen_ms;
+        win_half = c_eff_half; win_adj = c_widen_ms;
+    } else if (have_c && c_eff_half <= DRIFT_SAVE_GOOD_MS) {
+        out->origin = DRIFT_SEL_CURRENT;
+        snprintf(out->reason, sizeof(out->reason),
+                 "current_good_enough");
+        win = &c;
+        win_lo = c.lo_ms - c_widen_ms; win_hi = c.hi_ms + c_widen_ms;
+        win_half = c_eff_half; win_adj = c_widen_ms;
+    } else if (f_elig &&
+               (!have_c || f_adj + DRIFT_FB_ADV_MS <= c_eff_half)) {
+        out->origin = DRIFT_SEL_FALLBACK;
+        snprintf(out->reason, sizeof(out->reason), "%s",
+                 !have_c ? "no_current_candidate"
+                         : "fallback_materially_better");
+        win = &s_fb;
+        win_lo = s_fb.lo_ms - DRIFT_FB_ALLOW_MS;
+        win_hi = s_fb.hi_ms + DRIFT_FB_ALLOW_MS;
+        win_half = f_adj; win_adj = DRIFT_FB_ALLOW_MS;
+    } else if (have_c) {
+        out->origin = DRIFT_SEL_CURRENT;
+        snprintf(out->reason, sizeof(out->reason),
+                 "current_fresher_or_comparable");
+        win = &c;
+        win_lo = c.lo_ms - c_widen_ms; win_hi = c.hi_ms + c_widen_ms;
+        win_half = c_eff_half; win_adj = c_widen_ms;
+    } else {
+        snprintf(out->reason, sizeof(out->reason),
+                 "no_usable_correction");
+        return true;
+    }
+    out->valid = true;
+    /* §12.10: assumed-age use of even a qualified stored measurement
+     * is provisional — the record keeps its measured quality, the
+     * selection does not.                                            */
+    out->quality = out->origin == DRIFT_SEL_FALLBACK
+                 ? DRIFT_Q_PROVISIONAL : win->quality;
+    out->source = win->source;
+    out->lo_ms = win_lo;
+    out->hi_ms = win_hi;
+    out->half_ms = win_half;
+    out->meas_lo_ms = win->lo_ms;
+    out->meas_hi_ms = win->hi_ms;
+    out->meas_half_ms = win->accuracy_half_ms;
+    out->reference_at_ms = win->reference_at_ms;
+    out->computed_at_ms = win->computed_at_ms;
+    out->ref_age_ms = out->origin == DRIFT_SEL_FALLBACK
+                    ? f_age : (now_us - c.ref_mono_us) / 1000;
+    out->age_adj_ms = win_adj;
+    out->model_rev = win->model_rev;
+    out->assumptions = win->assumptions;
+    out->cache_policy = win->cache_policy;
+    out->visibility_policy = win->visibility_policy;
+    snprintf(out->model_id, sizeof(out->model_id), "%s", win->model_id);
+    snprintf(out->source_reason, sizeof(out->source_reason), "%s",
+             win->source_reason);
+    return true;
+}
+
+bool drift_fallback_view(drift_sot_t *out)
+{
+    if (!out || !s_fb.valid) return false;
+    *out = s_fb;
+    return true;
+}
+
+/* Confirmed-therapy-OUT save (update6 §10.1): the newest usable final
+ * session estimate replaces the stored record unconditionally — width
+ * is never compared against the previous record. Below the save gate
+ * the old record is kept untouched: its age is never refreshed.      */
+bool drift_finalize_fallback(int64_t now_us)
+{
+    drift_session_t *s = drift_live();
+    if (!s) return false;
+    drift_sot_t cand;
+    if (!sess_candidate(s, now_us, &cand)) {
+        drift_jrn("fallback", "\"e\":\"no_final_candidate\"");
+        return false;
+    }
+    /* spec §12.6: evidence whose newest reference is older than the
+     * live freshness window is not a "final session estimate" — it is
+     * an aged observation and must not be persisted.                */
+    if (now_us - cand.ref_mono_us > DRIFT_CUR_REF_MAX_US) {
+        drift_jrn("fallback", "\"e\":\"ref_stale\",\"age_us\":%lld",
+                  (long long)(now_us - cand.ref_mono_us));
+        return false;
+    }
+    if (cand.accuracy_half_ms +
+        transport_widen_ms(cand.ref_mono_us, now_us) >
+        DRIFT_SAVE_GOOD_MS) {
+        drift_jrn("fallback", "\"e\":\"below_save_gate\",\"half\":%lld",
+                  (long long)(cand.accuracy_half_ms +
+                              transport_widen_ms(cand.ref_mono_us,
+                                                 now_us)));
+        return false;
+    }
+    uint32_t seq = s_fb.persisted_seq;
+    s_fb = cand;
+    s_fb.persisted_seq = seq;
+    s_fb.dirty = true;
+    s_fb_dirty = true;
+    drift_jrn("fallback", "\"e\":\"save\",\"q\":\"%s\",\"half\":%lld,"
+                        "\"obs\":%u",
+              drift_quality_name(s_fb.quality),
+              (long long)s_fb.accuracy_half_ms,
+              (unsigned)s_fb.observations);
+    return true;
+}
+
 bool drift_sot_apply(const drift_sot_t *s, int64_t now_us,
                      int64_t *lo_ms, int64_t *hi_ms)
 {
@@ -1487,7 +1747,7 @@ bool drift_sot_apply(const drift_sot_t *s, int64_t now_us,
     }
     int64_t ulo, uhi;
     if (!drift_map_utc(now_us, &ulo, &uhi)) return false;
-    int64_t elapsed_ms = uhi - s->reference_at_ms;
+    int64_t elapsed_ms = (uhi - s->reference_at_ms * 1000) / 1000;
     if (elapsed_ms < 0) elapsed_ms = 0;
     int64_t widen_ms = elapsed_ms * (int64_t)s->dev_rate_ppm / 1000000;
     *lo_ms = s->lo_ms - widen_ms;
@@ -1507,6 +1767,12 @@ void drift_card_fw_note(const char *fw)
             s_sot[i].dirty = true;
             s_sot_dirty[i] = true;
         }
+    }
+    if (s_fb.valid && s_fb.card_fw[0] && strcmp(s_fb.card_fw, fw)) {
+        s_fb.stale = true;
+        s_fb.applicable = false;
+        s_fb.dirty = true;
+        s_fb_dirty = true;
     }
     if (changed) {
         /* card firmware/identity changed underneath us — persisted
@@ -1918,7 +2184,7 @@ static void sot_from_blob(drift_sot_slot_t slot, const sot_v2_blob_t *b)
     r->model_rev = b->model_rev;
     r->cache_policy = b->rsv1[0];
     r->visibility_policy = b->rsv1[1];
-    snprintf(r->model_id, sizeof(r->model_id), "u4_profile_%u",
+    snprintf(r->model_id, sizeof(r->model_id), "u5_profile_%u",
              (unsigned)b->model_rev);
     r->persisted_seq = b->seq;
     r->origin = DRIFT_SOT_NVS;
@@ -2042,7 +2308,218 @@ esp_err_t drift_sot_load(void)
     if (eq == ESP_ERR_NVS_NOT_FOUND || eq == ESP_ERR_NOT_FOUND) {
         eq = sot_load_legacy(h);
     }
-    return ep == ESP_OK || eq == ESP_OK ? ESP_OK : eq;
+    esp_err_t ef = fb_load(h);
+    return ep == ESP_OK || eq == ESP_OK || ef == ESP_OK ? ESP_OK : eq;
+}
+
+/* ---- completed-session fallback blob (update6 §10.2) ---------------
+ * Single authoritative record: the newest session whose final
+ * estimate met the save gate. Same field discipline as the v2 SOT
+ * blob plus the anchor epoch; corrupt/truncated data is ignored.     */
+
+#define FB_KEY      "drift_fb"
+#define FB_MAGIC    0x46423131u   /* "FB11" */
+#define FB_VERSION  1
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t  version;
+    uint8_t  quality;
+    uint8_t  source;
+    uint8_t  encoding;
+    uint8_t  stale;
+    uint8_t  rsv1[3];
+    uint32_t seq;
+    uint32_t model_rev;
+    uint32_t anchor_epoch;
+    uint64_t assumptions;
+    uint16_t observations;
+    uint16_t rsv2;
+    int64_t  drift_ms;
+    int64_t  lo_ms, hi_ms;
+    int64_t  half_ms;
+    int64_t  comp_ms;
+    int64_t  ref_ms;
+    uint32_t cache_us;
+    int32_t  latency_lo_us;
+    int32_t  latency_hi_us;
+    uint32_t jitter_us;
+    uint32_t rate_ppm;
+    int32_t  fname_lo_us;
+    int32_t  fname_hi_us;
+    int64_t  period_us;
+    char     reason[24];
+    char     fw[24];
+    uint32_t crc32;
+} fb_blob_t;
+
+static bool fb_record_sane(const fb_blob_t *b)
+{
+    return b->magic == FB_MAGIC && b->version == FB_VERSION &&
+           (b->quality == DRIFT_Q_PROVISIONAL ||
+            b->quality == DRIFT_Q_QUALIFIED) &&
+           b->source <= DRIFT_SRC_FNAME_PERIODIC &&
+           b->encoding <= DRIFT_ENC_ROUNDED &&
+           b->lo_ms <= b->hi_ms && b->half_ms >= 0 &&
+           b->half_ms <= DRIFT_SAVE_GOOD_MS &&
+           b->ref_ms != 0 && b->comp_ms != 0 &&
+           b->rsv1[0] <= DRIFT_CACHE_CHARACTERIZED &&
+           b->rsv1[1] <= DRIFT_VIS_CHARACTERIZED &&
+           b->cache_us <= 10000000 && b->latency_lo_us >= 0 &&
+           b->latency_hi_us >= b->latency_lo_us &&
+           b->jitter_us <= 10000000 && b->rate_ppm <= 10000 &&
+           b->fname_lo_us <= b->fname_hi_us;
+}
+
+static bool fb_model_matches(const fb_blob_t *b,
+                             const drift_profile_t *p)
+{
+    int64_t flo = b->source == DRIFT_SRC_FNAME_PERIODIC
+                ? p->fname_period_lo_us : p->fname_create_lo_us;
+    int64_t fhi = b->source == DRIFT_SRC_FNAME_PERIODIC
+                ? p->fname_period_hi_us : p->fname_create_hi_us;
+    return b->model_rev == p->model_rev &&
+           b->rsv1[0] == p->cache_policy &&
+           b->rsv1[1] == p->visibility_policy &&
+           b->cache_us == p->cache_bound_us &&
+           b->latency_lo_us == (int32_t)p->latency_lo_us &&
+           b->latency_hi_us == (int32_t)p->latency_hi_us &&
+           b->jitter_us == p->jitter_us &&
+           b->rate_ppm == p->dev_rate_ppm &&
+           b->encoding == p->filename_encoding &&
+           b->fname_lo_us == flo && b->fname_hi_us == fhi;
+}
+
+static esp_err_t fb_load(nvs_handle_t h)
+{
+    fb_blob_t b;
+    size_t want = sizeof(b);
+    esp_err_t err = nvs_get_blob(h, FB_KEY, &b, &want);
+    if (err != ESP_OK) return err;
+    if (want != sizeof(b) || !fb_record_sane(&b) ||
+        esp_crc32_le(0, (const uint8_t *)&b,
+                     offsetof(fb_blob_t, crc32)) != b.crc32) {
+        ESP_LOGW(TAG, "%s invalid — ignored", FB_KEY);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    drift_sot_t *r = &s_fb;
+    memset(r, 0, sizeof(*r));
+    r->valid = true;
+    r->stale = b.stale != 0;
+    r->freshness_unknown = true;   /* needs a live anchor before use   */
+    r->clock_drift_ms = b.drift_ms;
+    r->lo_ms = b.lo_ms;
+    r->hi_ms = b.hi_ms;
+    r->accuracy_half_ms = b.half_ms;
+    r->computed_at_ms = b.comp_ms;
+    r->reference_at_ms = b.ref_ms;
+    r->quality = b.quality;
+    r->source = b.source;
+    r->observations = b.observations;
+    r->filename_encoding = b.encoding;
+    r->filename_period_us = b.period_us;
+    r->anchor_epoch = b.anchor_epoch;
+    r->assumptions = b.assumptions;
+    r->cache_bound_us = b.cache_us;
+    r->latency_lo_us = b.latency_lo_us;
+    r->latency_hi_us = b.latency_hi_us;
+    r->jitter_us = b.jitter_us;
+    r->dev_rate_ppm = b.rate_ppm;
+    r->fname_lo_us = b.fname_lo_us;
+    r->fname_hi_us = b.fname_hi_us;
+    r->model_rev = b.model_rev;
+    r->cache_policy = b.rsv1[0];
+    r->visibility_policy = b.rsv1[1];
+    snprintf(r->model_id, sizeof(r->model_id), "u5_profile_%u",
+             (unsigned)b.model_rev);
+    r->persisted_seq = b.seq;
+    r->origin = DRIFT_SOT_NVS;
+    memcpy(r->source_reason, b.reason, sizeof(r->source_reason));
+    r->source_reason[sizeof(r->source_reason) - 1] = '\0';
+    memcpy(r->card_fw, b.fw, sizeof(r->card_fw));
+    r->card_fw[sizeof(r->card_fw) - 1] = '\0';
+    s_fb_persist_seq = b.seq;
+    s_fb_dirty = false;
+    if (!fb_model_matches(&b, drift_profile())) {
+        /* A record written by another timing model may be inspected
+         * but must never be applied as the fallback.                 */
+        r->stale = true;
+        r->applicable = false;
+        r->dirty = true;
+        s_fb_dirty = true;
+        drift_jrn("fallback", "\"e\":\"model_incompatible\","
+                  "\"blob_rev\":%lu,\"active_rev\":%lu",
+                  (unsigned long)b.model_rev,
+                  (unsigned long)drift_profile()->model_rev);
+    }
+    drift_jrn("fallback", "\"e\":\"restore\",\"seq\":%lu",
+              (unsigned long)b.seq);
+    return ESP_OK;
+}
+
+static esp_err_t fb_commit(nvs_handle_t h, bool force, int64_t now_us)
+{
+    drift_sot_t *r = &s_fb;
+    if (!r->valid || !s_fb_dirty) return ESP_OK;
+    /* s_fb_last_store_us stamps the last ATTEMPT, not the last success:
+     * a persistent NVS failure retries at most once a minute (bounded
+     * retries §10.1.4) instead of hammering flash every commit call.  */
+    if (!force && now_us - s_fb_last_store_us < 60LL * 1000 * 1000) {
+        return ESP_OK;
+    }
+    s_fb_last_store_us = now_us;
+    fb_blob_t b;
+    memset(&b, 0, sizeof(b));
+    b.magic = FB_MAGIC;
+    b.version = FB_VERSION;
+    b.quality = r->quality;
+    b.source = r->source;
+    b.encoding = r->filename_encoding;
+    b.stale = r->stale;
+    b.rsv1[0] = r->cache_policy;
+    b.rsv1[1] = r->visibility_policy;
+    b.seq = s_fb_persist_seq + 1;
+    b.model_rev = r->model_rev;
+    b.anchor_epoch = r->anchor_epoch;
+    b.assumptions = r->assumptions;
+    b.observations = r->observations;
+    b.drift_ms = r->clock_drift_ms;
+    b.lo_ms = r->lo_ms;
+    b.hi_ms = r->hi_ms;
+    b.half_ms = r->accuracy_half_ms;
+    b.comp_ms = r->computed_at_ms;
+    b.ref_ms = r->reference_at_ms;
+    b.cache_us = r->cache_bound_us;
+    b.latency_lo_us = r->latency_lo_us;
+    b.latency_hi_us = r->latency_hi_us;
+    b.jitter_us = r->jitter_us;
+    b.rate_ppm = r->dev_rate_ppm;
+    b.fname_lo_us = r->fname_lo_us;
+    b.fname_hi_us = r->fname_hi_us;
+    b.period_us = r->filename_period_us;
+    strncpy(b.reason, r->source_reason, sizeof(b.reason) - 1);
+    strncpy(b.fw, s_card_fw, sizeof(b.fw) - 1);
+    b.crc32 = esp_crc32_le(0, (const uint8_t *)&b,
+                           offsetof(fb_blob_t, crc32));
+    esp_err_t err = nvs_set_blob(h, FB_KEY, &b, sizeof(b));
+    if (err == ESP_OK) err = nvs_commit(h);
+    r->last_error = err;
+    if (err == ESP_OK) {
+        s_fb_persist_seq = b.seq;
+        r->persisted_seq = b.seq;
+        s_fb_dirty = false;
+        r->dirty = false;
+        r->last_error = ESP_OK;
+        ESP_LOGI(TAG, "fallback persisted: seq=%lu drift=%lldms ±%lldms",
+                 (unsigned long)b.seq,
+                 (long long)b.drift_ms, (long long)b.half_ms);
+        drift_jrn("fallback", "\"e\":\"commit\",\"seq\":%lu",
+                  (unsigned long)b.seq);
+    } else {
+        drift_jrn("fallback", "\"e\":\"commit_fail\",\"err\":%d",
+                  (int)err);
+    }
+    return err;
 }
 
 static esp_err_t sot_commit_slot(nvs_handle_t h, drift_sot_slot_t slot,
@@ -2120,7 +2597,8 @@ esp_err_t drift_sot_commit(bool force, int64_t now_us)
     if (!h) return ESP_ERR_INVALID_STATE;
     esp_err_t ep = sot_commit_slot(h, DRIFT_SOT_PROVISIONAL, force, now_us);
     esp_err_t eq = sot_commit_slot(h, DRIFT_SOT_QUALIFIED, force, now_us);
-    return ep != ESP_OK ? ep : eq;
+    esp_err_t ef = fb_commit(h, force, now_us);
+    return ep != ESP_OK ? ep : (eq != ESP_OK ? eq : ef);
 }
 
 void drift_sot_invalidate(void)
@@ -2130,11 +2608,14 @@ void drift_sot_invalidate(void)
         nvs_erase_key(h, SOT_KEY_LEGACY);
         nvs_erase_key(h, SOT_KEY_PROV);
         nvs_erase_key(h, SOT_KEY_QUAL);
+        nvs_erase_key(h, FB_KEY);
         nvs_commit(h);
     }
     memset(s_sot, 0, sizeof(s_sot));
     memset(s_sot_dirty, 0, sizeof(s_sot_dirty));
     memset(s_sot_committed_half, 0, sizeof(s_sot_committed_half));
+    memset(&s_fb, 0, sizeof(s_fb));
+    s_fb_dirty = false;
     drift_jrn("sot", "\"e\":\"invalidate\"");
 }
 
@@ -2341,11 +2822,17 @@ int drift_estimate_json(const drift_record_t *r, char *buf, size_t cap)
         "\"rtc_rate_ppm\":null,\"record_duration_s\":%lu,"
         "\"record_bytes\":%lu,\"complete_records\":\"%llu\","
         "\"n_windows\":%d,\"segments\":%d,"
+        "\"evidence_total\":%lu,\"evidence_retained\":%lu,"
+        "\"evidence_evicted\":%lu,"
         "\"model_id\":\"%s\",\"quality\":\"%s\",\"assumptions\":%llu,",
         (unsigned long)r->record_duration_s,
         (unsigned long)r->record_bytes,
         (unsigned long long)r->complete_records,
-        r->n_windows, r->n_segments, r->model_id,
+        r->n_windows, r->n_segments,
+        (unsigned long)r->ev_total,
+        (unsigned long)(r->ev_total - r->ev_dropped),
+        (unsigned long)r->ev_dropped,
+        r->model_id,
         drift_quality_name(r->quality),
         (unsigned long long)r->assumptions);
     emit_assumptions(buf, cap, &o, r->assumptions);
@@ -2413,6 +2900,79 @@ int drift_sot_json(const drift_sot_t *s, char *buf, size_t cap)
     if (o >= cap) return -1;          /* truncated: fail explicitly   */
     if (o && buf[o - 1] == ',') o--;
     snprintf(buf + o, cap - o, "}");
+    return (int)strlen(buf);
+}
+
+int drift_sel_json(const drift_sel_t *v, char *buf, size_t cap)
+{
+    static const char *view[] = {"none", "current_session_estimate",
+                                 "previous_session_fallback"};
+    size_t o = 0;
+    JAPP(buf, cap, o,
+        "{\"selected_view\":\"%s\",\"quality\":\"%s\",\"source\":\"%s\","
+        "\"interval_ms\":[%lld,%lld],\"accuracy_half_ms\":%lld,"
+        "\"measurement_interval_ms\":[%lld,%lld],"
+        "\"measurement_half_ms\":%lld,"
+        "\"reference_at_ms\":%lld,\"computed_at_ms\":%lld,"
+        "\"measurement_reference_age_ms\":%lld,"
+        "\"fallback_adjustment_ms\":%lld,"
+        "\"model_rev\":%u,\"model_id\":\"%s\",\"assumptions\":%llu,"
+        "\"cache_policy\":\"%s\",\"visibility_policy\":\"%s\","
+        "\"source_reason\":\"%s\",\"selection_reason\":\"%s\",",
+        view[v->origin <= DRIFT_SEL_FALLBACK ? v->origin : 0],
+        drift_quality_name(v->quality),
+        drift_source_name(v->source),
+        (long long)v->lo_ms, (long long)v->hi_ms,
+        (long long)v->half_ms,
+        (long long)v->meas_lo_ms, (long long)v->meas_hi_ms,
+        (long long)v->meas_half_ms,
+        (long long)v->reference_at_ms,
+        (long long)v->computed_at_ms,
+        (long long)v->ref_age_ms,
+        (long long)v->age_adj_ms,
+        (unsigned)v->model_rev, v->model_id,
+        (unsigned long long)v->assumptions,
+        cache_policy_name(v->cache_policy),
+        visibility_policy_name(v->visibility_policy),
+        v->source_reason, v->reason);
+    emit_assumptions(buf, cap, &o, v->assumptions);
+    if (o >= cap) return -1;
+    if (o && buf[o - 1] == ',') o--;
+    snprintf(buf + o, cap - o, "}");
+    return (int)strlen(buf);
+}
+
+/* Diagnostic view of the persisted previous-session fallback plus its
+ * read-time eligibility (age against the current UTC map).          */
+int drift_fallback_json(char *buf, size_t cap, int64_t now_us)
+{
+    if (!s_fb.valid) {
+        snprintf(buf, cap, "null");
+        return (int)strlen(buf);
+    }
+    size_t o = 0;
+    JAPP(buf, cap, o, "{\"historical\":false,");
+    int64_t age = -1, adj = 0;
+    bool elig = false;
+    int64_t ulo, uhi;
+    if (!s_fb.stale && !s_fb.freshness_unknown &&
+        s_fb.reference_at_ms > 0 &&
+        s_fb.model_rev == drift_profile()->model_rev &&
+        drift_map_utc(now_us, &ulo, &uhi)) {
+        age = us_floor_ms(uhi) - s_fb.reference_at_ms;
+        if (age >= 0 && age <= DRIFT_FB_MAX_AGE_MS) {
+            adj = s_fb.accuracy_half_ms + DRIFT_FB_ALLOW_MS;
+            elig = adj <= DRIFT_USABLE_HALF_MS;
+        }
+    }
+    JAPP(buf, cap, o,
+        "\"fallback_eligible\":%s,\"age_ms\":%lld,\"adjusted_half_ms\":%lld,"
+        "\"max_age_ms\":%lld,\"age_allowance_ms\":%lld,\"record\":",
+        elig ? "true" : "false", (long long)age, (long long)adj,
+        (long long)DRIFT_FB_MAX_AGE_MS, (long long)DRIFT_FB_ALLOW_MS);
+    int n = drift_sot_json(&s_fb, buf + o, cap - o);
+    if (n > 0) o += (size_t)n;
+    JAPP(buf, cap, o, "}");
     return (int)strlen(buf);
 }
 

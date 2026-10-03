@@ -253,7 +253,12 @@ typedef struct {
     int64_t  offset_lo_ms, offset_hi_ms;
 } drift_obs_pub_t;
 
-#define DRIFT_EV_CAP 96
+/* Rolling evidence window (update6 §8): the estimator keeps the newest
+ * DRIFT_EV_CAP events rather than stopping at the cap. Planned eviction
+ * is counted (ev_dropped), never reported as overflow; session-start /
+ * creation metadata is retained separately in ev0 so eviction cannot
+ * silently erase the session-start bound.                           */
+#define DRIFT_EV_CAP 32
 
 typedef struct {
     uint32_t cache_bound_us;
@@ -281,9 +286,15 @@ typedef struct {
     uint8_t  obs_diag_next;
     uint8_t  n_obs_diag;
 
-    drift_ev_t ev[DRIFT_EV_CAP];
-    int      n_ev;
-    bool     ev_overflow;
+    drift_ev_t ev[DRIFT_EV_CAP];  /* rolling window, oldest first     */
+    int      n_ev;                /* retained count (<= cap)          */
+    uint32_t ev_total;            /* monotonic events accepted        */
+    uint32_t ev_dropped;          /* planned evictions (cap reached)  */
+    drift_ev_t ev0;               /* first creation event — session
+                                     * start survives ring eviction    */
+    bool     have_ev0;
+    bool     ev_overflow;         /* catalog-diff overflow (loss, not
+                                     * planned ring eviction)         */
 
     /* filename-origin evidence and per-source candidates            */
     bool     fname_known;
@@ -397,6 +408,9 @@ typedef struct {
     int64_t     accuracy_half_ms;
     int64_t     computed_at_ms;              /* UTC fit instant        */
     int64_t     reference_at_ms;             /* UTC instant it applies */
+    int64_t     ref_mono_us;                 /* monotonic ref instant  */
+    uint32_t    ev_total;                    /* events accepted (mono) */
+    uint32_t    ev_dropped;                  /* planned ring evictions */
     int         n_windows;
     int         n_segments;
     bool        has_period;
@@ -502,6 +516,73 @@ esp_err_t drift_sot_commit(bool force, int64_t now_us); /* throttled */
 bool      drift_sot_dirty(void);
 void      drift_sot_invalidate(void);    /* explicit evidence reset    */
 void      drift_card_fw_note(const char *fw); /* card identity check  */
+
+/* ---------------- current-session vs previous-session fallback ------
+ * (update6 §8/§10): NVS holds the latest COMPLETED session's estimate
+ * when it ended within DRIFT_SAVE_GOOD_MS — never a best-ever record.
+ * The read-time selector compares a fresh current-session candidate
+ * against the aged fallback; freshness and explicit age allowance
+ * decide, not raw width.                                             */
+
+#define DRIFT_SAVE_GOOD_MS     2000        /* save/use gate            */
+#define DRIFT_FB_MAX_AGE_MS    (36LL*3600*1000)  /* fallback expiry   */
+#define DRIFT_FB_ALLOW_MS      1000        /* fixed age allowance      */
+#define DRIFT_FB_ADV_MS        500         /* required fallback margin */
+#define DRIFT_USABLE_HALF_MS   5000        /* nothing beyond this      */
+#define DRIFT_CUR_REF_MAX_US   (180LL*1000*1000) /* current ref age   */
+
+typedef enum {
+    DRIFT_SEL_NONE = 0,
+    DRIFT_SEL_CURRENT,
+    DRIFT_SEL_FALLBACK,
+} drift_sel_origin_t;
+
+typedef struct {
+    bool     valid;                /* a usable selection exists       */
+    uint8_t  origin;               /* drift_sel_origin_t              */
+    uint8_t  quality;              /* quality at measurement          */
+    uint8_t  source;               /* drift_source_t                  */
+    char     reason[48];           /* machine code                    */
+    /* effective (transported) view at selection time                 */
+    int64_t  lo_ms, hi_ms;
+    int64_t  half_ms;
+    /* measurement values as stored                                   */
+    int64_t  meas_lo_ms, meas_hi_ms;
+    int64_t  meas_half_ms;
+    int64_t  reference_at_ms;
+    int64_t  computed_at_ms;
+    int64_t  ref_age_ms;           /* fallback ref age; current: ~0   */
+    int64_t  age_adj_ms;           /* allowance applied to half       */
+    uint16_t model_rev;
+    uint64_t assumptions;
+    uint8_t  cache_policy;
+    uint8_t  visibility_policy;
+    char     model_id[24];
+    char     source_reason[48];
+    /* fallback diagnostics (valid even when current won)             */
+    bool     fb_present;
+    bool     fb_eligible;
+    int64_t  fb_age_ms;
+    int64_t  fb_adj_half_ms;       /* measured half + allowance        */
+    /* current-session candidate diagnostics                          */
+    bool     cur_present;
+    bool     cur_fresh;
+    int64_t  cur_meas_half_ms;
+    int64_t  cur_eff_half_ms;
+} drift_sel_t;
+
+/* Evaluate the current-session-vs-fallback choice at now_us (ESP
+ * monotonic). Always fills *out when it returns true; valid=false
+ * means no usable correction (diagnostics still populated).         */
+bool      drift_select(int64_t now_us, drift_sel_t *out);
+int       drift_sel_json(const drift_sel_t *v, char *buf, size_t cap);
+/* Persisted previous-session fallback record (diagnostic view).     */
+bool      drift_fallback_view(drift_sot_t *out);
+int       drift_fallback_json(char *buf, size_t cap, int64_t now_us);
+/* Confirmed-therapy-OUT hook: evaluate the latest estimate and, when
+ * it meets the save gate, replace the persisted fallback regardless
+ * of prior width. Keeps the old record untouched otherwise.         */
+bool      drift_finalize_fallback(int64_t now_us);
 
 /* Confirmed fixed POSIX-style timezone for filename interpretation —
  * e.g. UTC0 or AEST-10. Complex DST rules remain unresolved.          */

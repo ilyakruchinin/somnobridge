@@ -32,6 +32,8 @@ typedef enum {
     PH_VERNIER,     /*         shifted grid, interval constraints       */
     PH_REFINE,      /*         further shifted grids                    */
     PH_MAINTAIN,    /* steady: pulls around the bounded prediction      */
+    PH_REFINE2,     /* sustained: REFINE grid every cycle, no drift     */
+                    /* of the cluster — centered on each prediction    */
 } ph_state_t;
 
 #define PH_OBS_CAP 24   /* bounded transition brackets retained         */

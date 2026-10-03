@@ -394,7 +394,8 @@ def collect_session_references(host, day, evidence, revisions):
                 "error": str(error)}
 
 
-JOURNAL_KEEP_KINDS = {"anchor", "timing_obs", "sot", "phase", "event"}
+JOURNAL_KEEP_KINDS = {"anchor", "timing_obs", "sot", "fallback",
+                      "phase", "event"}
 
 
 def collect_journal(dev, evidence):

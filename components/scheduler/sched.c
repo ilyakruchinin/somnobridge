@@ -31,7 +31,6 @@ static const char *TAG = "sched";
 #define COVER_PERIOD_US    (60LL * 1000 * 1000)  /* coverage round    */
 #define COLD_PERIOD_US     (5 * 1000 * 1000)
 #define NEIGH_PERIOD_US    (3600LL * 1000 * 1000)  /* once/hour        */
-#define ACTIVE_CAP_8H      SCHED_ACTIVE_CAP_8H
 #define LEDGER_BUCKETS     481
 #define LEDGER_BUCKET_US   (60LL * 1000 * 1000)
 #define TRACK_FRESH_US     (75LL * 1000 * 1000)  /* tracked folder must
@@ -68,7 +67,7 @@ static uint32_t s_backoff_ms;
 static int      s_backoff_idx;
 static uint16_t s_ledger[LEDGER_BUCKETS]; /* minute buckets, 8h ring   */
 static int      s_ledger_head;
-static int64_t  s_ledger_ckpt_us;
+static int64_t  s_ledger_ckpt_us;   /* last event stamp (telemetry)  */
 
 /* phase-tracking poll schedule (update2 §3): one tracker bound to the
  * tracked day folder — the live estimator session's day while a
@@ -108,7 +107,11 @@ static therapy_state_t s_prev_therapy;
 static est_state_t     s_prev_est = EST_INVALID;   /* journaled once   */
 static acc_tier_t      s_prev_tier = ACC_NONE;
 
-/* ---------------- ledger ---------------- */
+/* ---------------- request-count diagnostics ----------------
+ * update6 removed the cumulative card-request budget: counts stay
+ * available for diagnostics but nothing gates on them, and no budget
+ * ledger is checkpointed to NVS. Legacy "load_budget" blobs are left
+ * in place (inert) — they are not read and must not gate monitoring. */
 
 static void ledger_add(bool active_mode, int64_t now)
 {
@@ -126,78 +129,15 @@ static void ledger_add(bool active_mode, int64_t now)
     s_ledger_ckpt_us = now;
 }
 
-static uint32_t s_restored_8h;      /* pre-boot requests, conservative */
-
 uint32_t sched_active_8h(void)
 {
-    uint32_t t = s_restored_8h;
+    uint32_t t = 0;
     for (int i = 0; i < LEDGER_BUCKETS; i++) {
         t += s_ledger[i];
     }
     return t;
 }
 
-/* ---------------- load_budget checkpoint (§6.1) ----------------
- * Minute-bucket counts persist to metadata NVS once/minute. A reboot
- * cannot age them (no RTC), so a restored lump counts toward the cap
- * until this boot's own ledger has run 8 h — expiry rounds late, per
- * spec. If >60 s pass since the last successful commit, active-mode
- * requests suspend until one lands.                                 */
-
-#define CKPT_PERIOD_US  (60LL * 1000 * 1000)
-#define CKPT_MAGIC      0x4C424331u   /* "LBC1" */
-static int64_t  s_ckpt_ok_us;
-static uint32_t s_ckpt_seq;
-static int64_t  s_ledger_boot_us;
-
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint32_t seq;
-    uint16_t n;
-    uint16_t pad;
-    uint16_t cnt[LEDGER_BUCKETS];
-} lbc_t;
-
-static void ledger_checkpoint(int64_t now)
-{
-    nvs_handle_t h = settings_nvs_metadata();
-    if (!h) {
-        s_ckpt_ok_us = now;          /* dev path: no partition         */
-        return;
-    }
-    static lbc_t b;
-    memset(&b, 0, sizeof(b));
-    b.magic = CKPT_MAGIC;
-    b.seq = ++s_ckpt_seq;
-    b.n = LEDGER_BUCKETS;
-    memcpy(b.cnt, s_ledger, sizeof(b.cnt));
-    if (nvs_set_blob(h, "load_budget", &b, sizeof(b)) == ESP_OK &&
-        nvs_commit(h) == ESP_OK) {
-        s_ckpt_ok_us = now;
-    } else {
-        ESP_LOGW(TAG, "load_budget checkpoint failed");
-    }
-}
-
-static void ledger_restore(void)
-{
-    nvs_handle_t h = settings_nvs_metadata();
-    if (!h) return;
-    static lbc_t b;
-    size_t want = sizeof(b);
-    if (nvs_get_blob(h, "load_budget", &b, &want) == ESP_OK &&
-        want == sizeof(b) && b.magic == CKPT_MAGIC &&
-        b.n == LEDGER_BUCKETS) {
-        uint32_t sum = 0;
-        for (int i = 0; i < LEDGER_BUCKETS; i++) sum += b.cnt[i];
-        s_ckpt_seq = b.seq;
-        s_restored_8h = sum;         /* counts until boot+8h (conserv.) */
-        ESP_LOGI(TAG, "load_budget restored: %lu pre-boot requests",
-                 (unsigned long)sum);
-    }
-}
-
-bool sched_budget_ok(void) { return sched_active_8h() < ACTIVE_CAP_8H; }
 uint32_t sched_backoff_ms(void) { return s_backoff_ms; }
 
 int sched_phase_json(char *buf, size_t cap)
@@ -491,10 +431,6 @@ static void estim_housekeeping(int64_t now)
                  "\"state\":%d,\"tier\":%d,\"w\":%d,\"seg\":%d",
                  (int)r.state, (int)r.tier, r.n_windows, r.n_segments);
         jrn_put("estimate", rec);
-        if (r.tier == ACC_ACCURATE && s_prev_tier != ACC_ACCURATE) {
-            /* first accurate result in the session — persist now    */
-            drift_sot_commit(true, now);
-        }
         s_prev_est = r.state;
         s_prev_tier = r.tier;
     }
@@ -529,6 +465,10 @@ static void estim_track_therapy(int64_t now)
                     }
                 }
             }
+            /* update6 §10.1: the newest usable final estimate replaces
+             * the persisted completed-session fallback — below the
+             * save gate the old record is kept, age unrefreshed.      */
+            drift_finalize_fallback(now);
             drift_live_end(now);
             drift_sot_commit(true, now);
             s_prev_est = EST_INVALID;
@@ -901,9 +841,6 @@ esp_err_t sched_init(void)
         return ESP_ERR_NO_MEM;
     }
     therapy_init();
-    ledger_restore();
-    s_ckpt_ok_us = esp_timer_get_time();     /* grace: first 60 s free */
-    s_ledger_boot_us = s_ckpt_ok_us;
     return ESP_OK;
 }
 
@@ -1075,7 +1012,7 @@ static void q_requeue(qjob_t *jobs, int n, int skip)
 
 /* DIAG: loop liveness/position for the silent-stall investigation —
  * s_diag_stage records how far the last iteration progressed:
- *   1 top, 2 post-estim, 3 post-checkpoint, 4 post-rx, 5 planned,
+ *   1 top, 2 post-estim, 3 post-rx, 5 planned,
  *   6 picked, 7 executing job                                             */
 static volatile uint32_t s_diag_iters;
 static volatile int      s_diag_stage;
@@ -1089,13 +1026,13 @@ int sched_diag_json(char *buf, size_t cap)
 {
     return snprintf(buf, cap,
         "\"loop\":{\"iters\":%lu,\"stage\":%d,\"link\":%d,"
-        "\"qlen\":%u,\"ckpt_age_ms\":%lld,\"budget_ok\":%d,"
+        "\"qlen\":%u,\"active_8h\":%lu,"
         "\"picked\":%d,\"exec_ms\":%lld,\"created\":%d}",
         (unsigned long)s_diag_iters, (int)s_diag_stage,
         (int)s_link_up,
         (unsigned)(s_q ? uxQueueMessagesWaiting(s_q) : 0xFFFF),
-        (long long)((esp_timer_get_time() - s_ckpt_ok_us) / 1000),
-        (int)sched_budget_ok(), (int)s_diag_picked_kind,
+        (unsigned long)sched_active_8h(),
+        (int)s_diag_picked_kind,
         (long long)(s_diag_exec_us / 1000), (int)s_diag_created);
 }
 
@@ -1140,16 +1077,6 @@ void sched_run_forever(void)
         }
 #endif
 
-        /* restored pre-boot budget expires only after this boot has
-         * itself run 8 h (§6.1: expiry rounds late, never early)     */
-        if (s_restored_8h &&
-            now - s_ledger_boot_us > 8LL * 3600 * 1000000LL) {
-            s_restored_8h = 0;
-        }
-        /* once/minute budget checkpoint; suspension gate below       */
-        if (now - s_ckpt_ok_us >= CKPT_PERIOD_US) {
-            ledger_checkpoint(now);
-        }
         s_diag_stage = 3;
 
         /* journal phase-tracker transitions and misses (update2 §7) */
@@ -1217,20 +1144,9 @@ void sched_run_forever(void)
         s_diag_picked_kind = (int)j.kind;
         q_requeue(jobs, njobs, pick);
 
-        /* §6.1 + update2 §5: requests suspend when the budget is
-         * exhausted OR the last checkpoint is older than 60 s. The
-         * ledger counts card requests in every therapy state —
-         * OUT-mode reads are cheap but never accounted as free.     */
-        bool checkpoint_fresh =
-            now - s_ckpt_ok_us < CKPT_PERIOD_US;
-        if (!sched_budget_ok() || !checkpoint_fresh) {
-            ESP_LOGW(TAG, "drop k=%d: budget=%d ckpt_age=%lld ms",
-                     (int)j.kind, (int)sched_budget_ok(),
-                     (long long)((now - s_ckpt_ok_us) / 1000));
-            q_drop(&j, ESP_ERR_NO_MEM);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
+        /* update6: no cumulative request budget gates card I/O — the
+         * per-request spacing, service-time, backoff, and one-in-
+         * flight guards below are the actual load contract.         */
         s_last_req_us = esp_timer_get_time();
         if (j.phase_job) {
             phase_submitted(&s_ph);   /* pull token consumed on start */

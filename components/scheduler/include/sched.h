@@ -63,10 +63,9 @@ typedef enum {
 #define JOB_DIR_MAX   260
 #define JOB_NAME_MAX  EZS_NAME_MAX
 
-/* Total card-request ceiling in the rolling 8 h ledger (spec §6.1,
- * update2 §5). Counts parent+day listings and version probes in every
- * therapy state — reads are cheap but never accounted as free.       */
-#define SCHED_ACTIVE_CAP_8H 8000
+/* update6 removed the cumulative request budget: sched_active_8h()
+ * remains a diagnostic counter only — nothing gates on it, and no
+ * budget state is checkpointed to NVS.                            */
 
 struct sched_result;
 typedef struct {
@@ -100,9 +99,8 @@ void      sched_run_forever(void);                /* task body        */
 void sched_set_card_ip(uint32_t ip);
 void sched_set_link(bool up);
 
-/* load ledger (spec §6.1) */
+/* request-count telemetry (diagnostic only — no cumulative gate)  */
 uint32_t sched_active_8h(void);        /* card-request count, 8 h    */
-bool     sched_budget_ok(void);
 uint32_t sched_backoff_ms(void);       /* current HTTP backoff       */
 
 /* Phase-tracker status for GET_STATUS (update2 §7): emits

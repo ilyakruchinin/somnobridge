@@ -1,50 +1,61 @@
 # TODO
 
-## SOT replacement logic reports stale drift values indefinitely
+## SOT replacement logic reports stale drift values indefinitely — RESOLVED (update6)
 
-The persisted source-of-truth (SOT) record selection logic is wrong for a
-time-varying quantity like AS11 clock drift. A record persisted on one day can
-keep being reported as current on much later days, even though the true drift
-has long since moved.
+The persisted source-of-truth (SOT) record selection logic was wrong for a
+time-varying quantity like AS11 clock drift. A record persisted on one day
+could keep being reported as current on much later days, even though the
+true drift had long since moved.
 
-### Defects
+### Resolution (implemented)
 
-1. **Reported interval is frozen at promotion time.** `drift_sot_apply()`
-   (which re-references a stored bound to "now" by widening it with
-   `elapsed × dev_rate_ppm`) is never called in the live path — only in host
-   tests. `op_get_drift` serializes the stored record verbatim, so
-   `interval_ms` and `current_half_ms` reflect the promotion instant, not the
-   read instant. See `components/drift/drift.c` (`drift_sot_apply`,
-   `drift_sot_json`, `sot_fill`) and `components/ble_api/ble_ops.c`
-   (`op_get_drift`).
+The user-approved policy from `docs/implmenetation-update6-spec.md` §§8–12
+is implemented:
 
-2. **No age-based expiry.** Records are marked stale only on clock
-   discontinuity, model-revision mismatch, card firmware change, or explicit
-   invalidation. Nothing ages a record out. A record from day 14 is still
-   `applicable=true, stale=false` on day 56.
+1. **Frozen interval → read-time effective view.** The old verbatim-record
+   serialization is replaced by `drift_select()`/`drift_sel_json()`: the API
+   reports the measured interval, the effective (allowance-adjusted)
+   interval, measurement reference age, and the selection reason. The
+   previously dead `drift_sot_apply()` elapsed-time widening had a µs/ms
+   unit bug that is fixed; the selector performs equivalent transport.
 
-3. **Newer evidence cannot refresh the record.** `sot_offer()` replaces the
-   stored record only when the slot is empty/stale, the new interval is
-   disjoint (non-overlapping), or the new half-width is ≥250 ms tighter.
-   An overlapping, slightly-wider or equal-width estimate from a *newer*
-   session is rejected — so `reference_at_ms`/`computed_at_ms` stay old even
-   when fresh measurements exist. The disjoint rule only rescues monotonic
-   drift once the new interval fully stops overlapping; slowly-drifting
-   estimates that keep partially overlapping may never displace the stale
-   record. Host tests currently assert this behavior ("same-width re-eval does
-   not supersede", "older eval never displaces SOT",
-   `scripts/host_test.c` ~line 983).
+2. **No age expiry → explicit 36 h expiry + fixed allowance.** The new
+   completed-session fallback record (`drift_fb` NVS blob) expires
+   36 hours after its measurement reference, evaluated on read — never by
+   rewriting flash. While eligible it is used only at
+   `measured_half + 1000 ms` (DRIFT_FB_ALLOW_MS), never at its stored
+   width. Unknown age after reboot (freshness_unknown) blocks use until an
+   authenticated current map exists.
 
-### Consequence
+3. **Width-only replacement → latest-session replacement + read-time
+   selection.** `drift_finalize_fallback()` runs once on the confirmed
+   IN→OUT transition: when the session's final estimate is usable within
+   ±2000 ms (after transport widening), it replaces the stored record
+   unconditionally — even when wider than the previous one. Below the gate
+   the old record is kept with its age unrefreshed. The 250 ms improvement
+   hysteresis no longer decides what is reported: `drift_select()` prefers
+   a fresh current-session candidate, then a materially-better eligible
+   fallback (≥500 ms advantage after allowance), then a merely-usable
+   current. Legacy `drift_sot_p`/`drift_sot_q` slots remain as historical
+   diagnostics only (`historical:true, applicable:false` in schema 5).
 
-`best_available_offset` / `provisional_source_of_truth` can return a drift
-bound measured days or weeks ago as if it were current, while a newer valid
-session estimate exists. Freshness of evidence is not considered — only
-interval width and overlap.
+Also resolved in the same change: the 96-event estimator saturation
+(rolling 32-event evidence buffer with pinned session-start `ev0`),
+sustained REFINE2 phase tracking instead of coarsening to MAINTAIN, and
+removal of the cumulative 8 h request ledger/NVS checkpoint that could
+suspend observation.
 
-### Direction
+### Verification status
 
-Decision deferred — proposed remedies were rejected. To be decided how
-freshness should factor into replacement, whether read-time widening should be
-exposed, and whether/how records should age out. Any change to replacement
-semantics requires a `model_rev` bump and host-test updates.
+- `scripts/host_test.c` `test_update6` covers: rolling eviction past the
+  old cap, fallback restore/expiry/allowance, current-vs-fallback margin
+  selection, wider-final replacement, below-gate keep-old, 180 s stale
+  reference rejection, model-incompatible record non-application, and
+  corrupt-blob invalidation.
+- `python3 scripts/validate_timing.py self-test`: passes.
+- `./scripts/idf.sh build`: clean.
+- **Still open:** overnight hardware evidence (§6 of the update6 spec) and
+  measured-load characterization for sustained REFINE2 (§13.5) have not
+  been collected; ten-minute host-anchor cadence depends on the client
+  supplying anchors (firmware side is ready, `validate_timing.py observe`
+  defaults to 600 s).

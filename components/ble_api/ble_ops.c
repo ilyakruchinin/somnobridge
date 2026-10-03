@@ -255,8 +255,7 @@ static void op_get_status(uint32_t rid, cJSON *args)
         "\"quiet_since_ms\":%lu,\"expected_append_ms\":%lu,"
         "\"out_timeout_ms\":%lu,\"confidence\":\"%s\","
         "\"reason\":\"%s\",\"transfer_allowed\":%s},"
-        "\"budget\":{\"active_8h\":\"%lu\",\"backoff_ms\":%lu,"
-        "\"cap\":%d},"
+        "\"budget\":{\"active_8h\":\"%lu\",\"backoff_ms\":%lu},"
         "%s,%s,%s}",
         settings_security_label(),
         n->mode == NETW_MODE_STA ? "STA" :
@@ -273,7 +272,7 @@ static void op_get_status(uint32_t rid, cJSON *args)
         t->confidence, t->reason,
         t->transfer_allowed ? "true" : "false",
         (unsigned long)sched_active_8h(),
-        (unsigned long)sched_backoff_ms(), SCHED_ACTIVE_CAP_8H,
+        (unsigned long)sched_backoff_ms(),
         pn > 0 ? phj : "\"phase\":null",
         tn > 0 ? tj : "\"http\":null",
         dn > 0 && dn < (int)sizeof(dj) ? dj : "\"loop\":null");
@@ -1009,44 +1008,63 @@ static void op_get_drift(uint32_t rid, cJSON *args)
         if (jn_ < 0 || o + (size_t)jn_ >= dcap) o = dcap;             \
         else o += (size_t)jn_;                                        \
     } while (0)
-    DAPP("{\"schema\":4,\"estimate\":");
+    int64_t now_us = esp_timer_get_time();
+    DAPP("{\"schema\":5,\"estimate\":");
     drift_record_t rec;
     if (o < dcap && drift_pub_get(&rec)) {
         DJSON(drift_estimate_json, &rec);
     } else {
         DAPP("null");
     }
+    /* update6 §11: current-session vs previous-session fallback       */
+    drift_sel_t sel;
+    bool have_sel = o < dcap && drift_select(now_us, &sel);
+    /* source_of_truth is ONLY a fresh live qualified candidate — a
+     * persisted record can never appear here.                        */
     DAPP(",\"source_of_truth\":");
-    drift_sot_t sot;
-    if (o < dcap && drift_sot_view(&sot)) {
-        DJSON(drift_sot_json, &sot);
+    if (have_sel && sel.valid && sel.origin == DRIFT_SEL_CURRENT &&
+        sel.quality == DRIFT_Q_QUALIFIED &&
+        sel.half_ms <= DRIFT_SAVE_GOOD_MS) {
+        DJSON(drift_sel_json, &sel);
     } else {
         DAPP("null");
     }
+    /* Persisted SOT slots are historical diagnostics — they are not
+     * used for current-time correction anymore (update6 §11.1).      */
     DAPP(",\"qualified_source_of_truth\":");
+    drift_sot_t sot;
     if (o < dcap && drift_sot_slot_view(DRIFT_SOT_QUALIFIED, &sot)) {
+        DAPP("{\"historical\":true,\"applicable\":false,\"record\":");
         DJSON(drift_sot_json, &sot);
+        DAPP("}");
     } else {
         DAPP("null");
     }
     DAPP(",\"provisional_source_of_truth\":");
     if (o < dcap && drift_sot_slot_view(DRIFT_SOT_PROVISIONAL, &sot)) {
+        DAPP("{\"historical\":true,\"applicable\":false,\"record\":");
         DJSON(drift_sot_json, &sot);
+        DAPP("}");
     } else {
         DAPP("null");
     }
+    DAPP(",\"completed_session_fallback\":");
+    if (o < dcap) {
+        int fn_ = drift_fallback_json(buf + o, dcap - o, now_us);
+        if (fn_ < 0 || o + (size_t)fn_ >= dcap) o = dcap;
+        else o += (size_t)fn_;
+    }
     DAPP(",\"best_available_opt_in_required\":true,"
          "\"best_available_offset\":");
-    bool have_best = o < dcap && best_req && drift_sot_best(&sot);
+    bool have_best = o < dcap && best_req && have_sel && sel.valid;
     if (have_best) {
-        DJSON(drift_sot_json, &sot);
+        DJSON(drift_sel_json, &sel);
     } else {
         DAPP("null");
     }
     DAPP(",\"best_available_reason\":\"%s\"",
          !best_req ? "client_opt_in_required" :
-         have_best ? "selected_by_quality_then_width" :
-                     "no_persisted_record");
+         have_sel ? sel.reason : "no_usable_correction");
     if (o >= dcap - 1) {
         send_error(rid, OP_GET_DRIFT, EC_RESOURCE_LIMIT);
         free(buf);

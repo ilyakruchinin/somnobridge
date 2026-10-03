@@ -421,8 +421,10 @@ def print_status(r):
           f"out_timeout={t.get('out_timeout_ms')} ms  "
           f"transfer_allowed={t.get('transfer_allowed')}")
     b = res.get("budget", {})
-    print(f"  budget: active_8h={b.get('active_8h')} "
-          f"backoff={b.get('backoff_ms')} ms cap={b.get('cap')}")
+    cap = f" cap={b.get('cap')}" if "cap" in b else ""
+    print(f"  requests: active_8h={b.get('active_8h')} "
+          f"backoff={b.get('backoff_ms')} ms{cap} "
+          f"(diagnostic — no cumulative cap since update6)")
     ph = res.get("phase")
     if ph:
         print(f"  phase: st={ph.get('st')} day={ph.get('day')} "
@@ -494,8 +496,9 @@ def print_ls(r, directory):
 
 
 def print_drift(r):
-    """U10 envelope: {"schema":4,"estimate":{...}|null,
-                     "source_of_truth":{...}|null}."""
+    """U10 envelope: {"schema":5,"estimate":{...}|null,
+                     "source_of_truth":{...}|null,
+                     "completed_session_fallback":{...}|null}."""
     res = r.get("result", {})
     hr("GET_DRIFT")
     if not r.get("ok"):
@@ -554,10 +557,40 @@ def print_drift(r):
               f"segments={est.get('segments')}")
         flags = est.get("flags") or []
         print(f"    flags: {', '.join(flags) if flags else '(none)'}")
+    schema = res.get("schema")
+
+    def print_sel(v, label):
+        """schema>=5 selected-view object (drift_sel_t)."""
+        if not v:
+            print("    (none)")
+            return
+        print(f"    selected_view     = {v.get('selected_view')}"
+              f"   reason={v.get('selection_reason')}")
+        print(f"    quality={v.get('quality')} "
+              f"source={v.get('source')} "
+              f"interval={fmt_iv(v.get('interval_ms'))} "
+              f"half={fmt_ms(v.get('accuracy_half_ms'))}")
+        print(f"    measured          = "
+              f"{fmt_iv(v.get('measurement_interval_ms'))} "
+              f"half={fmt_ms(v.get('measurement_half_ms'))} "
+              f"age={fmt_ms(v.get('measurement_reference_age_ms'))} "
+              f"allowance={fmt_ms(v.get('fallback_adjustment_ms'))}")
+        print(f"    model_rev={v.get('model_rev')} "
+              f"model_id={v.get('model_id')} "
+              f"assumptions={v.get('assumptions')}")
+
+    def sot_rec(v):
+        """Unwrap schema>=5 historical slot wrapper."""
+        if isinstance(v, dict) and "record" in v:
+            return v.get("record"), v.get("historical")
+        return v, None
+
     sot = res.get("source_of_truth")
     print("  source_of_truth:")
     if not sot:
-        print("    (none — no accurate estimate has ever persisted)")
+        print("    (none — no live qualified correction)")
+    elif schema and schema >= 5:
+        print_sel(sot, "source_of_truth")
     else:
         print(f"    clock_drift_ms    = {fmt_ms(sot.get('clock_drift_ms'))}"
               f"   interval {fmt_iv(sot.get('interval_ms'))}")
@@ -572,23 +605,48 @@ def print_drift(r):
               f"cache={sot.get('cache_policy')} "
               f"visibility={sot.get('visibility_policy')} "
               f"delay_us={sot.get('visibility_delay_us')}")
-        print("    note: source_of_truth stays qualified-only; request "
-              "best_available for provisional records")
-    prov = res.get("provisional_source_of_truth")
-    if prov is not None:
-        print("  provisional_source_of_truth:")
-        if not prov:
+    for key in ("qualified_source_of_truth",
+                    "provisional_source_of_truth"):
+        slot = res.get(key)
+        if slot is None:
+            continue
+        rec, hist = sot_rec(slot)
+        label = key + (" (historical)" if hist else "")
+        print(f"  {label}:")
+        if not rec:
             print("    (none)")
         else:
-            print(f"    interval={fmt_iv(prov.get('interval_ms'))} "
-                  f"half={fmt_ms(prov.get('accuracy_half_ms'))} "
-                  f"source={prov.get('source')} stale={prov.get('stale')} "
-                  f"model_rev={prov.get('model_rev')}")
+            print(f"    interval={fmt_iv(rec.get('interval_ms'))} "
+                  f"half={fmt_ms(rec.get('accuracy_half_ms'))} "
+                  f"source={rec.get('source')} stale={rec.get('stale')} "
+                  f"model_rev={rec.get('model_rev')}")
+    fb = res.get("completed_session_fallback")
+    if fb is not None:
+        print("  completed_session_fallback:")
+        if not fb:
+            print("    (none persisted)")
+        else:
+            rec = fb.get("record") or {}
+            print(f"    fallback_eligible={fb.get('fallback_eligible')} "
+                  f"age={fmt_ms(fb.get('age_ms'))} "
+                  f"adjusted_half={fmt_ms(fb.get('adjusted_half_ms'))} "
+                  f"(+{fmt_ms(fb.get('age_allowance_ms'))} allowance, "
+                  f"max {fmt_ms(fb.get('max_age_ms'))})")
+            print(f"    interval={fmt_iv(rec.get('interval_ms'))} "
+                  f"half={fmt_ms(rec.get('accuracy_half_ms'))} "
+                  f"quality={rec.get('quality')} "
+                  f"stale={rec.get('stale')} "
+                  f"freshness_unknown={rec.get('freshness_unknown')} "
+                  f"model_rev={rec.get('model_rev')}")
+            print(f"    reference_at_ms={fmt_ms(rec.get('reference_at_ms'))}"
+                  f"  seq={rec.get('persisted_seq')}")
     best = res.get("best_available_offset")
     if best is not None:
         print("  best_available_offset:")
         if not best:
-            print("    (none)")
+            print(f"    (none — {res.get('best_available_reason')})")
+        elif schema and schema >= 5:
+            print_sel(best, "best_available_offset")
         else:
             print(f"    quality={best.get('quality')} "
                   f"source={best.get('source')} "
