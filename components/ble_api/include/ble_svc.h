@@ -1,5 +1,5 @@
 /*
- * SomnoPal — BLE service (spec §3, §10)
+ * SomnoBridge — BLE service (spec §3, §10)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  */

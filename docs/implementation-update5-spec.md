@@ -1,4 +1,4 @@
-# SomnoPal — implementation update 5: independent scoring and qualification
+# SomnoBridge — implementation update 5: independent scoring and qualification
 
 Status: host-side collector/scorer and the model-rev4 best-effort anchor path
 are implemented, build-verified, and flashed; qualified firmware certification
@@ -16,7 +16,7 @@ Implemented host tooling:
   default, retains source provenance/epoch, and supports non-committing raw
   exchanges for offline mapping.
 - `validate_timing.py observe` performs bounded passive collection of
-  SomnoPal status/drift, raw brackets, SomnoTrace clock references, session
+  SomnoBridge status/drift, raw brackets, SomnoTrace clock references, session
   metadata, BLE exchange anchors, and journal records without adding card
   requests.
 - `validate_timing.py analyze` now deduplicates observations, maps them with
@@ -39,7 +39,7 @@ The supplied session reached the desired numerical precision:
 | Final correction, true time minus device time | −507,615 ms |
 | Final correction interval | [−508,882, −506,349] ms |
 | Independent SomnoTrace stop-time correction | −508,008 ms |
-| Signed midpoint difference, SomnoPal minus reference | +393 ms |
+| Signed midpoint difference, SomnoBridge minus reference | +393 ms |
 | Latest raw bracket | 554.002 ms |
 | Narrowest raw bracket shown | 554.002 ms |
 | Final observation count / clock segments | 11 / 1 |
@@ -49,7 +49,7 @@ The reference point is inside the final interval, 874 ms above its lower edge
 and 1,659 ms below its upper edge. This is encouraging agreement, not a measured
 ±393 ms accuracy bound. The midpoint difference is one comparison; uncertainty
 in both measurements and their different reference times remains relevant.
-The stop reference was measured 23.373 seconds after SomnoPal's final
+The stop reference was measured 23.373 seconds after SomnoBridge's final
 `reference_at_ms`; at the installed 500 ppm device-rate bound, transporting an
 interval across that gap adds about 11.7 ms per edge. Always score at a common
 time rather than comparing unrelated timestamps silently.
@@ -111,7 +111,7 @@ or bound changes; do not relabel old provisional measurements as qualified.
 No therapy commands, waveform downloads, firmware writes, or anchor commits
 were made during these checks.
 
-- SomnoPal GET_STATUS / GET_DRIFT responded over authenticated BLE. The session
+- SomnoBridge GET_STATUS / GET_DRIFT responded over authenticated BLE. The session
   is now observation-closed, retains the 1,266 ms estimate, and has a valid,
   persisted revision-3 provisional SOT. It is out of therapy.
 - ESP-side listing statistics reported 216 successes, zero failures, minimum
@@ -192,7 +192,7 @@ python3 scripts/validate_timing.py observe \
     --day $(date +%Y%m%d) --duration 7200 \
     --host 192.168.86.102 --no-anchor-commit
 python3 scripts/validate_timing.py analyze \
-    --input /tmp/somnopal-validation-XXXX/evidence.jsonl
+    --input /tmp/somnobridge-validation-XXXX/evidence.jsonl
 ```
 
 Existing gaps now split into:
@@ -215,7 +215,7 @@ Existing gaps now split into:
 
 Default collection policy (implemented in `observe`, subject to load testing):
 
-- Keep one authenticated SomnoPal BLE connection, serialize operations, and
+- Keep one authenticated SomnoBridge BLE connection, serialize operations, and
   read cached GET_STATUS + GET_DRIFT every five seconds while active. Back off
   to 30–60 seconds when idle. Skip overlapping work rather than accumulating it.
 - Collect raw observations keyed by boot/domain, session/segment, beacon, and
@@ -240,7 +240,7 @@ Default collection policy (implemented in `observe`, subject to load testing):
 - Store evidence privately (directory 0700, files 0600), timing-only allowlist,
   bounded sizes and retention. Exclude device identifiers from shared reports.
 
-BLE receipt time is only a collection timestamp. SomnoPal event endpoints remain
+BLE receipt time is only a collection timestamp. SomnoBridge event endpoints remain
 ESP monotonic values. Querying status/drift must not generate extra card HTTP
 requests. Collection traffic can still perturb BLE/WiFi coexistence; include
 collector load as an experimental condition and test lighter collection too.
@@ -292,7 +292,7 @@ Requirements for analysis:
    enclosing intervals without claiming statistical independence.
 5. Compare mtime, creation, periodic candidates and selected fit separately.
    Replay fixed recorded events under alternative models without circularly
-   using SomnoPal's own fitted offset to calibrate delay.
+   using SomnoBridge's own fitted offset to calibrate delay.
 6. Delays may vary across events. Do not intersect them as one constant.
    Report event intervals and conservative session/condition hulls; observed
    maxima/percentiles are empirical and cannot certify all future operation.
@@ -337,7 +337,7 @@ The current run already meets the numerical target. Likely useful improvements:
 - Ensure timezone/DST transitions are handled; the current fixed `AEST-10`
   rule is suitable for this date but is not a year-round Melbourne DST rule.
 
-No direct AS11 reference should silently replace the autonomous SomnoPal fit.
+No direct AS11 reference should silently replace the autonomous SomnoBridge fit.
 The reference is an experimental scorer, not a new production dependency.
 
 ## 8. Firmware/API follow-up and acceptance
@@ -385,14 +385,14 @@ Acceptance tests:
 
 ## 9. First automated live result
 
-A masked session (`20261002_164953`-era SomnoTrace metadata; SomnoPal beacon
+A masked session (`20261002_164953`-era SomnoTrace metadata; SomnoBridge beacon
 `20261002_164826_BRP.edf`) was collected passively after the user confirmed
 mask placement. SomnoTrace `EnterTherapy` was acknowledged; the user stopped
 therapy manually. No card writes or additional card polls were added.
 
 | Item | Result |
 |---|---|
-| SomnoPal snapshots | 216 |
+| SomnoBridge snapshots | 216 |
 | Bracketed `GetDateTime` references | 69 |
 | BLE exchange groups | 3, host-side only; source bound ≈ ±148–150 ms |
 | Journal replays | 4; final replay reported no gaps/truncation |
@@ -469,12 +469,12 @@ This is intentionally `anchor_best_effort`, not a qualified anchor.
 
 Three controlled masked sessions were then run for ten minutes each with
 approximately two-minute gaps. Evidence is private mode-0600 timing metadata
-only: `/tmp/somnopal-validation-kxss4a0n/evidence.jsonl`; scored output is
-`/tmp/somnopal-validation-kxss4a0n/analysis.json`.
+only: `/tmp/somnobridge-validation-kxss4a0n/evidence.jsonl`; scored output is
+`/tmp/somnobridge-validation-kxss4a0n/analysis.json`.
 
 | Item | Result |
 |---|---|
-| SomnoPal snapshots | 404 |
+| SomnoBridge snapshots | 404 |
 | Bracketed `GetDateTime` references | 120 |
 | BLE exchange groups / usable exchanges | 5 / 15 |
 | Journal replays | 4 |

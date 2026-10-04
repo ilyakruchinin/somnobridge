@@ -1,5 +1,5 @@
 /*
- * SomnoPal — board support (LCD + BOOT button)
+ * SomnoBridge — board support (LCD + BOOT button)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE for the Section 7(b) attribution term.
  */

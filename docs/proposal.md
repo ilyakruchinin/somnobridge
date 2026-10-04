@@ -9,16 +9,16 @@
 
 ## 1. Recommendation in one page
 
-**Use the AS10's own 60-second flush as a clock, and make SomnoPal watch it with a
+**Use the AS10's own 60-second flush as a clock, and make SomnoBridge watch it with a
 phase-locked poller.**
 
 1. During therapy the AS10 appends one 60 s EDF record to each open file about once a
    minute and updates the FAT directory entry (**size** and **mtime**). Each flush is a
-   physical event that (a) SomnoPal can timestamp against NTP-derived time and
+   physical event that (a) SomnoBridge can timestamp against NTP-derived time and
    (b) carries an AS10-RTC stamp (the mtime). Every flush is therefore one
    *(AS10 says X, truth says Y)* pair. No file downloads, no EDF parsing — a
    directory listing is enough.
-2. Because the cadence is ~60 s, SomnoPal does not need to poll continuously. After a
+2. Because the cadence is ~60 s, SomnoBridge does not need to poll continuously. After a
    short acquisition it runs an **early/late-gate poller**: one directory listing per
    cycle, placed at the *predicted* edge; whether the new mtime is already visible
    steers the next poll earlier or later (a bang-bang phase-locked loop). Steady-state
@@ -27,7 +27,7 @@ phase-locked poller.**
    EZShare cards.
 3. The 2 s FAT quantisation is defeated statistically (upper-envelope estimator across
    files and cycles), not by polling faster.
-4. SomnoPal timestamps everything on its own monotonic clock and logs **raw
+4. SomnoBridge timestamps everything on its own monotonic clock and logs **raw
    evidence** plus BLE time-sync anchors from SomnoTrace. NTP time is assigned
    *afterwards* by interpolating between anchors. The estimator can be re-run on the
    raw log as it improves.
@@ -90,7 +90,7 @@ assumed timezone, see §7.3):
 o    = AS10_clock − true_time        unknown offset we want (positive = AS10 fast)
 T_k  = true time at which the AS10 stamps flush k
 L    = latency from stamping to the directory entry being visible over WiFi  (>= 0)
-s_k  = T_k + L                       when SomnoPal could first see it (estimated by polling)
+s_k  = T_k + L                       when SomnoBridge could first see it (estimated by polling)
 m_k  = mtime shown in the listing    = floor2( AS10_clock(T_k) )      (2 s FAT granularity)
 q_k  = quantisation error            in [0, 2) s
 ```
@@ -203,7 +203,7 @@ These add redundancy and per-session anchors; none is precise enough alone.
 Because every poll makes the card touch the SD through its MUX, anything that tells us
 about flush timing *without* reading the card is attractive:
 
-- **WiFi association / beacon TSF.** SomnoPal, as STA, sees the AP appear/disappear
+- **WiFi association / beacon TSF.** SomnoBridge, as STA, sees the AP appear/disappear
   and can read the AP's 64-bit µs TSF (needs promiscuous management-frame capture).
   TSF resets on card power-up → detects **card power cycles and boundaries** with no
   requests. It does *not* give flush timing.
@@ -247,13 +247,13 @@ Needed to *calibrate and validate* everything above, once:
 
 ---
 
-## 5. Getting NTP time into SomnoPal
+## 5. Getting NTP time into SomnoBridge
 
-SomnoPal sits on the EZShare AP with no internet route, so its NTP source is
+SomnoBridge sits on the EZShare AP with no internet route, so its NTP source is
 **SomnoTrace over the BLE link** it already serves.
 
-- **Two-way exchange, NTP-style.** SomnoPal sends `t1`; SomnoTrace replies with
-  `(t2 = its NTP time on receipt, t3 = its NTP time on reply)`; SomnoPal records `t4`.
+- **Two-way exchange, NTP-style.** SomnoBridge sends `t1`; SomnoTrace replies with
+  `(t2 = its NTP time on receipt, t3 = its NTP time on reply)`; SomnoBridge records `t4`.
   Offset `= ((t2−t1)+(t3−t4))/2`, RTT `= (t4−t1)−(t3−t2)`. BLE connection-interval
   granularity bounds this at roughly **±10–30 ms**; keep the lowest-RTT exchanges and
   discard outliers. This is well below the HTTP-side noise, so it is not the limiter.
@@ -266,7 +266,7 @@ SomnoPal sits on the EZShare AP with no internet route, so its NTP source is
   8 h, so anchors every ~10 min make it negligible, and even a BLE gap of hours is
   recoverable by the anchors either side.
 - **If the BLE link is down** for a whole session, the observations remain valid on
-  `mono_us`; they resolve when the next anchor arrives. SomnoPal must therefore keep
+  `mono_us`; they resolve when the next anchor arrives. SomnoBridge must therefore keep
   running through BLE loss and persist its log (the GEEK's TF slot suits this).
 
 ---
@@ -335,7 +335,7 @@ comes from *when* the requests are placed, not how many there are.
 ### 6.4 Guardrails (load and safety)
 
 - **Hard rate ceiling** (e.g. ≤1 request/10 s outside Phase 1) and a global request
-  budget per night, enforced in SomnoPal regardless of what the estimator wants.
+  budget per night, enforced in SomnoBridge regardless of what the estimator wants.
 - **Never poll during a bulk download**, and never run bulk transfers *during* an active
   flush cadence unless they have been proven not to disturb the AS10 — the bridge job
   and the timing job compete for the same card.
@@ -355,7 +355,7 @@ comes from *when* the requests are placed, not how many there are.
 
 ## 7. Estimator, evidence, hand-off
 
-### 7.1 Raw evidence log (what SomnoPal persists)
+### 7.1 Raw evidence log (what SomnoBridge persists)
 
 Log evidence, not conclusions, so improved estimators can re-run history:
 
@@ -440,7 +440,7 @@ Per-session result by scenario:
 Rate: **~1–3 ppm** (Precise/Balanced), ~8 ppm (Frugal). At 8 h, 3 ppm is 0.09 s.
 
 Between sessions, if the rate is known to ~3 ppm, a session can be *interpolated* from
-its neighbours with ~0.26 s error per 24 h — so a night where SomnoPal lost lock or was
+its neighbours with ~0.26 s error per 24 h — so a night where SomnoBridge lost lock or was
 absent is still recoverable to well under a second.
 
 ---
@@ -455,7 +455,7 @@ absent is still recoverable to well under a second.
 | E3 | Test `Range:` support and cost of a 256-byte header read mid-therapy | Whether Channel 2 can be read live | Header polling allowed/forbidden |
 | **E4** | Rig B: read `TIC` (bisected rollover) + `STK` over UART while logging SD stamps; run several nights | **A5** locked vs independent; `L`; `q` behaviour; **ground-truth `o`** | Decides §4.4 branch; calibrates `L` |
 | E5 | Rig B/A: 5–10 Hz ping / `version` probe vs Channel-1 edges | Channel 6 latency signature | Adopt or drop |
-| E6 | Rig A: PC host writing at 60 s cadence + `sync`; SomnoPal polling | Card listing latency & staleness (**A3**), HTTP RTT distribution, mtime rendering | Calibrates the HTTP term; independent of AS10 |
+| E6 | Rig A: PC host writing at 60 s cadence + `sync`; SomnoBridge polling | Card listing latency & staleness (**A3**), HTTP RTT distribution, mtime rendering | Calibrates the HTTP term; independent of AS10 |
 | E7 | Full system on AS10 for ≥2 weeks with UART truth captured at intervals | End-to-end accuracy vs ground truth; drift character (offset/rate/steps); DST behaviour | Final accuracy claim |
 
 **Pass criteria for adopting the design:** E0 shows no AS10 disturbance at the chosen
@@ -474,16 +474,16 @@ estimated `o` within 0.5 s of UART truth on ≥90 % of nights.
 | Cadence has large jitter | Poor prediction → more acquisition | Pairing still works (§4.1); widen the gate |
 | Firmware variants differ (AS10 SX567 revisions, card firmware) | Per-family `L`, `q` | Fingerprint via `version`/`Identification.*`; per-family constants |
 | DST / manual clock set mid-night | False "drift" | Step detection + flags (§7.3) |
-| SomnoPal not powered / not locked overnight | Missing sessions | Interpolation between neighbours; flag `low_coverage` |
+| SomnoBridge not powered / not locked overnight | Missing sessions | Interpolation between neighbours; flag `low_coverage` |
 | Privacy | Listings contain only names/sizes/times — no therapy data | Logs contain no EDF content; keep it that way |
 
 **Open questions for the maintainer:**
 
 1. Can an AS10 with the UART breakout be dedicated to E4 for a few nights? It is the
    single highest-value experiment.
-2. Preferred split of work: estimator on SomnoPal (proposed; cheap arithmetic, keeps
+2. Preferred split of work: estimator on SomnoBridge (proposed; cheap arithmetic, keeps
    SomnoTrace simple) or all-on-SomnoTrace from raw evidence?
-3. Should SomnoPal expose "hold off timing" for cases when SomnoTrace wants the card for
+3. Should SomnoBridge expose "hold off timing" for cases when SomnoTrace wants the card for
    a bulk pull immediately after therapy ends?
 4. Log retention target (nights of raw evidence kept on the GEEK's TF card).
 
@@ -499,13 +499,13 @@ estimated `o` within 0.5 s of UART truth on ≥90 % of nights.
 
 | Proposed Element | Status | Critique & Reality Check |
 |---|---|---|
-| **BLE NTP time transfer** (§5) | **Agreed (Strong)** | Pushing NTP time from SomnoTrace to SomnoPal over BLE with two-way exchanges and retrospective interpolation on `mono_us` is elegant, robust, and avoids complex dual-radio WiFi topologies. |
+| **BLE NTP time transfer** (§5) | **Agreed (Strong)** | Pushing NTP time from SomnoTrace to SomnoBridge over BLE with two-way exchanges and retrospective interpolation on `mono_us` is elegant, robust, and avoids complex dual-radio WiFi topologies. |
 | **Monotonic raw evidence logging** (§7.1) | **Agreed (Strong)** | Logging raw timestamps and observables to the GEEK's TF cache before fitting preserves ground truth and allows retrofitting improved estimators without re-running hardware tests. |
 | **Offset + rate model** (`clock_drift_ms`, `rate_ppm`) (§3, §7.4) | **Agreed (Strong)** | Matches SomnoTrace's established sign convention and models within-night crystal drift (~1–3 s over 8 h). |
 | **Bang-bang PLL edge-hunting** (§6.2) | **Flawed (Hazardous)** | Intentionally steering polls to land directly on the 1–2 s AS10 write burst creates high bus contention on the EZShare hardware MUX, risks SD buffer overrun on the medical recorder, and suffers from card-side HTTP latency jitter (50–1500 ms) that destroys sub-second early/late gating. |
 | **Upper-envelope de-quantization** (§4.4) | **Flawed (Math)** | The `2/(N+1)` envelope convergence assumes independent, uniformly distributed phase samples $q_k \sim U[0, 2)$. In reality, the AS10's sample clock and RTC drift by <20 ppm (~1.2 ms/cycle), sweeping <0.5 s across an entire 8 h night. The phase is strongly autocorrelated; the upper envelope on a single night remains biased by up to ~1.4 s. |
 | **Free 1 s filenames in listings** (§4.2) | **Unverified / Unlikely** | Real EZShare firmware emits 8.3 FAT short names (`2071A5~1.EDF`), stripping the second-resolution timestamp from `YYYYMMDD_HHMMSS_*.edf`. Finer resolution must come from EDF headers or record integration. |
-| **Online-only directory restriction** (§1, §4) | **Suboptimal** | Restricting observation to 1 KB directory listings during therapy ignores the fact that SomnoPal's core purpose is to bridge the full EDF files to SomnoTrace post-session. Full EDF headers and exact record counts provide ground-truth integration that supersedes directory heuristics. |
+| **Online-only directory restriction** (§1, §4) | **Suboptimal** | Restricting observation to 1 KB directory listings during therapy ignores the fact that SomnoBridge's core purpose is to bridge the full EDF files to SomnoTrace post-session. Full EDF headers and exact record counts provide ground-truth integration that supersedes directory heuristics. |
 
 ---
 
@@ -517,7 +517,7 @@ In §6.2 and §6.4, the proposal states:
 This is the single most critical operational risk in the proposal:
 
 1. **Hardware MUX Contention:** The EZShare card uses an internal bus switch to multiplex flash access between the AS10's SDIO/SPI pins and the card's internal WiFi MCU. If an incoming HTTP directory request hits while the AS10 is issuing multi-block write commands, one of two things happens:
-   - The card's WiFi MCU stalls until the AS10 completes, causing HTTP response latency spikes (up to 1–2 seconds) or TCP timeouts on SomnoPal.
+   - The card's WiFi MCU stalls until the AS10 completes, causing HTTP response latency spikes (up to 1–2 seconds) or TCP timeouts on SomnoBridge.
    - The MUX arbitrates against the AS10, delaying host block acknowledgement. For a CPAP device sampling flow at 25–50 Hz and pressure at 40 Hz into RTOS ring buffers, delayed SD writes risk buffer overrun, dropped sensor packets, or triggering a visible SD card fault on the machine.
 2. **HTTP Latency Jitter vs Bang-Bang Step:** A bang-bang PLL dithering with step $\delta = 50\text{--}250\text{ ms}$ requires the observation channel to have timing noise well below $\delta$. Embedded WiFi SD web servers exhibit non-deterministic service latency (50 ms idle up to >1000 ms during flash read/write or WiFi beacon retransmission). A 300 ms response latency spike reads as a false "edge not yet visible", corrupting the PLL phase detector.
 3. **Card-Side Sector Buffering:** If EZShare caches directory sectors in SRAM even for 500 ms to 1 s, the apparent visibility edge shifts unpredictably based on cache eviction rather than host write timing.
@@ -575,19 +575,19 @@ The proposal (§4.2) assumes that `YYYYMMDD_HHMMSS_*.edf` is readable directly f
   </pre>
   ```
 - The original long filename timestamp is hashed/truncated into the short name (e.g. `2071A5~1.EDF` or `202107~1.EDF`).
-- **Consequence:** The 1-second timestamp in the filename cannot be assumed to be present in `/dir`. To obtain 1-second resolution, SomnoPal or SomnoTrace must read the **EDF fixed header** (`bytes 0..255`) where `startdate` (`dd.mm.yy`) and `starttime` (`hh.mm.ss`) are preserved intact.
+- **Consequence:** The 1-second timestamp in the filename cannot be assumed to be present in `/dir`. To obtain 1-second resolution, SomnoBridge or SomnoTrace must read the **EDF fixed header** (`bytes 0..255`) where `startdate` (`dd.mm.yy`) and `starttime` (`hh.mm.ss`) are preserved intact.
 
 ---
 
 ### 11.5 The Two-Tier Paradigm: Quiet-Window Tracking + Post-Session Synthesis
 
-SomnoPal does not exist in a vacuum; it is an active bridge to SomnoTrace. SomnoTrace consumes data **post-session** when calculating compliance, daily summaries, SleepHQ synchronization, and EDF export.
+SomnoBridge does not exist in a vacuum; it is an active bridge to SomnoTrace. SomnoTrace consumes data **post-session** when calculating compliance, daily summaries, SleepHQ synchronization, and EDF export.
 
 Therefore, drift estimation should be split into two complementary tiers:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│ TIER 1: Online / In-Session Tracking (SomnoPal on EZShare AP)          │
+│ TIER 1: Online / In-Session Tracking (SomnoBridge on EZShare AP)          │
 │                                                                        │
 │ • Polls at quiet midpoint (φ ≈ +30 s), 1 request every 60–120 s        │
 │ • Observes record increments (k), FAT mtime, and response RTT          │
@@ -598,7 +598,7 @@ Therefore, drift estimation should be split into two complementary tiers:
                                     │ Post-session BLE File Transfer
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│ TIER 2: Post-Session Rigorous Synthesis (SomnoTrace or SomnoPal)       │
+│ TIER 2: Post-Session Rigorous Synthesis (SomnoTrace or SomnoBridge)       │
 │                                                                        │
 │ • Ingests full EDF fixed headers (exact 1 s starttime: HH:MM:SS)       │
 │ • Ingests STR.edf session summary (mask-on / mask-off events)          │
@@ -617,7 +617,7 @@ Therefore, drift estimation should be split into two complementary tiers:
 2. **Absolute Offset Disambiguation:**
    - The EDF fixed header gives $t_{\text{start}}$ at **1 s** resolution.
    - The FAT directory creation mtime gives an independent 2 s floor.
-   - SomnoPal's first observed file appearance window bounds $T_{\text{start}}$ from above: $T_{\text{first\_seen\_ntp}} - \text{Latency} \ge t_{\text{start}}$.
+   - SomnoBridge's first observed file appearance window bounds $T_{\text{start}}$ from above: $T_{\text{first\_seen\_ntp}} - \text{Latency} \ge t_{\text{start}}$.
    - Combining the 1 s header timestamp with the bounding window isolates the sub-second offset to the order of the file creation latency (~0.2–0.5 s), achieving target accuracy cleanly.
 
 ---
@@ -628,8 +628,8 @@ Beyond directory entries, three physical hardware events provide zero-bus-load t
 
 1. **Card Association & WiFi Beacon TSF:**
    - When the AS10 powers up its SD slot (at therapy start or machine wake), the EZShare card boots.
-   - SomnoPal detects the SSID beacon. The 802.11 beacon management frame carries a 64-bit microsecond Timing Synchronization Function (TSF) timestamp.
-   - The TSF resets to 0 on boot. SomnoPal recording the monotonic arrival of `TSF = 0` provides an exact hardware boot timestamp without issuing a single HTTP or SD request.
+   - SomnoBridge detects the SSID beacon. The 802.11 beacon management frame carries a 64-bit microsecond Timing Synchronization Function (TSF) timestamp.
+   - The TSF resets to 0 on boot. SomnoBridge recording the monotonic arrival of `TSF = 0` provides an exact hardware boot timestamp without issuing a single HTTP or SD request.
 2. **Mask-On / Mask-Off Transients:**
    - The AS10 detects breathing and mask application automatically (SmartStart / SmartStop).
    - In `STR.edf` and the EDF summary files, MaskOn and MaskOff are recorded to the minute/second.
@@ -649,7 +649,7 @@ Beyond directory entries, three physical hardware events provide zero-bus-load t
 | **Quantization Handling** | Upper envelope over $r_k$ | Joint fit of 1 s EDF header + record integrator + quiet bounds | Mathematically sound; avoids the autocorrelated $q_k$ trap |
 | **Rate Determination** | Edge-to-edge diffs across cycles | Total records ($N \times 60\,\text{s}$) vs total session NTP elapsed time | Sub-0.05 ppm precision with trivial computation |
 | **Filename Reliance** | Assumes long names with HHMMSS in `/dir` | Treats `/dir` names as 8.3 aliases; extracts 1 s time from EDF header bytes | Robust against real EZShare firmware limitations |
-| **Timing Role** | Standalone online estimator on SomnoPal | Two-tier: SomnoPal logs raw evidence; SomnoTrace finalizes at ingest | Fits SomnoTrace's existing post-therapy pipeline; maximum algorithmic flexibility |
+| **Timing Role** | Standalone online estimator on SomnoBridge | Two-tier: SomnoBridge logs raw evidence; SomnoTrace finalizes at ingest | Fits SomnoTrace's existing post-therapy pipeline; maximum algorithmic flexibility |
 
 ---
 
@@ -695,8 +695,8 @@ retaining most of the original precision.
 1. **Quiet windows as the default.** §6.4 treated burst proximity as a gated risk
    (test in E0, then decide). §11 is right that the *default* must be away from the
    burst, with near-edge observation strictly opt-in. Adopted (§A.5).
-2. **Two-tier split.** SomnoPal logs raw evidence and tracks online; SomnoTrace (or
-   SomnoPal offline) finalizes at ingest with full EDF headers. This was already the
+2. **Two-tier split.** SomnoBridge logs raw evidence and tracks online; SomnoTrace (or
+   SomnoBridge offline) finalizes at ingest with full EDF headers. This was already the
    intent in §7.1/§7.4 — §4.2's "avoid during therapy" applied to *live* header reads,
    not to post-session ingestion. §11 states it better; adopted.
 3. **8.3 filename warning — as a risk, not a fact.** The archived spec
@@ -984,7 +984,7 @@ original C5 in `as10-time-drift.md`). This is premature:
   *relative* to the file's `starttime`, which is in AS10-clock time. The
   annotations describe clinically timestamped events (apneas, hypopneas, large
   leaks) that occur at specific points during therapy.
-- **Post-session**, SomnoPal bridges the entire file. SomnoTrace can then
+- **Post-session**, SomnoBridge bridges the entire file. SomnoTrace can then
   compare the annotation onset (AS10 time) against the O2 ring's desaturation
   event (NTP time). A 3% SpO2 desaturation following an obstructive apnea has
   a physiological delay of 15–45 s. This is coarse, but it is an *independent*
@@ -1003,7 +1003,7 @@ original C5 in `as10-time-drift.md`). This is premature:
 
 STR.edf records `MaskOn` and `MaskOff` as minute-of-day values (signals `ONT`
 and `OFT` in `edf_signals.md`). These are AS10-clock timestamps. The
-corresponding physical event — mask removal — is observable by SomnoPal
+corresponding physical event — mask removal — is observable by SomnoBridge
 through two independent channels:
 1. WiFi disassociation if the AS10 powers down the SD slot at therapy end
    (immediate).
@@ -1036,14 +1036,14 @@ The comb fit (§A.4) requires knowing the exact record size to derive `k` from
 | SAD.edf | 60 + 60 + 1 = 121 samples | **242** |
 
 The record size varies by AS10 variant (CPAP, AutoSet, VAuto, ASV).
-**SomnoPal cannot assume a fixed record size.** The correct approach: read the
+**SomnoBridge cannot assume a fixed record size.** The correct approach: read the
 EDF header once (post-session, during the file transfer it is already doing)
 to extract `nr_signals` and `samples_per_record[]`, compute the record size,
 and apply it retroactively to the in-session size observations. This is
 compatible with the two-tier design — Tier 1 logs raw sizes; Tier 2 resolves
 record counts from the header.
 
-**Alternative for Tier 1 (without headers):** if SomnoPal observes two
+**Alternative for Tier 1 (without headers):** if SomnoBridge observes two
 consecutive size values `S_j` and `S_{j+1}` with `S_{j+1} > S_j`, then
 `ΔS = S_{j+1} − S_j` is the record size (or a multiple thereof if more than
 one flush occurred between polls). A single observed `ΔS` at the start of
@@ -1077,7 +1077,7 @@ to confirm whether it is exactly `P` or carries an additional offset.
 #### B.3.5 Persistent State Across Power Cycles
 
 The GEEK's TF card is the evidence store. What happens if:
-1. SomnoPal loses power mid-session (USB unplugged, power outage)?
+1. SomnoBridge loses power mid-session (USB unplugged, power outage)?
 2. The TF card fills up?
 3. The TF card is corrupt?
 
@@ -1103,13 +1103,13 @@ The document contains seven experiments and a multi-component firmware design.
 The risk of "analysis paralysis" is real — the experiments depend on hardware
 that may not all be available immediately. A pragmatic build order:
 
-1. **Week 1: SomnoPal WiFi client + HTTP listing parser.**
+1. **Week 1: SomnoBridge WiFi client + HTTP listing parser.**
    Join the EZShare AP, poll `/dir`, parse the HTML `<pre>` listing, log
    `{mono_us, entries[]}` to serial and/or TF. This is useful immediately for
    E0/E1 and is the foundation of all timing work.
 
 2. **Week 2: BLE GATT server + NTP time exchange.**
-   SomnoTrace connects, pushes NTP anchors. SomnoPal logs
+   SomnoTrace connects, pushes NTP anchors. SomnoBridge logs
    `{mono_us, ntp_ms, rtt_us}`. Now the evidence log has both clocks.
 
 3. **Week 3: Comb fit prototype (offline, on PC).**
@@ -1118,7 +1118,7 @@ that may not all be available immediately. A pragmatic build order:
    any embedded estimator is written.
 
 4. **Week 4+: File transfer bridge, embedded estimator, LCD status.**
-   The timing subsystem is validated; the bridge is the primary SomnoPal
+   The timing subsystem is validated; the bridge is the primary SomnoBridge
    feature; the estimator runs alongside.
 
 E4 (UART rig) can run in parallel whenever the hardware is available — it
@@ -1129,7 +1129,7 @@ does not block the firmware build.
 The proposal assumes the AS10 writes only during therapy. This is likely true
 for BRP/PLD/SAD, but STR.edf and Identification files may be updated outside
 therapy (settings changes, compliance summary writes, alarm events). If the
-AS10 writes to the card while SomnoPal is not expecting it:
+AS10 writes to the card while SomnoBridge is not expecting it:
 - A `/dir` poll during a surprise write hits the same MUX contention window.
 - The evidence log may contain unexpected size/mtime changes that confuse the
   comb fit.
@@ -1412,8 +1412,8 @@ SleepHQ and ResScan tolerate it is unknown. Recommendation:
 ### C.6 Integration note not covered anywhere
 
 SomnoTrace's BLE stack has a history of fragility (AS11 supervision-timeout disconnects,
-coexistence tuning). An AS10 user has **no AS11 link**, so SomnoPal takes that slot
-(SomnoPal + O2 ring = two links, as today) instead of adding a third. Still, the
+coexistence tuning). An AS10 user has **no AS11 link**, so SomnoBridge takes that slot
+(SomnoBridge + O2 ring = two links, as today) instead of adding a third. Still, the
 time-exchange and file-transfer traffic should follow SomnoTrace's existing
 connection-parameter and coexistence settings, and share its reconnect logic rather
 than reinvent it.
@@ -1822,7 +1822,7 @@ file-creation time. Two shortcuts:
   consecutive contact is the case to test in E0b — the field prior (hms-cpap, isolated
   hits) says nothing about it.
 - **Rigid grid is pessimistic** (in D's favour, but the simulator must model it):
-  SomnoPal's own poll scheduling jitter, AS10 flush jitter, and the rate mismatch
+  SomnoBridge's own poll scheduling jitter, AS10 flush jitter, and the rate mismatch
   `60·ε ≈ 3 ms/cycle` at 50 ppm (≈ 36 ms grid shift per 65 s sweep) all fill the
   grid over a night. A 65 s vernier over 8 h is therefore better than ±2.5 s in
   practice — how much better is a simulator question, not a hand-derivation one.

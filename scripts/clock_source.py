@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
 # GPLv3+ — see LICENSE and NOTICE.
 #
-# Host clock-source bound and stable source identity for SomnoPal timing
+# Host clock-source bound and stable source identity for SomnoBridge timing
 # exchanges. The uncertainty is deliberately conservative: chrony's root
 # distance plus a fixed guard is a bound claim, not a precision claim.
 

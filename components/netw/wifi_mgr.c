@@ -1,5 +1,5 @@
 /*
- * SomnoPal — WiFi manager (spec §4.3)
+ * SomnoBridge — WiFi manager (spec §4.3)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  */
@@ -199,7 +199,7 @@ esp_err_t netw_enter_sta(const sp_settings_t *cfg)
 static void gen_ap_credentials(void)
 {
     uint32_t r = esp_random();
-    snprintf(s_ap_ssid, sizeof(s_ap_ssid), "SomnoPal-Setup-%04lX",
+    snprintf(s_ap_ssid, sizeof(s_ap_ssid), "SomnoBridge-Setup-%04lX",
              (unsigned long)(r & 0xFFFF));
     s_ap_pass[0] = '\0';   /* open AP — short-lived setup window only */
 }

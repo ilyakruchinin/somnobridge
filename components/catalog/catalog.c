@@ -1,5 +1,5 @@
 /*
- * SomnoPal — volatile DATALOG catalog (spec §5)
+ * SomnoBridge — volatile DATALOG catalog (spec §5)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *

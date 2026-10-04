@@ -1,5 +1,5 @@
 /*
- * SomnoPal — NVS settings store (spec §4.2)
+ * SomnoBridge — NVS settings store (spec §4.2)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *
@@ -11,7 +11,7 @@
  * CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID is provisioned (purpose HMAC_UP), all
  * three NVS partitions are opened through nvs_flash_secure_init*. The key
  * is NEVER auto-burned — a missing key means fail-closed (production) or
- * plainly-marked dev mode (CONFIG_SOMNOPAL_DEV_UNPROTECTED).
+ * plainly-marked dev mode (CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED).
  */
 #include <string.h>
 
@@ -173,7 +173,7 @@ esp_err_t settings_init(void)
         }
         ESP_RETURN_ON_ERROR(err, TAG, "secure init");
         s_sec = SP_SEC_ENCRYPTED;
-    } else if (CONFIG_SOMNOPAL_DEV_UNPROTECTED) {
+    } else if (CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED) {
         ESP_LOGW(TAG, "no eFuse HMAC key — DEV UNPROTECTED storage");
         esp_err_t err = nvs_flash_init();
         if (err == ESP_ERR_NVS_NO_FREE_PAGES ||

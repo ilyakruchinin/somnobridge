@@ -1,5 +1,5 @@
 /*
- * SomnoPal — phase-tracking poll schedule (update3 spec §4)
+ * SomnoBridge — phase-tracking poll schedule (update3 spec §4)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *
@@ -40,7 +40,7 @@ typedef enum {
 
 typedef struct {
     uint32_t watch_gap_us;   /* continuous-poll spacing (5 s)          */
-    uint32_t rate_ppm;       /* device/SomnoPal rate-disagreement bound */
+    uint32_t rate_ppm;       /* device/SomnoBridge rate-disagreement bound */
     bool     enabled;        /* false pins the tracker to fixed polls  */
     bool     refine;         /* allow the REFINE stage                  */
 } phase_cfg_t;

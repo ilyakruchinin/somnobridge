@@ -1,5 +1,5 @@
 /*
- * SomnoPal — minimal text UI on the ST7789.
+ * SomnoBridge — minimal text UI on the ST7789.
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *

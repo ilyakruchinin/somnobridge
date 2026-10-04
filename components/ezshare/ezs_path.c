@@ -1,5 +1,5 @@
 /*
- * SomnoPal — EZShare path canonicalization (spec §11.1)
+ * SomnoBridge — EZShare path canonicalization (spec §11.1)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *

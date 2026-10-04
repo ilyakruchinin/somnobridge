@@ -1,5 +1,5 @@
 /*
- * SomnoPal — EZShare HTTP adapter (spec §11)
+ * SomnoBridge — EZShare HTTP adapter (spec §11)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  */

@@ -1,5 +1,5 @@
 /*
- * SomnoPal — EZShare HTML <pre> listing parser (host-testable, spec §11.2)
+ * SomnoBridge — EZShare HTML <pre> listing parser (host-testable, spec §11.2)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *

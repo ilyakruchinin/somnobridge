@@ -2,14 +2,14 @@
 
 **Status:** design, pre-implementation. `proposal-final.md` remains the clock/therapy
 design; this document defines the DATALOG metadata catalog and synchronization
-ownership between SomnoPal and SomnoTrace. Terminology follows `proposal-final.md`
+ownership between SomnoBridge and SomnoTrace. Terminology follows `proposal-final.md`
 (`therapy_active`, `transfer_allowed`, `stale`, fitted `P`, hot-window listing).
 
 ## 1. Goals and non-goals
 
 **Goals**
 
-- SomnoPal maintains a **volatile, rebuildable, DATALOG-only metadata catalog** in
+- SomnoBridge maintains a **volatile, rebuildable, DATALOG-only metadata catalog** in
   PSRAM, fed by the same EZShare listings the timing controller already issues.
 - SomnoTrace is the **sole persistent sync authority**: it compares requested
   recent catalog metadata against its own durable state and decides what to fetch.
@@ -18,7 +18,7 @@ ownership between SomnoPal and SomnoTrace. Terminology follows `proposal-final.m
 **Non-goals**
 
 - No TF card requirement for the catalog. No file-content snapshots. No persistent
-  transfer database on SomnoPal. **No `boot_id`, generation counters, per-entry
+  transfer database on SomnoBridge. **No `boot_id`, generation counters, per-entry
   versions, or change-log protocol.**
 - Files outside `A:\DATALOG` are **not** indexed or cached. SomnoTrace accesses
   them through the live, uncached `LIST_DIRECTORY` and generic `GET_FILE` proxy
@@ -81,7 +81,7 @@ ownership between SomnoPal and SomnoTrace. Terminology follows `proposal-final.m
 - The exact EZShare-exposed names/aliases must be used for download. Alias
   stability must be tested; never infer a timestamp from hashed 8.3 names.
 
-## 5. API (SomnoPal, over BLE)
+## 5. API (SomnoBridge, over BLE)
 
 Keep it simple — per-day granularity avoids pagination-consistency and version
 schemes.
@@ -108,7 +108,7 @@ schemes.
   supplied, a known pre-body mismatch rejects the request. No claim of HTTP Range.
 - Both live proxy APIs must canonicalize paths, reject traversal and write-like
   operations, and restrict access to the EZShare volume rooted at `A:\`.
-- SomnoPal **never** decides which files are "needed" — it lacks SomnoTrace
+- SomnoBridge **never** decides which files are "needed" — it lacks SomnoTrace
   state. It returns requested metadata; SomnoTrace decides.
 - BLE framing/chunking is a transport detail. One logical `LIST_DAY` response
   must be internally consistent: copy the entry descriptors under the catalog
@@ -117,7 +117,7 @@ schemes.
 ## 6. SomnoTrace algorithm and state
 
 - Setting `recent_noon_days` = `N` — recommended initial **14**, configurable.
-  This is a **query window**, not SomnoPal retention.
+  This is a **query window**, not SomnoBridge retention.
 - Sync loop: query status → `LIST_RECENT_DAYS(N)` → `LIST_DAY` each returned day
   → compare remote `(day, name, size, timestamp_raw)` to persistent local state.
 - Persistent state minimum: `day`/`name`, last downloaded size and raw timestamp,
@@ -131,19 +131,19 @@ schemes.
 - Root/STR/etc. are not catalog entries. After detecting a relevant DATALOG
   change, SomnoTrace uses `LIST_DIRECTORY` to obtain their current live metadata,
   compares it with its own state, and fetches selected files with generic
-  `GET_FILE`. These results remain uncached on SomnoPal.
+  `GET_FILE`. These results remain uncached on SomnoBridge.
 
 ## 7. Toilet-break / resume race — honest, simple rules
 
 - The catalog is minute-fresh, **not a lock**. If therapy resumes during a `GET`,
-  SomnoPal may detect it only at the next listing — or only after a long GET if
+  SomnoBridge may detect it only at the next listing — or only after a long GET if
   EZShare cannot serve a listing concurrently.
 - **Before each GET:** SomnoTrace requires `therapy_active == false`
   (OUT_OF_THERAPY) and `transfer_allowed == true`. For a DATALOG file, its cached
   folder must be fresh (non-`stale`) and its tuple must match `expected_size`.
   For an uncached file, SomnoTrace must first obtain fresh metadata from
   `LIST_DIRECTORY`, then pass that size as `expected_size`.
-- **After each GET:** SomnoPal prioritizes an immediate refresh of **both** (a)
+- **After each GET:** SomnoBridge prioritizes an immediate refresh of **both** (a)
   the source directory, to re-check the file tuple — cached folder refresh for
   DATALOG, live `LIST_DIRECTORY` otherwise — and (b) the active/hot DATALOG
   folder needed for therapy detection, if different. SomnoTrace waits for both
@@ -229,7 +229,7 @@ schemes.
 
 This is deliberately simple: a volatile PSRAM mirror of EZShare listings, an
 unversioned compare tuple, and per-day APIs. There is no arbitrary 14-day cache
-retention on SomnoPal — all metadata is retained while PSRAM permits; `N`
+retention on SomnoBridge — all metadata is retained while PSRAM permits; `N`
 controls only SomnoTrace's query window. Persistent truth remains SomnoTrace's
 local state plus the EZShare card as source of record, so reboots, card swaps,
 and races are recoverable by rebuild/compare and degrade to re-downloads rather

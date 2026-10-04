@@ -1,4 +1,4 @@
-# SomnoPal — implementation update 3: refined offsets and persisted provisional SOT
+# SomnoBridge — implementation update 3: refined offsets and persisted provisional SOT
 
 Status: proposed implementation plan, revision 1, 2026-10-02.
 Documentation only. This document does not change firmware, enable a profile,
@@ -718,7 +718,7 @@ behavior, not merely a state name or an attractive midpoint.
 
 ### 10.4 Commands and short live acceptance
 
-Run from `/opt/shared/somnopal`:
+Run from `/opt/shared/somnobridge`:
 
 ```
 ./scripts/run_host_tests.sh

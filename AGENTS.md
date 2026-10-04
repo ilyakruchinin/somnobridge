@@ -1,4 +1,4 @@
-# SomnoPal — agent and contributor notes
+# SomnoBridge — agent and contributor notes
 
 WiFi↔BLE bridge firmware for the Waveshare ESP32-S3-GEEK, bridging the
 EZShare WiFi SD card (in an AirSense 10) to SomnoTrace over BLE.
@@ -71,7 +71,7 @@ NOT trust it to tell you whether the firmware works:
 
 ## Querying a live device (`scripts/ble_query.py`)
 
-Host-side diagnostic for a bonded SomnoPal (needs `python3-dbus` +
+Host-side diagnostic for a bonded SomnoBridge (needs `python3-dbus` +
 `python3-gi`; the device must be bonded already):
 
 ```bash
@@ -99,7 +99,7 @@ python3 scripts/validate_timing.py self-test
 python3 scripts/validate_timing.py history --day YYYYMMDD
 python3 scripts/validate_timing.py capture --day YYYYMMDD --duration 1200
 python3 scripts/validate_timing.py observe --day YYYYMMDD --duration 7200 --no-anchor-commit
-python3 scripts/validate_timing.py analyze --input /tmp/somnopal-validation-XXXX/evidence.jsonl
+python3 scripts/validate_timing.py analyze --input /tmp/somnobridge-validation-XXXX/evidence.jsonl
 ```
 
 Evidence defaults to a private temporary directory with a mode-0600 JSONL

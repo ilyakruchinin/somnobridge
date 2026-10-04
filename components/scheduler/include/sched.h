@@ -1,5 +1,5 @@
 /*
- * SomnoPal — card worker + therapy FSM + poll scheduler (spec §6/§7)
+ * SomnoBridge — card worker + therapy FSM + poll scheduler (spec §6/§7)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *

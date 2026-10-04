@@ -1,5 +1,5 @@
 /*
- * SomnoPal — time anchors, monotonic→UTC mapping, and drift records
+ * SomnoBridge — time anchors, monotonic→UTC mapping, and drift records
  * (spec §8, §8.5; update spec U3–U7)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.

@@ -1,4 +1,4 @@
-# SomnoPal — implementation update 6: sustained refinement and recent-session fallback
+# SomnoBridge — implementation update 6: sustained refinement and recent-session fallback
 
 Status: implementation handoff. The user approved the recent-session fallback
 policy in sections 8–12 to fix `TODO.md`. Sections 1–7 describe sustained
@@ -18,7 +18,7 @@ timing docs so historical replacement rules do not remain contradictory.
 
 ## 1. Recommendation in simple words
 
-Once SomnoPal learns when the next card update is likely, keep taking a small
+Once SomnoBridge learns when the next card update is likely, keep taking a small
 cluster of spaced readings around that predicted update throughout therapy.
 Move that cluster earlier or later as new readings show the update moving.
 Do not deliberately drop to a coarser schedule simply because acquisition
@@ -122,7 +122,7 @@ all night even with perfect flush polling.
    update. This is what the request scheduler predicts.
 2. **AirSense clock offset:** true UTC minus the machine's file timestamp.
    This is what SomnoTrace needs for correction.
-3. **SomnoPal monotonic-to-UTC mapping:** maintained by authenticated host
+3. **SomnoBridge monotonic-to-UTC mapping:** maintained by authenticated host
    time exchanges, with its own uncertainty and epochs.
 
 Following the visible flush does not directly measure the machine's RTC rate.

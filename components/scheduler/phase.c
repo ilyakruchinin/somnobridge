@@ -1,5 +1,5 @@
 /*
- * SomnoPal — phase-tracking poll schedule (update3 spec §4)
+ * SomnoBridge — phase-tracking poll schedule (update3 spec §4)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *

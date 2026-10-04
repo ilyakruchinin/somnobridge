@@ -1,4 +1,4 @@
-/* SomnoPal — 8x16 font. GPLv3+ (see LICENSE/NOTICE). */
+/* SomnoBridge — 8x16 font. GPLv3+ (see LICENSE/NOTICE). */
 #pragma once
 #include <stdint.h>
 

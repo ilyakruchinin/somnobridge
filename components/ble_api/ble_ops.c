@@ -1,5 +1,5 @@
 /*
- * SomnoPal — BLE ops dispatch + file streaming (spec §10.2–10.4)
+ * SomnoBridge — BLE ops dispatch + file streaming (spec §10.2–10.4)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  */

@@ -1,5 +1,5 @@
 /*
- * SomnoPal — 8x16 VGA-style font (public-domain glyph shapes)
+ * SomnoBridge — 8x16 VGA-style font (public-domain glyph shapes)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *

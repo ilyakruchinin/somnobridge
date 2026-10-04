@@ -1,5 +1,5 @@
 /*
- * SomnoPal — setup portal (AP-mode HTTP server, spec §4.1)
+ * SomnoBridge — setup portal (AP-mode HTTP server, spec §4.1)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *
@@ -65,7 +65,7 @@ static bool cookie_ok(httpd_req_t *r)
 static bool csrf_ok(httpd_req_t *r)
 {
     char hdr[24];
-    if (httpd_req_get_hdr_value_str(r, "X-SomnoPal-CSRF", hdr,
+    if (httpd_req_get_hdr_value_str(r, "X-SomnoBridge-CSRF", hdr,
                                     sizeof(hdr)) != ESP_OK) {
         return false;
     }
@@ -100,11 +100,11 @@ static esp_err_t read_body(httpd_req_t *r, char *buf, size_t cap)
 /* ---------------- handlers ---------------- */
 
 static const char INDEX_HTML[] =
-    "<!doctype html><meta charset=utf-8><title>SomnoPal setup</title>"
+    "<!doctype html><meta charset=utf-8><title>SomnoBridge setup</title>"
     "<style>body{font-family:monospace;max-width:34em;margin:2em auto}"
     "label{display:block;margin:.6em 0}input{width:100%%}"
     "button{margin:.4em 0;padding:.5em 1em}</style>"
-    "<h1>SomnoPal setup</h1>"
+    "<h1>SomnoBridge setup</h1>"
     "<form id=f><label>EZShare SSID<input name=ssid required></label>"
     "<label>Password<input name=pass type=password></label>"
     "<label><input name=open type=checkbox style=width:auto> "
@@ -116,7 +116,7 @@ static const char INDEX_HTML[] =
     "const C='%s';"
     "f.onsubmit=e=>{e.preventDefault();"
     "fetch('/api/config',{method:'POST',headers:{'Content-Type':"
-    "'application/json','X-SomnoPal-CSRF':C},body:JSON.stringify({"
+    "'application/json','X-SomnoBridge-CSRF':C},body:JSON.stringify({"
     "ezshare_ssid:f.ssid.value,ezshare_password:f.pass.value,"
     "allow_open_wifi:f.open.checked,as10_tz:f.tz.value,"
     "timezone_confirmed:true})}).then(r=>r.json()).then(j=>{"

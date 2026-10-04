@@ -8,9 +8,9 @@ reproduced by the simulator (§10, E-sim) before it is quoted anywhere else.
 
 | Constraint | Consequence |
 |---|---|
-| **No wired access** to the AS10 (no UART, no service port). | Nothing can be calibrated against the AS10's own clock. All latencies between "AS10 writes" and "SomnoPal sees it" become **bounded priors**, not measured constants (§7). |
+| **No wired access** to the AS10 (no UART, no service port). | Nothing can be calibrated against the AS10's own clock. All latencies between "AS10 writes" and "SomnoBridge sees it" become **bounded priors**, not measured constants (§7). |
 | **Good accuracy early** — within 30 min, preferably 5 min. Higher polling is acceptable for a short time, at a reasonable rate. | A **staged acquisition** (§5): dense but short polling right after therapy start, then very sparse tracking. Sub-second by ~minute 4, ~30 requests. |
-| **Drift is accumulated over the night and read as metadata** by SomnoTrace when it pulls the last file; SomnoTrace stores it and applies it to the EDFs *it* generates. | SomnoPal never rewrites anything. It publishes a per-session drift record (§8) at ms precision; SomnoTrace rounds only at EDF export. |
+| **Drift is accumulated over the night and read as metadata** by SomnoTrace when it pulls the last file; SomnoTrace stores it and applies it to the EDFs *it* generates. | SomnoBridge never rewrites anything. It publishes a per-session drift record (§8) at ms precision; SomnoTrace rounds only at EDF export. |
 
 Everything else from the review record still applies: no writes to the card, evidence
 logged raw so estimators can be re-run, and load kept modest and bounded by the
@@ -20,7 +20,7 @@ hard guardrails in §5.7.
 
 **Primary observable:** the AS10 appends one 60 s record to each open EDF file about
 once a minute. Seen through EZShare directory listings, that is a file-size step per
-file per minute — a *comb* in true time, `T_k = T_0 + k·P`. SomnoPal locates the comb
+file per minute — a *comb* in true time, `T_k = T_0 + k·P`. SomnoBridge locates the comb
 edges by polling the listing at chosen moments and timestamping the answers on an
 NTP-anchored clock. Two quantities fall out:
 
@@ -88,7 +88,7 @@ Anything finer is a *format* question (BRP re-packing), not a measurement questi
 ### 3.1 Three clocks, two rates
 
 ```
-true time      NTP, delivered to SomnoPal over BLE (§4)
+true time      NTP, delivered to SomnoBridge over BLE (§4)
 AS10 RTC       stamps filenames, FAT entries, EDF starttime, STR fields   rate ε_rtc
 AS10 timer     paces samples, records and therefore flushes              rate ε_timer
 EZShare        irrelevant; it never stamps anything we use (verify A8)
@@ -132,9 +132,9 @@ defined against the nominal 60 s record duration.
 | 7 | Noon-day folder creation | 1/day anchor | 2 s | free | weak |
 | — | WiFi association/TSF, HTTP `Date:`, RTT spikes | log only | — | — | not channels |
 
-## 4. True time inside SomnoPal
+## 4. True time inside SomnoBridge
 
-SomnoPal is on the EZShare AP with no internet route. Its time source is SomnoTrace,
+SomnoBridge is on the EZShare AP with no internet route. Its time source is SomnoTrace,
 over the BLE link the bridge already uses.
 
 - **Two-way exchange, NTP style**, on every SomnoTrace connection and then every
@@ -146,7 +146,7 @@ over the BLE link the bridge already uses.
   a SomnoTrace that is asleep or disconnected for hours: the night's evidence resolves
   when the next anchor arrives.
 - **Crystal holdover:** an uncalibrated ESP32 XTAL (±10 ppm) drifts up to 0.3 s over
-  8 h — *not* negligible against a ±0.3 s target. SomnoPal must (a) self-calibrate its
+  8 h — *not* negligible against a ±0.3 s target. SomnoBridge must (a) self-calibrate its
   crystal ppm from the anchor history (residual ~1 ppm → 30 ms/8 h), and (b) flag any
   session whose evidence has no anchor within ~2 h on both sides.
 
@@ -321,7 +321,7 @@ Published fields (§8.3): `therapy_active`, `state_since`, `last_growth`
 `out_timeout_ms`, `confidence`, `stale`, `reason` (human-readable cause of last
 transition).
 
-### 5.9 Transfer policy (SomnoPal ↔ SomnoTrace)
+### 5.9 Transfer policy (SomnoBridge ↔ SomnoTrace)
 
 Default rule: **fail closed for transfer.** The recommendation is *no in-therapy
 file synchronization at all*: open EDFs are mutable, the known EZShare API has no
@@ -331,8 +331,8 @@ needs. The single capped header probe (§5.4) is metadata acquisition, not
 synchronization.
 
 - While `IN_THERAPY`, or `UNKNOWN`/`stale`: **never** list-for-bulk or download
-  session files. SomnoTrace may still query SomnoPal's *local* status/metadata over
-  BLE — that answers from SomnoPal's state and costs **no** EZShare request.
+  session files. SomnoTrace may still query SomnoBridge's *local* status/metadata over
+  BLE — that answers from SomnoBridge's state and costs **no** EZShare request.
 - Only after `OUT_OF_THERAPY` is confirmed: freeze/finalize the session's evidence
   (§8.2 runs, hand-off record published), *then* permit SomnoTrace enumeration and
   download of the session's files.
@@ -400,7 +400,7 @@ absolute bias below ~±0.25 s. That is accepted under the ±0.5 s EDF target.
 
 ## 8. Evidence, estimation, hand-off
 
-### 8.1 Evidence log (SomnoPal, append-only, crash-safe)
+### 8.1 Evidence log (SomnoBridge, append-only, crash-safe)
 
 ```
 poll    { mono_req_us, mono_resp_us, dir, http, changed:[{name, size, stamp_raw}],
@@ -414,7 +414,7 @@ config  { fw, ezshare_version, esp_tz, watch_window, profile }
 Segments on the TF card (flash fallback), write-then-rename, size-capped rotation,
 NVS boot counter. ~20–40 KB/night with changed-entries-only logging.
 
-### 8.2 Estimator (runs on SomnoPal at growth-stop; re-runnable offline)
+### 8.2 Estimator (runs on SomnoBridge at growth-stop; re-runnable offline)
 
 1. Map every `mono` to `[t_lo, t_hi]` in NTP via anchor interpolation (with crystal ppm).
 2. Turn "changed / unchanged" observations into interval constraints on `(T_0, P)`
@@ -535,7 +535,7 @@ No step needs wires. E0–E2 need one card, one AS10 and a laptop; E-sim needs n
   burst is tested explicitly before the ladder ships.
 - **`λ_w` as a bounded prior.** With no wired truth, ±0.25 s systematic is accepted;
   it is below the EDF representability floor and the correction needs `o + λ_w` anyway.
-- **SomnoPal publishes, SomnoTrace applies.** ms-precision metadata, rounding at
+- **SomnoBridge publishes, SomnoTrace applies.** ms-precision metadata, rounding at
   export, consistency across header/filenames/STR, noon-day on raw time.
 - **Two rates, carried separately.** Timer rate from the comb each night; RTC rate from
   `o(day)` across nights.

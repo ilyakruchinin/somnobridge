@@ -1,8 +1,8 @@
-# SomnoPal — ESP32-S3-GEEK base configuration
+# SomnoBridge — ESP32-S3-GEEK base configuration
 #
 # This defaults file is the DEVELOPMENT profile: it enables the unprotected
 # (plain) NVS path so firmware can boot on boards without a burned eFuse
-# HMAC key. Production builds must set CONFIG_SOMNOPAL_DEV_UNPROTECTED=n,
+# HMAC key. Production builds must set CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED=n,
 # in which case a missing HMAC key yields SECURITY_NOT_PROVISIONED and
 # credentials are never written unencrypted (spec §4.2).
 
@@ -67,7 +67,7 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
 # Development-only: allow plain NVS + warning banner when no eFuse key is
 # provisioned. Must be off for production.
-CONFIG_SOMNOPAL_DEV_UNPROTECTED=y
+CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED=y
 # LESC P-256 math at -Og takes tens of seconds and overruns the 30 s SMP
 # proc timer — compile performance, keep assertions.
 # CONFIG_COMPILER_OPTIMIZATION_DEBUG is not set
@@ -78,4 +78,4 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_BT_NIMBLE_CRYPTO_STACK_MBEDTLS=y
 CONFIG_NIMBLE_CRYPTO_STACK_MBEDTLS=y
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=12288
-# CONFIG_SOMNOPAL_DIAG_FIXED_PASSKEY is not set
+# CONFIG_SOMNOBRIDGE_DIAG_FIXED_PASSKEY is not set

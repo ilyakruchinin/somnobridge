@@ -1,5 +1,5 @@
 /*
- * SomnoPal — host contract tests for pure-logic modules (spec §14.1)
+ * SomnoBridge — host contract tests for pure-logic modules (spec §14.1)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *

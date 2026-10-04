@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SomnoPal — ESP-IDF toolchain runner (Docker).
+# SomnoBridge — ESP-IDF toolchain runner (Docker).
 # Wraps the official Espressif image so Docker is the only host dependency.
 #
 #   ./scripts/idf.sh build            # idf.py build

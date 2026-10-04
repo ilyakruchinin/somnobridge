@@ -1,5 +1,5 @@
 /*
- * SomnoPal — application entry point
+ * SomnoBridge — application entry point
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *
@@ -25,7 +25,7 @@
 #include "settings.h"
 #include "ble_svc.h"
 
-static const char *TAG = "somnopal";
+static const char *TAG = "somnobridge";
 
 /* DIAG: temporary heap-corruption bisection — each boot stage checks
  * integrity; the walker crashes on the first corrupt structure, so the
@@ -159,7 +159,7 @@ static void ui_tick(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "SomnoPal boot (reset reason %d)",
+    ESP_LOGI(TAG, "SomnoBridge boot (reset reason %d)",
              (int)esp_reset_reason());
 
     /* DIAG: quiet chatty drivers so NimBLE SM trace survives the UART */
@@ -175,7 +175,7 @@ void app_main(void)
         ESP_LOGE(TAG, "board_init failed: %s", esp_err_to_name(err));
     }
     lcd_ui_clear();
-    lcd_ui_headline("SOMNOPAL");
+    lcd_ui_headline("SOMNOBRIDGE");
     lcd_ui_row(1, "BOOT OK", 0);
     heap_ck("board");
 
@@ -361,7 +361,7 @@ void app_main(void)
                 if (s_pin_up) {         /* PIN closed — repaint chrome */
                     s_pin_up = false;
                     lcd_ui_clear();
-                    lcd_ui_headline("SOMNOPAL");
+                    lcd_ui_headline("SOMNOBRIDGE");
                 }
                 ui_tick();
             }

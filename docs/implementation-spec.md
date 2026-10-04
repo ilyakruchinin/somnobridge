@@ -1,4 +1,4 @@
-# SomnoPal Firmware Implementation Specification
+# SomnoBridge Firmware Implementation Specification
 
 **Status:** implementation contract, version 1. Hardware-dependent timing features require the validation gates in §14; their accuracy is not a demonstrated guarantee.
 
@@ -24,29 +24,29 @@ For implementation, **this document takes precedence where these documents or th
 | `SCANNING/READY/ERROR` versus `INCOMPLETE` | Four explicit catalog states; folder completeness and freshness are separate (§5). |
 | Missing status/drift API | `GET_STATUS` and `GET_DRIFT` are defined in §10. |
 | Therapy `stale` versus folder `stale` | Use `therapy_stale` and `folder_stale`, with explicit age limits. |
-| Client-only versus server transfer gating | SomnoPal enforces all live file/list requests; client checks are additional protection. Cached metadata remains queryable during therapy. |
+| Client-only versus server transfer gating | SomnoBridge enforces all live file/list requests; client checks are additional protection. Cached metadata remains queryable during therapy. |
 | Historical versus active file transfers | No ordinary live file download, including historical files, while therapy is active, unknown, or stale. |
 | Mandatory TF staging/resume in README | No TF requirement, file snapshots, or persistent transfer database. Stream through a bounded RAM ring. Version 1 restarts interrupted files from byte zero. |
 | First observed append versus first session append | Resolve record/flush indices from verified header and size evidence; otherwise publish pending/ambiguous drift, never silently shift by one cycle. |
 | Physical cadence versus logical EDF duration | Fit physical cadence separately. Derive a sample-time scale only after verifying the record-to-flush relationship. |
 | Precision estimates versus error bounds | Publish model-qualified intervals and uncertainty components; do not label unvalidated assumptions as measured accuracy (§8). |
-| NTP path | SomnoTrace supplies authenticated BLE time exchanges. SomnoPal does not join a home WiFi network or trust the card's HTTP clock. |
+| NTP path | SomnoTrace supplies authenticated BLE time exchanges. SomnoBridge does not join a home WiFi network or trust the card's HTTP clock. |
 | Open HTTP management on EZShare WiFi | No HTTP listener in normal STA operation. Setup/diagnostics are confined to a physically opened, password-protected AP. |
 
 ### 0.2 Deliberate exclusions
 
 - No wired AS10 connection, UART calibration, service-port cable, or writes/configuration calls to EZShare.
-- No content cache, TF staging, catalog boot IDs, generation counters, per-entry versions, delta protocol, or SomnoPal decision about which files SomnoTrace needs.
+- No content cache, TF staging, catalog boot IDs, generation counters, per-entry versions, delta protocol, or SomnoBridge decision about which files SomnoTrace needs.
 - No automatic deletion of SomnoTrace data, inference of filenames from hashed aliases, or guarantee of detecting identical-looking card swaps.
 - No routine annotation tail reads or incremental downloads during therapy.
 - No network OTA or arbitrary HTTP proxy in version 1. Future OTA requires a separate authenticated, signed-update contract.
 
-SomnoPal is a separate firmware, not a SomnoTrace fork. Protocol documentation may inform behavior; do not copy SomnoTrace source, assets, UI, build scripts, or license headers. This document makes no legal assertion about licensing obligations; source provenance and licensing must be checked before firmware dependencies are added.
+SomnoBridge is a separate firmware, not a SomnoTrace fork. Protocol documentation may inform behavior; do not copy SomnoTrace source, assets, UI, build scripts, or license headers. This document makes no legal assertion about licensing obligations; source provenance and licensing must be checked before firmware dependencies are added.
 
 ## 1. Architecture and ownership
 
 ```
-AS10 + EZShare -- WiFi STA / read-only HTTP --> SomnoPal
+AS10 + EZShare -- WiFi STA / read-only HTTP --> SomnoBridge
                                                  |
                                     paired, encrypted BLE
                                                  |
@@ -54,7 +54,7 @@ AS10 + EZShare -- WiFi STA / read-only HTTP --> SomnoPal
                                     home WiFi / NTP / storage
 ```
 
-SomnoPal owns:
+SomnoBridge owns:
 
 1. EZShare connection and bounded HTTP requests.
 2. A PSRAM catalog of DATALOG day folders and their file metadata.
@@ -108,11 +108,11 @@ Resetting settings, forgetting a bond, and clearing evidence each require a port
 
 ### 3.1 Pairing and reconnecting
 
-SomnoPal supports **one bonded SomnoTrace identity and one BLE connection**.
+SomnoBridge supports **one bonded SomnoTrace identity and one BLE connection**.
 
 - Require LE Secure Connections, bonding, MITM-authenticated passkey entry, and a 128-bit encryption key: Bluetooth security level 4. No legacy pairing or Just Works fallback.
-- SomnoPal advertises DisplayOnly I/O capability. SomnoTrace provides keyboard/passkey entry and supplies the displayed six-digit passkey through its BLE stack.
-- Generate a fresh random passkey per attempt using the hardware-backed RNG, including leading zeros. Display it only on SomnoPal's LCD; do not expose it in advertisements, serial logs, HTTP, or an unencrypted characteristic.
+- SomnoBridge advertises DisplayOnly I/O capability. SomnoTrace provides keyboard/passkey entry and supplies the displayed six-digit passkey through its BLE stack.
+- Generate a fresh random passkey per attempt using the hardware-backed RNG, including leading zeros. Display it only on SomnoBridge's LCD; do not expose it in advertisements, serial logs, HTTP, or an unencrypted characteristic.
 - An unknown central can pair only within the physically opened 120-second window (§2.1). Each attempt expires at the earlier of 60 seconds from its start or closure of that window. Close the window after success or three failures; another physical short press is required to retry.
 - If a bond already exists, deny new pairing. Replacing SomnoTrace requires the physically confirmed `FORGET_PEER` setup action, which clears the old bond before a new window can open.
 - Persist NimBLE bond material and the authorized peer identity in encrypted NVS. Do not authenticate by an advertised name or raw current MAC address; use the bonded identity/IRK so private addresses reconnect correctly.
@@ -125,7 +125,7 @@ Service discovery and a generic device name may be public. Control, data, time, 
 
 Advertisements contain the service UUID and a generic device label, never therapy status, patient identifiers, files, SSIDs, PINs, or drift. Logs redact secrets and do not dump request bodies or EDF content. Store only necessary parsed header fields; never persist the EDF patient-ID field.
 
-BLE pairing protects the SomnoPal–SomnoTrace link. It does **not** make the EZShare's plaintext HTTP endpoint secure against another client on the card's WiFi, prove that a card contains a particular patient's data, or make a bonded peer's supplied NTP truthful. Protect EZShare WiFi with a strong password where its firmware permits it, and report open/weak WiFi as a warning. Do not silently join an open card AP: require an explicit setup acknowledgment.
+BLE pairing protects the SomnoBridge–SomnoTrace link. It does **not** make the EZShare's plaintext HTTP endpoint secure against another client on the card's WiFi, prove that a card contains a particular patient's data, or make a bonded peer's supplied NTP truthful. Protect EZShare WiFi with a strong password where its firmware permits it, and report open/weak WiFi as a warning. Do not silently join an open card AP: require an explicit setup acknowledgment.
 
 At-rest production security is defined in §4.2. Physical reflashing/debug access is a separate threat boundary; do not describe a developer build as tamper-resistant.
 
@@ -140,7 +140,7 @@ Entering SETUP MUST:
 1. Close the pairing window/cancel pending pairing, reject new live BLE work, and abort any in-flight transfer with an explicit error. An existing authorized bonded connection may remain for local status only.
 2. Set therapy UNKNOWN/stale and record an observation gap.
 3. Disconnect EZShare STA; do not operate an EZShare bridge while the portal is open.
-4. Start a WPA2-PSK AP named `SomnoPal-Setup-XXXX` using a fresh random 12-character password, shown on the LCD. No shared/default password or open fallback.
+4. Start a WPA2-PSK AP named `SomnoBridge-Setup-XXXX` using a fresh random 12-character password, shown on the LCD. No shared/default password or open fallback.
 5. Serve a local portal at `192.168.8.1`, with at most one WiFi client. Show the address explicitly; captive-portal detection is optional, never required for setup.
 
 Close the AP after a successful save, a runtime exit hold, or five minutes without authenticated portal activity; enforce an absolute 15-minute session limit. With no valid settings, closing setup leaves a local `Setup required — hold BOOT` screen. Credentials and bonds remain intact on timeout. A new setup session gets new AP/session secrets.
@@ -343,8 +343,8 @@ Use `esp_timer` microseconds for every deadline, observation, and interval. Neve
 After each authorized connection, and every 10 minutes while connected, SomnoTrace performs five two-way exchanges and commits the lowest-RTT usable sample. The wire contract is in §10.4:
 
 - `t1`: SomnoTrace UTC microseconds immediately before writing the first TIME_REQUEST fragment.
-- `m2`: SomnoPal monotonic microseconds at receipt of the complete request.
-- `m3`: SomnoPal monotonic microseconds immediately before submitting TIME_REPLY.
+- `m2`: SomnoBridge monotonic microseconds at receipt of the complete request.
+- `m3`: SomnoBridge monotonic microseconds immediately before submitting TIME_REPLY.
 - `t4`: SomnoTrace UTC microseconds at receipt of the complete reply.
 
 For an exchange short enough to neglect oscillator-rate change:
@@ -420,7 +420,7 @@ If true start is bounded by [S_lo,S_hi], the model-conditional drift interval is
 
 - Publish `flush_period_ms` and its interval whenever the visible comb is defensible, even if offset is pending.
 - Publish `timer_rate_ppm = (P / D_record - 1) * 1e6` only after the one-record-per-flush, sample-timer-driven relationship is validated. This field means **elapsed-time scale deviation**, not oscillator-frequency ppm: `true_elapsed = device_sample_elapsed * (1 + timer_rate_ppm/1e6)`. Otherwise it is null with `timer_model_unverified`. Never automatically interpret a 57/60 ratio as an ordinary small RTC drift.
-- `rtc_rate_ppm` is null on SomnoPal version 1. SomnoTrace may fit cross-night offsets with explicit timezone/manual-clock change-point handling. Do not pool across suspected clock steps or firmware/card/profile changes.
+- `rtc_rate_ppm` is null on SomnoBridge version 1. SomnoTrace may fit cross-night offsets with explicit timezone/manual-clock change-point handling. Do not pool across suspected clock steps or firmware/card/profile changes.
 - Ambiguous/nonexistent DST local times, unconfirmed timezone, and inconsistent header/file grouping produce flags and null correction, not arbitrary hour shifts. Noon-day labels remain the raw AS10 folder names after any correction.
 
 The proposal's approximately ±0.3-second start, ±0.6-second offset, and 2–5 ppm night-end rate are **conditional targets** for simulation/hardware evaluation. Preferred early acquisition, 30-minute degradation reporting, and post-session accumulation remain requirements; sub-second absolute truth cannot be promised from unverified software-only latency assumptions.
@@ -465,11 +465,11 @@ Persist these records:
 
 Use an 8 KiB RAM batch; commit when full or every 60 seconds, and at observation stop, configuration transition, and before reporting successful post-download metadata. Flash work must not block time-sensitive HTTP targets. A queue/flash failure flags `evidence_truncated`/`persist_failed`; never silently claim full replay coverage. Power loss can lose the current ≤60-second RAM batch, and recovered records must expose that gap.
 
-Retain at most 64 latest observation-group metadata records, each ≤8 KiB, in the metadata partition. Atomically replace that group's latest estimate after useful anchors/header parsing and at stop. Retain summaries after raw journal rotation; `evidence_available:false` distinguishes a surviving summary from replayable raw evidence. Expose oldest retained metadata/evidence boundaries and utilization; **no fixed number of days is guaranteed**. SomnoTrace must persist records when synchronizing, not rely on SomnoPal as an archive.
+Retain at most 64 latest observation-group metadata records, each ≤8 KiB, in the metadata partition. Atomically replace that group's latest estimate after useful anchors/header parsing and at stop. Retain summaries after raw journal rotation; `evidence_available:false` distinguishes a surviving summary from replayable raw evidence. Expose oldest retained metadata/evidence boundaries and utilization; **no fixed number of days is guaranteed**. SomnoTrace must persist records when synchronizing, not rely on SomnoBridge as an archive.
 
 Lookup uses exact paths and parsed header identity. If history is missing/evicted or a reboot left no usable anchors/indexing, return `METADATA_UNAVAILABLE` with a reason, not a zero drift or a carry-forward estimate from another file. Rebuilding a catalog does not fabricate old timing observations. Clearing/replacing configured card details invalidates old associations; an undetectable identical-looking swap remains a limitation of the available evidence.
 
-No `.part` files, file-body hashes, downloaded markers, sync windows, or SomnoTrace acknowledgments are persisted as SomnoPal transfer state. SHA-256 during streaming is transient. Estimate retention keys do not create a delta or version protocol.
+No `.part` files, file-body hashes, downloaded markers, sync windows, or SomnoTrace acknowledgments are persisted as SomnoBridge transfer state. SHA-256 during streaming is transient. Estimate retention keys do not create a delta or version protocol.
 
 ## 10. BLE protocol version 1
 
@@ -546,7 +546,7 @@ Each payload below is little-endian and can be fragmented via §10.1. Use one re
 | TIME_REPLY | echoed `t1_utc_us:u64`, `m2_us:u64`, `m3_us:u64`, echoed `source_epoch:u32` |
 | TIME_COMMIT | echoed `t1_utc_us:u64`, `t4_utc_us:u64`, echoed `source_epoch:u32` |
 
-SomnoPal captures m2 on receipt of the complete TIME_REQUEST; SomnoTrace captures t4 on receipt of the complete TIME_REPLY and supplies it in TIME_COMMIT. Set m3 immediately before submitting the first reply fragment; subsequent fragmentation/confirmation delay is included in the measured RTT, not subtracted as server processing. Validate commits against cached exact t1/epoch/m2/m3, compute §8.1, then return JSON acknowledgment with accepted/rejected reason and anchor uncertainty. Do not accept caller-supplied m2/m3 or change monotonic time. A wrapped/changed source_epoch forces a new interpolation segment; it is not a persistent synchronization token.
+SomnoBridge captures m2 on receipt of the complete TIME_REQUEST; SomnoTrace captures t4 on receipt of the complete TIME_REPLY and supplies it in TIME_COMMIT. Set m3 immediately before submitting the first reply fragment; subsequent fragmentation/confirmation delay is included in the measured RTT, not subtracted as server processing. Validate commits against cached exact t1/epoch/m2/m3, compute §8.1, then return JSON acknowledgment with accepted/rejected reason and anchor uncertainty. Do not accept caller-supplied m2/m3 or change monotonic time. A wrapped/changed source_epoch forces a new interpolation segment; it is not a persistent synchronization token.
 
 ## 11. Read-only EZShare HTTP adapter
 
@@ -588,7 +588,7 @@ Do not claim a matching length/hash detects a same-size rewrite or makes a growi
 
 ### 12.1 Server transaction
 
-SomnoPal enforces this sequence for **each** ordinary GET_FILE:
+SomnoBridge enforces this sequence for **each** ordinary GET_FILE:
 
 1. Validate authorization, mode, paths, current OUT status, and global monitoring freshness when the request reaches the worker; an earlier client status read does not reserve permission.
 2. Capture a complete fresh pre-transfer round of all relevant hot/active folders and parent; reuse successful observations ≤90 seconds old if they still satisfy the OUT proof. Preserve this baseline for §7's intentional-pause rule.
@@ -599,7 +599,7 @@ SomnoPal enforces this sequence for **each** ordinary GET_FILE:
 7. Require matching pre/post source tuple, exact byte length, successful monitoring, and a rebuilt/continuing non-stale OUT decision. New file/growth/uncertain writes, a missing source, error, unresolved confirmation, or a stale monitoring decision makes completion_allowed false. No next GET starts until this decision is sent and buffers released.
 8. Persist useful parsed header/estimate updates and return STREAM_END. Post-validation remains required for large historical files and root files, not only current DATALOG.
 
-A body may finish even if status ages into UNKNOWN. Resume cannot normally be discovered while that sole HTTP request is active; detection occurs at its post-check. Do not state that SomnoPal immediately notices mask-on. On a client abort, WiFi loss, or deadline, close the request, recover monitoring, and return failure if the BLE link survives. Partial data is not a successful file.
+A body may finish even if status ages into UNKNOWN. Resume cannot normally be discovered while that sole HTTP request is active; detection occurs at its post-check. Do not state that SomnoBridge immediately notices mask-on. On a client abort, WiFi loss, or deadline, close the request, recover monitoring, and return failure if the BLE link survives. Partial data is not a successful file.
 
 Completion_allowed may be false despite byte transport succeeding. SomnoTrace may keep the `.part` unverified or discard it; it cannot rename/mark complete based on transport alone. No server polling limit is relaxed to salvage a download.
 
@@ -620,7 +620,7 @@ Do not automatically delete local files after remote disappearance, renamed alia
 
 ### 12.3 Applying drift downstream
 
-SomnoPal never rewrites source or downloaded EDF bytes. SomnoTrace preserves raw provenance and applies metadata only to its generated/exported timeline under its own verified EDF rules:
+SomnoBridge never rewrites source or downloaded EDF bytes. SomnoTrace preserves raw provenance and applies metadata only to its generated/exported timeline under its own verified EDF rules:
 
 - Positive clock_drift_ms means add it to interpreted AS10 event timestamps to reach true time.
 - Preserve raw noon-day folder labels; corrected time crossing noon does not relabel the reporting bucket.

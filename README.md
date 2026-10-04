@@ -1,4 +1,4 @@
-# SomnoPal
+# SomnoBridge
 
 > A pocket-sized **WiFi ↔ BLE bridge** that sits permanently on an EZShare WiFi SD card's access point and serves its files to [SomnoTrace](https://github.com/ilyakruchinin/SomnoTrace) over Bluetooth Low Energy — so SomnoTrace never has to leave your home WiFi to fetch them.
 
@@ -10,11 +10,11 @@ Created and architected by **Ilya Kruchinin** ([@ilyakruchinin](https://github.c
 
 SomnoTrace talks to your home network for uploads, dashboards and alerts — but EZShare WiFi SD cards are **AP-only**: they host their own network (`ezshare.card`, typically `192.168.4.1`) and never join yours. Pulling a file means SomnoTrace must drop its home WiFi association, join the card's network, download, and hop back — every time.
 
-SomnoPal eliminates the network switching entirely. It is a second, cheap ESP32-S3 device that lives **permanently on the EZShare network**, and exposes the card's files over a fast BLE link to SomnoTrace:
+SomnoBridge eliminates the network switching entirely. It is a second, cheap ESP32-S3 device that lives **permanently on the EZShare network**, and exposes the card's files over a fast BLE link to SomnoTrace:
 
 ```
 ┌──────────┐   WiFi (STA)   ┌───────────┐    BLE 5 (GATT)   ┌─────────────┐
-│ EZShare  │ ◄────────────► │ SomnoPal  │ ◄───────────────► │ SomnoTrace  │
+│ EZShare  │ ◄────────────► │ SomnoBridge  │ ◄───────────────► │ SomnoTrace  │
 │ SD card  │   HTTP /dir +  │  (GEEK)   │   metadata + file │             │
 │          │    /download   │           │    streaming      │             │
 └──────────┘                └───────────┘                   └──────┬──────┘
@@ -29,7 +29,7 @@ SomnoTrace stays on your LAN the whole time. The BLE link only carries data to o
 
 ## Hardware
 
-SomnoPal targets the **[Waveshare ESP32-S3-GEEK](https://www.waveshare.com/product/esp32-related/boards-kits/esp32-s3/esp32-s3-geek.htm)** — a USB-A stick form-factor board, ideal for hiding behind the nightstand powered from any USB port:
+SomnoBridge targets the **[Waveshare ESP32-S3-GEEK](https://www.waveshare.com/product/esp32-related/boards-kits/esp32-s3/esp32-s3-geek.htm)** — a USB-A stick form-factor board, ideal for hiding behind the nightstand powered from any USB port:
 
 | Peripheral | Part | Notes |
 |---|---|---|
@@ -47,8 +47,8 @@ SomnoTrace remains the **[Waveshare ESP32-S3-Touch-LCD-1.54](https://www.wavesha
 
 ## What the firmware does
 
-1. **Provision** — on first boot (or after reset) SomnoPal hosts its own WiFi AP + config portal (`somnopal.local`). You set the EZShare SSID and password there.
-2. **Join** — SomnoPal joins the EZShare AP as a STA and keeps the association alive (auto-reconnect, RSSI monitoring).
+1. **Provision** — on first boot (or after reset) SomnoBridge hosts its own WiFi AP + config portal (`somnobridge.local`). You set the EZShare SSID and password there.
+2. **Join** — SomnoBridge joins the EZShare AP as a STA and keeps the association alive (auto-reconnect, RSSI monitoring).
 3. **Serve** — it runs a BLE GATT server that SomnoTrace connects to, exposing a small **metadata API** plus a **file-transfer channel** that streams card contents over BLE.
 4. **Report** — the LCD shows EZShare link state, BLE link state, RSSI, active transfer and throughput at a glance.
 
@@ -76,19 +76,19 @@ BLE is the bottleneck, so the design minimizes its cost rather than papering ove
 
 - **BLE PHY**: 2 M PHY + Data Length Extension + negotiated 247-byte MTU, short connection interval — notifications stream, no request/response round trip per chunk.
 - **Read-ahead**: while BLE drains the buffer, the WiFi side prefetches from the card over a keep-alive HTTP session into a ring buffer — BLE never stalls waiting on the card.
-- **TF staging**: large transfers are spooled to SomnoPal's SD card first, then served uninterrupted — the card's HTTP stack is slow and bursty, the BLE side wants a steady pipe.
+- **TF staging**: large transfers are spooled to SomnoBridge's SD card first, then served uninterrupted — the card's HTTP stack is slow and bursty, the BLE side wants a steady pipe.
 - **Resume**: every frame carries its offset + CRC32, so reconnects resume instead of restarting.
 - **No double buffering pain**: 2 MB PSRAM is the smooth-over-jitter buffer; the TF card is the real cache.
 
 ## EZShare client side
 
-SomnoPal speaks the card's observed HTTP protocol (documented in SomnoTrace's `spec/archive/files-over-http.md`):
+SomnoBridge speaks the card's observed HTTP protocol (documented in SomnoTrace's `spec/archive/files-over-http.md`):
 
 - `GET /dir?dir=A:\path` — HTML `<pre>` directory listing (parsed, not scraped blindly)
 - `GET /download?fname=…&fdir=…` — raw file bytes (8.3 short names)
 - `GET /client?command=version` — card firmware version, used for the status page
 
-On top of that, SomnoPal keeps a small HTTP API of its own on the EZShare network for diagnostics and management (`/api/status`, `/api/cache`, `/api/config`) — useful from any laptop joined to the card's AP.
+On top of that, SomnoBridge keeps a small HTTP API of its own on the EZShare network for diagnostics and management (`/api/status`, `/api/cache`, `/api/config`) — useful from any laptop joined to the card's AP.
 
 ## Build & flash
 
@@ -108,7 +108,7 @@ GPLv3 with the same §7(b) attribution term as SomnoTrace — see `LICENSE` and 
 ## Documents
 
 - [`docs/as10-time-drift.md`](docs/as10-time-drift.md) — problem statement: the
-  AS10's clock drifts, EZShare has no usable clock, and everything SomnoPal can
+  AS10's clock drifts, EZShare has no usable clock, and everything SomnoBridge can
   learn is from passive filesystem observation. Maps the side channels worth
   investigating before designing a drift estimator.
 

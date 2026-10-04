@@ -1,5 +1,5 @@
 /*
- * SomnoPal — bounded evidence journal (spec §9)
+ * SomnoBridge — bounded evidence journal (spec §9)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  */

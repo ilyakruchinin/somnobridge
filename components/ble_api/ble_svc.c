@@ -1,10 +1,10 @@
 /*
- * SomnoPal — BLE service: NimBLE GATT + security (spec §3, §10)
+ * SomnoBridge — BLE service: NimBLE GATT + security (spec §3, §10)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *
  * One connection, one authorized peer. LE Secure Connections + MITM +
- * bonding + 128-bit key => security level 4. DisplayOnly I/O: SomnoPal
+ * bonding + 128-bit key => security level 4. DisplayOnly I/O: SomnoBridge
  * shows a fresh 6-digit passkey, SomnoTrace types it.
  */
 #include <string.h>
@@ -167,7 +167,7 @@ static int gap_event(struct ble_gap_event *ev, void *arg);
 
 static uint32_t gen_passkey(void)
 {
-#ifdef CONFIG_SOMNOPAL_DIAG_FIXED_PASSKEY
+#ifdef CONFIG_SOMNOBRIDGE_DIAG_FIXED_PASSKEY
     /* DIAG: fixed PIN so an automated agent can answer without waiting
      * for the LCD/log. Never set in production.                      */
     return 424242;
@@ -410,7 +410,7 @@ void ble_svc_advertise(void)
     struct ble_hs_adv_fields f = {0};
 
     f.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    f.name = (uint8_t *)"SomnoPal";
+    f.name = (uint8_t *)"SomnoBridge";
     f.name_len = 8;
     f.name_is_complete = 1;
     /* service UUID in adv so scanners can filter w/o connecting —

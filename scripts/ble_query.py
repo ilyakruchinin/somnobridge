@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# SomnoPal — host-side BLE query tool (status / catalog / drift / time sync)
+# SomnoBridge — host-side BLE query tool (status / catalog / drift / time sync)
 # Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
 # GPLv3+ — see LICENSE and NOTICE.
 #
-# Talks to a bonded SomnoPal over BlueZ's D-Bus API.
+# Talks to a bonded SomnoBridge over BlueZ's D-Bus API.
 #
 # Why D-Bus and not bluetoothctl: this bluez build's CLI `write` command
 # returns org.bluez.Error.NotSupported for every variant and never reaches
@@ -54,8 +54,8 @@ def frame(kind, rid, offset, flags, payload=b""):
     return HDR.pack(1, kind, flags, rid, offset) + payload
 
 
-class SomnoPal:
-    """Minimal BlueZ GATT client for the SomnoPal vendor service."""
+class SomnoBridge:
+    """Minimal BlueZ GATT client for the SomnoBridge vendor service."""
 
     def __init__(self, address, verbose=False):
         self.addr = address.upper()
@@ -145,7 +145,7 @@ class SomnoPal:
         objects = self._managed()
         svc = self._find(objects, "org.bluez.GattService1", SVC_UUID)
         if not svc:
-            raise RuntimeError("SomnoPal service not found after connect")
+            raise RuntimeError("SomnoBridge service not found after connect")
         for path, ifaces in objects.items():
             c = ifaces.get("org.bluez.GattCharacteristic1")
             if not c or str(c.get("Service", "")) != svc:
@@ -731,7 +731,7 @@ def self_test():
     from unittest.mock import Mock, patch
 
     def client():
-        dev = SomnoPal.__new__(SomnoPal)
+        dev = SomnoBridge.__new__(SomnoBridge)
         dev._next_rid = Mock(return_value=42)
         dev._write = Mock()
         dev._ack = Mock()
@@ -786,7 +786,7 @@ def self_test():
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Query a bonded SomnoPal over BLE (BlueZ D-Bus).",
+        description="Query a bonded SomnoBridge over BLE (BlueZ D-Bus).",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--address", default=DEFAULT_ADDR,
                     help=f"BLE address (default {DEFAULT_ADDR})")
@@ -831,7 +831,7 @@ def main():
         args.days = 14
 
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-    dev = SomnoPal(args.address, verbose=args.verbose)
+    dev = SomnoBridge(args.address, verbose=args.verbose)
     try:
         dev.connect()
         dev.subscribe()

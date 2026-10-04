@@ -1,4 +1,4 @@
-# SomnoPal — implementation update 2: phase-tracking poll schedule
+# SomnoBridge — implementation update 2: phase-tracking poll schedule
 
 Status: **revision 3 — schedule implemented in firmware**. The
 WATCH/HUNT/NARROW/VERNIER/REFINE/MAINTAIN tracker, the coverage round,
@@ -29,7 +29,7 @@ fixed number of minutes.
 |---|---|---|
 | Filename `YYYYMMDD_HHMMSS` | AirSense local-clock session/start claim | Whole seconds; rounding versus truncation must be characterized |
 | File mtime | AirSense-clock reading associated with a file update | Modelled as truncated FAT 2 s interval `[M, M+2)` |
-| Tuple transition bracket on SomnoPal's anchored monotonic clock | When an update became visible through the listing interface | Limited by poll timing, service time, visibility/cache delay, anchor uncertainty |
+| Tuple transition bracket on SomnoBridge's anchored monotonic clock | When an update became visible through the listing interface | Limited by poll timing, service time, visibility/cache delay, anchor uncertainty |
 
 The third observable is the best way to locate the **update moment in true
 time**. Its resolution is not restricted to 2 s by FAT. BRP size changes
@@ -64,7 +64,7 @@ Do not label phase precision as clock-offset accuracy.
   delay. Count cache separately only if it represents an additional effect.
 - **Mark:** predicted center of the next visible update.
 - **Period `P`:** nominal 60 s recurrence, fitted/checked in monotonic time.
-  AirSense seconds and SomnoPal seconds may differ slightly in rate.
+  AirSense seconds and SomnoBridge seconds may differ slightly in rate.
 - **Prediction uncertainty `iunc`:** bounded cycle-to-cycle phase error,
   period uncertainty, oscillator-rate uncertainty, and visibility variation.
   No automatic 2 s floor applies when predicting from observed moments

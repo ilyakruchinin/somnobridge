@@ -1,5 +1,5 @@
 /*
- * SomnoPal — BLE protocol framing (spec §10.1) — host-testable
+ * SomnoBridge — BLE protocol framing (spec §10.1) — host-testable
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  */

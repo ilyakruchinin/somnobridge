@@ -11,7 +11,7 @@
 
 SomnoTrace talks to the ResMed **AirSense 11 over BLE**. The **AirSense 10 has
 no radio** — its only data path is the SD card. To support it, the AS10's card
-slot hosts an **EZShare WiFi SD card**, and **SomnoPal** lives permanently on
+slot hosts an **EZShare WiFi SD card**, and **SomnoBridge** lives permanently on
 that card's access point, proxying files to SomnoTrace over BLE.
 
 The problem: **the AS10's internal clock drifts** (reports put the error up to
@@ -28,14 +28,14 @@ The constraints that make this interesting:
 - **EZShare likely has no meaningful clock of its own.** Anything the card
   stamps itself is probably wrong or epoch-relative — unverified assumption,
   but plan for "no usable EZShare time."
-- **SomnoPal does have real time.** NTP on the EZShare network... no — the
-  EZShare AP has no upstream route. SomnoPal's NTP source is its *own* uplink
+- **SomnoBridge does have real time.** NTP on the EZShare network... no — the
+  EZShare AP has no upstream route. SomnoBridge's NTP source is its *own* uplink
   side, not the card's network. This has an implication worth stating plainly:
-  **SomnoPal may need two networks** (the EZShare AP for card access + some
+  **SomnoBridge may need two networks** (the EZShare AP for card access + some
   path to NTP), or a stored RTC discipline that survives without NTP. Open
   question — see §6.
 - **Passive observation only.** Everything we can learn comes from *watching*
-  the card's filesystem over HTTP and correlating with SomnoPal's clock.
+  the card's filesystem over HTTP and correlating with SomnoBridge's clock.
 
 ---
 
@@ -45,13 +45,13 @@ The constraints that make this interesting:
 |---|---|---|---|
 | **AS10 RTC** | Internal, drifts ~min/month(?), user-settable, can step | ❌ the thing we're measuring | FAT mtimes, EDF `startdate`/`starttime`, EDF+ annotation onsets, possibly filenames/dir names |
 | **EZShare card** | Unknown — likely none/free-running | ❌ assume useless | HTTP `Date:` header (if any), any card-generated metadata |
-| **SomnoPal** | NTP (when reachable), free-running between syncs | ✅ ground truth | poll timestamps — "when did we observe X" |
+| **SomnoBridge** | NTP (when reachable), free-running between syncs | ✅ ground truth | poll timestamps — "when did we observe X" |
 | **SomnoTrace** | Has its own RTC story (AS11 path already solves this) | n/a | ingest-time corrections — downstream consumer |
 
 The core measurement problem is therefore:
 
 > **Pair "what the AS10 claims the time is" (observed via file content/metadata)
-> with "when SomnoPal actually observed it" (NTP time).** Every usable side
+> with "when SomnoBridge actually observed it" (NTP time).** Every usable side
 > channel produces one such pair; the drift estimate comes from accumulating
 > and reconciling them.
 
@@ -87,7 +87,7 @@ Two classes of signal:
 
 1. **Content channels** — AS10-time *claims* embedded in the data (EDF headers,
    annotations, filenames). These tell us what the AS10 thinks "now" is.
-2. **Event channels** — *real-time* occurrences we can timestamp on SomnoPal
+2. **Event channels** — *real-time* occurrences we can timestamp on SomnoBridge
    (a file appeared, a file grew, the card came up). These anchor the content
    claims to wall time.
 
@@ -204,7 +204,7 @@ card-managed vs AS10-written files. One cheap experiment, then likely close it.
 
 The EZShare lives in the AS10's SD slot — its power (and WiFi) dies with the
 machine. **Card-up/card-down transitions are real-time events** observable by
-SomnoPal, and they bound session start/end. Session boundaries also correlate
+SomnoBridge, and they bound session start/end. Session boundaries also correlate
 with EDF header/footer content → another pairing opportunity, this one
 session-granularity rather than per-append.
 
@@ -229,13 +229,13 @@ Cheap to check, low expected value — keep on a list so we don't forget:
 
 1. **Whose clock is in the FAT mtime?** (E1 — most important; everything else
    builds on this)
-2. **Does SomnoPal have an NTP path while on the EZShare AP?** The EZShare AP
+2. **Does SomnoBridge have an NTP path while on the EZShare AP?** The EZShare AP
    has no upstream route. Options worth investigating (not solving here):
    dual-radio/AP+STA topologies, RTC holdover quality between syncs — and the
    elegant inversion: **SomnoTrace is on the home WiFi and already has NTP —
-   it could push its clock *to* SomnoPal over the BLE link**, making SomnoPal
+   it could push its clock *to* SomnoBridge over the BLE link**, making SomnoBridge
    a time *consumer* rather than an NTP client of its own. Also worth asking
-   whether SomnoPal needs wall-clock *accuracy* at all, or just a stable
+   whether SomnoBridge needs wall-clock *accuracy* at all, or just a stable
    monotonic reference that SomnoTrace's NTP-solved clock calibrates.
 3. **What's the real append cadence and which files tick?** (E2)
 4. **Buffered-write lag distribution** — how stale can on-disk data be vs the

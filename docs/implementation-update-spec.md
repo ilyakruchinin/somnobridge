@@ -1,4 +1,4 @@
-# SomnoPal — implementation update: timestamp-first drift estimation, accuracy tiers, and persisted source of truth
+# SomnoBridge — implementation update: timestamp-first drift estimation, accuracy tiers, and persisted source of truth
 
 Status: proposed requirements, **revision 2**. Normative delta over
 `implementation-spec.md`; where they conflict, this document wins for the
@@ -315,7 +315,7 @@ regression can revert without losing detection or persistence.
 - **Out-of-therapy trigger:** unchanged —
   `out_timeout_ms = max(125000, 2 * expected_append_max_ms + allowance)`.
 - **Offset-only first:** no RTC-rate or timer-rate claims in version 1 of
-  this update; `rtc_rate_ppm` stays null on SomnoPal (base §8.4).
+  this update; `rtc_rate_ppm` stays null on SomnoBridge (base §8.4).
 - **Achievable precision:** interval width = 2 s quantization + visibility
   + latency; with 0.5 s dense bursts and a latency prior ≲1 s, half-width
   ≈ ±1.9 s — the **±2 s each way** gate is realistic. ±1 s total is

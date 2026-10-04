@@ -1,5 +1,5 @@
 /*
- * SomnoPal — therapy FSM (spec §7)
+ * SomnoBridge — therapy FSM (spec §7)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *

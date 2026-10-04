@@ -1,5 +1,5 @@
 /*
- * SomnoPal — minimal wildcard DNS responder for the setup AP.
+ * SomnoBridge — minimal wildcard DNS responder for the setup AP.
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *

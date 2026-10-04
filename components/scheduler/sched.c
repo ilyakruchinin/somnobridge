@@ -1,5 +1,5 @@
 /*
- * SomnoPal — card worker / poll scheduler (spec §6)
+ * SomnoBridge — card worker / poll scheduler (spec §6)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  *

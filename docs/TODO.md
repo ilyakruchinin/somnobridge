@@ -76,7 +76,7 @@ suspend observation.
 # NEXT
 
 Findings from the 2026-10-04 70-minute live capture
-(`/tmp/somnopal-observe-20261004-0139.jsonl`, update6 firmware):
+(`/tmp/somnobridge-observe-20261004-0139.jsonl`, update6 firmware):
 
 ## FIX: card-identity probe burns persisted records (drift.c)
 
@@ -124,7 +124,7 @@ differing probes do.
 
 Originally flagged because the 70-minute capture ended while therapy
 was still IN. Confirmed live in the 6.5-hour overnight capture
-(`/tmp/somnopal-observe-20261004-2348.jsonl`, 8742 records):
+(`/tmp/somnobridge-observe-20261004-2348.jsonl`, 8742 records):
 
 - Session 1 (toilet-break pause, ~51 min): finalize ran at OUT and
   correctly **declined** — journal `fallback/ref_stale age_us=195571274`,

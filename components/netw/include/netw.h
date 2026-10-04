@@ -1,5 +1,5 @@
 /*
- * SomnoPal — WiFi manager + setup portal (spec §4.1/§4.3)
+ * SomnoBridge — WiFi manager + setup portal (spec §4.1/§4.3)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  */

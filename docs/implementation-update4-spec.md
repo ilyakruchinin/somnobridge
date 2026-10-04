@@ -1,4 +1,4 @@
-# SomnoPal — implementation update 4: measured request timing and explicit visibility semantics
+# SomnoBridge — implementation update 4: measured request timing and explicit visibility semantics
 
 Status: implemented, revision 1.
 This update changes the timing model, diagnostics, and persisted-model

@@ -1,4 +1,4 @@
-# SomnoPal — timing-channel validation results
+# SomnoBridge — timing-channel validation results
 
 Status: measured results from the 2026-10-01 validation session. Evidence for
 `implementation-update.spec` revision 2. All observations are from the
@@ -7,7 +7,7 @@ do not by themselves transfer to an AS10.
 
 ## 1. Scope and method
 
-- **Topology (user-confirmed):** the EZShare card monitored by SomnoPal is
+- **Topology (user-confirmed):** the EZShare card monitored by SomnoBridge is
   physically inside the same AirSense 11 that is paired with SomnoTrace
   (`192.168.86.102`).
 - **Independent clock reference:** SomnoTrace's read-only `GetDateTime` RPC
@@ -15,7 +15,7 @@ do not by themselves transfer to an AS10.
   (`clock_drift_ms`, `clock_drift_valid`, `clock_drift_source`), retrieved
   read-only over anonymous FTP. Host NTP discipline: chrony, leap normal;
   conservative source uncertainty from root distance ≈ **±150 ms**.
-- **SomnoPal observation:** cached BLE catalog reads (5 s cadence), the
+- **SomnoBridge observation:** cached BLE catalog reads (5 s cadence), the
   device's own serial poll log, and — after a diagnostic firmware flash —
   native EDF header inspections with exact HTTP content lengths. No estimator
   or therapy-threshold changes; no card writes; therapy started/stopped via
@@ -25,7 +25,7 @@ do not by themselves transfer to an AS10.
   local). Historical comparison across the five completed sessions of
   2026-09-30 (25 native catalog files matched to SomnoTrace references).
 - Evidence was captured to private mode-0600 JSONL files under `/tmp`
-  (`somnopal-validation-*`); only timing/layout metadata was recorded — no
+  (`somnobridge-validation-*`); only timing/layout metadata was recorded — no
   patient fields, waveforms, or recording content.
 
 ## 2. Reference quality
@@ -174,9 +174,9 @@ polls are scheduler-internal card requests).
 ## 6. Evidence pointers
 
 Private JSONL evidence (mode 0600, timing metadata only):
-`/tmp/somnopal-validation-{ns4guvr7,wgc3ac4f,y664tk12,7d4kxv17,cbn4e3u4}/evidence.jsonl`
+`/tmp/somnobridge-validation-{ns4guvr7,wgc3ac4f,y664tk12,7d4kxv17,cbn4e3u4}/evidence.jsonl`
 (snapshots, clock references, transitions), and
-`/tmp/somnopal-validation-{9loqe74g,npp84tik,37_d9v7x,_q5kstbj}/evidence.jsonl`
+`/tmp/somnobridge-validation-{9loqe74g,npp84tik,37_d9v7x,_q5kstbj}/evidence.jsonl`
 (therapy-control cycles). Recorder: `scripts/validate_timing.py`
 (self-test, history, capture, cycle, analyze modes). Diagnostic firmware
 additions: `INSPECT_EDF_HEADER` BLE op, listing-derived download resolver,
@@ -231,11 +231,11 @@ and no qualified SOT may promote under this semantic model alone.
 A masked session was collected with `validate_timing.py observe` after mask
 confirmation. SomnoTrace `EnterTherapy` was acknowledged through the documented
 RPC bridge; the user stopped therapy manually. The observer made no card writes
-and added no card polls beyond SomnoPal's own scheduler.
+and added no card polls beyond SomnoBridge's own scheduler.
 
-- Evidence: `/tmp/somnopal-validation-epa3tku1/evidence.jsonl`
+- Evidence: `/tmp/somnobridge-validation-epa3tku1/evidence.jsonl`
   (private mode-0600 timing metadata only).
-- Collection: 216 SomnoPal snapshots, 69 bracketed `GetDateTime` references,
+- Collection: 216 SomnoBridge snapshots, 69 bracketed `GetDateTime` references,
   three host-side BLE exchange groups, four journal replays, and four
   completed-session metadata records. Final journal replay reported no gaps or
   truncation; BLE reconnects were zero.
@@ -243,7 +243,7 @@ and added no card polls beyond SomnoPal's own scheduler.
   **1,473 ms**, 26 windows, one segment.
 - Independent reference: completed SomnoTrace session metadata reported
   `clock_drift_ms=-508036` 9.8 s after the estimate reference; the reference
-  interval remained inside SomnoPal's interval (`reference_contained`,
+  interval remained inside SomnoBridge's interval (`reference_contained`,
   midpoint delta **−380 ms**). Contemporaneous live references similarly
   remained contained (`−391 ms` midpoint delta).
 - Offset coverage across retained observations: 17 `reference_contained`,
@@ -269,9 +269,9 @@ best-effort/provisional anchor, not a qualified anchor. Three 10-minute masked
 therapy sessions were then run with ~2-minute gaps; all were started and stopped
 through SomnoTrace's documented RPC bridge.
 
-- Evidence: `/tmp/somnopal-validation-kxss4a0n/evidence.jsonl`; analysis:
-  `/tmp/somnopal-validation-kxss4a0n/analysis.json` (private timing metadata).
-- Collection: 404 SomnoPal snapshots, 120 bracketed `GetDateTime` references,
+- Evidence: `/tmp/somnobridge-validation-kxss4a0n/evidence.jsonl`; analysis:
+  `/tmp/somnobridge-validation-kxss4a0n/analysis.json` (private timing metadata).
+- Collection: 404 SomnoBridge snapshots, 120 bracketed `GetDateTime` references,
   five BLE exchange groups (15 exchanges), four journal replays, and ten
   session metadata records including the three new sessions. BLE reconnects: 0.
 - Analyzer domain handling: 84 journal observations from before the post-flash

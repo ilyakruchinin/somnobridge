@@ -1,5 +1,5 @@
 /*
- * SomnoPal — anchors, mapping, stamp-transition estimator, SOT
+ * SomnoBridge — anchors, mapping, stamp-transition estimator, SOT
  * (spec §8.1/§8.3/§8.5; update spec U3–U7)
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
@@ -271,7 +271,7 @@ static drift_profile_t s_prof = {
     .provisional_half_us     = 5000000,
     .cadence_step_us         = 90000000,
     /* AS11 + EZShare bounds measured 2026-10-02 (masked session, 18 flush
-     * cycles, capture evidence somnopal-validation-lt_hjhvx):
+     * cycles, capture evidence somnobridge-validation-lt_hjhvx):
      * create: filename instant -> listing appearance measured -0.5..+5.8 s
      *         (incl. poll window + visibility latency); bound [-3,+10] s.
      * periodic: stamp - (filename + k*60 s) residual measured -1 s

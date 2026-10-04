@@ -84,7 +84,7 @@ python3 scripts/validate_timing.py capture \
 - It is read-only: cached BLE catalog reads + clock references + serial
   poll log. Adds no card polls, never writes to the card.
 - Stop it before flashing (it owns the serial reader). Evidence lands in a
-  private mode-0600 JSONL under `/tmp/somnopal-validation-*`.
+  private mode-0600 JSONL under `/tmp/somnobridge-validation-*`.
 
 ### Passive observer (automated multi-session collection)
 
@@ -112,7 +112,7 @@ Requires a *running* capture file plus `--allow-therapy-control`; drives
 
 ```bash
 python3 scripts/validate_timing.py cycle \
-    --input /tmp/somnopal-validation-XXXX/evidence.jsonl \
+    --input /tmp/somnobridge-validation-XXXX/evidence.jsonl \
     --allow-therapy-control --therapy-seconds 480 \
     --host 192.168.86.102 --day $(date +%Y%m%d)
 ```
@@ -124,7 +124,7 @@ waiting on the user.
 
 ```bash
 python3 scripts/validate_timing.py analyze \
-    --input /tmp/somnopal-validation-XXXX/evidence.jsonl
+    --input /tmp/somnobridge-validation-XXXX/evidence.jsonl
 ```
 
 Emits: per-file-type transition counts (size-only vs stamp-only vs both),

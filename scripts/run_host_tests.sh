@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SomnoPal — host contract test runner (spec §14.1)
+# SomnoBridge — host contract test runner (spec §14.1)
 # Compiles pure-logic components with stub ESP headers and runs the suite.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -22,7 +22,7 @@ SRCS="$SRCS components/drift/drift.c"
 SRCS="$SRCS components/drift/edf_hdr.c"
 SRCS="$SRCS components/journal/journal.c"
 
-OUT="${TMPDIR:-/tmp}/somnopal-host-test"
+OUT="${TMPDIR:-/tmp}/somnobridge-host-test"
 cc -std=c11 -Wall -Wextra -Werror -g -O0 -DCAT_HOST_THREADS -pthread \
     $INC $SRCS scripts/host_test.c -lm -o "$OUT"
 "$OUT"

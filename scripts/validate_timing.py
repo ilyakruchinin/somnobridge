@@ -22,10 +22,13 @@ from zoneinfo import ZoneInfo
 from clock_source import clock_bound, clock_source
 
 
+SNAPSHOT_KINDS = ("somnobridge_snapshot", "somnopal_snapshot")
+
+
 class Evidence:
     def __init__(self, output=None):
         if output is None:
-            output = Path(tempfile.mkdtemp(prefix="somnopal-validation-")) / "evidence.jsonl"
+            output = Path(tempfile.mkdtemp(prefix="somnobridge-validation-")) / "evidence.jsonl"
         self.path = Path(output)
         self.file = os.fdopen(os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w")
 
@@ -83,9 +86,9 @@ def reference(host, source_uncertainty_ms, rounds=3):
 
 def ble_connect(address):
     import dbus.mainloop.glib
-    from ble_query import SomnoPal
+    from ble_query import SomnoBridge
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-    dev = SomnoPal(address)
+    dev = SomnoBridge(address)
     try:
         dev.connect()
         dev.subscribe()
@@ -259,8 +262,8 @@ def serial_observations(fd, state, evidence):
                              count=int(match[3]), changed=bool(int(changed)),
                              fields=fields,
                              timing_semantics="log_after_feed_not_http_issue")
-            if "SomnoPal boot" in text or "Guru Meditation" in text:
-                evidence.put("device_discontinuity", boot="SomnoPal boot" in text,
+            if "SomnoBridge boot" in text or "Guru Meditation" in text:
+                evidence.put("device_discontinuity", boot="SomnoBridge boot" in text,
                              panic="Guru Meditation" in text)
         if len(state[0]) > 65536:
             state[0] = b""
@@ -499,7 +502,7 @@ def observe(args, evidence, bound):
                     continue
                 u2, m2 = time.time_ns() // 1000000, time.monotonic_ns()
                 snapshots += 1
-                evidence.put("somnopal_snapshot", request_utc_ms=u1,
+                evidence.put("somnobridge_snapshot", request_utc_ms=u1,
                              request_mono_ns=m1, response_utc_ms=u2,
                              response_mono_ns=m2, status=status, drift=drift)
                 therapy = (status.get("therapy") or {})
@@ -765,7 +768,7 @@ def map_with_anchor(obs_lo_us, obs_hi_us, anchors, rate_ppm=500):
 def unique_observations(rows):
     observations = {}
     for row in rows:
-        if row["kind"] == "somnopal_snapshot":
+        if row["kind"] in SNAPSHOT_KINDS:
             estimate = ((row.get("drift") or {}).get("estimate") or {})
             files = estimate.get("files") or []
             beacon = files[0].get("name") if files else None
@@ -888,7 +891,7 @@ def score_update5(rows):
     estimate_scores = []
     seen_estimate_scores = set()
     for row in rows:
-        if row["kind"] != "somnopal_snapshot":
+        if row["kind"] not in SNAPSHOT_KINDS:
             continue
         estimate = ((row.get("drift") or {}).get("estimate") or {})
         interval = estimate.get("drift_interval_ms")
@@ -987,7 +990,7 @@ def analyze(path):
                 samples.append(row)
             if kind == "serial_day_result":
                 serial_polls += 1
-            if kind == "catalog_snapshot" or kind == "somnopal_snapshot":
+            if kind == "catalog_snapshot" or kind in SNAPSHOT_KINDS:
                 status = row.get("status") or {}
                 states.add(status.get("therapy", {}).get("state"))
             if kind == "observed_catalog_transition":
@@ -1068,7 +1071,7 @@ def self_test():
         {"kind": "clock_reference", "response_utc_ms": 1000500,
          "rtt_ms": 50, "drift_interval_ms": [80, 120],
          "host_clock_step": False},
-        {"kind": "somnopal_snapshot", "host_utc_ms": 1001000,
+        {"kind": "somnobridge_snapshot", "host_utc_ms": 1001000,
          "drift": {"estimate": {"session_start_as10": "synthetic",
              "timing_model": {"dev_rate_ppm": 500},
              "drift_interval_ms": [-1500, 700],
@@ -1133,7 +1136,7 @@ def self_test():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SomnoPal / SomnoTrace timing validation; explicit cycle mode controls therapy")
+    parser = argparse.ArgumentParser(description="SomnoBridge / SomnoTrace timing validation; explicit cycle mode controls therapy")
     parser.add_argument("mode", choices=["history", "capture", "observe", "cycle",
                                        "analyze", "self-test"])
     parser.add_argument("--host", default="192.168.86.102")
