@@ -54,11 +54,16 @@ suspend observation.
   corrupt-blob invalidation.
 - `python3 scripts/validate_timing.py self-test`: passes.
 - `./scripts/idf.sh build`: clean.
-- **Still open:** overnight hardware evidence (§6 of the update6 spec) and
-  measured-load characterization for sustained REFINE2 (§13.5) have not
-  been collected; ten-minute host-anchor cadence depends on the client
+- **Overnight hardware evidence collected** (2026-10-04 70-min +
+  2026-10-05 6.5-h captures): sustained REFINE2 with graceful
+  reacquisition, rolling evidence to 360 events, fallback commit +
+  next-session selection, and 1163/1164 interval containment vs AS11
+  `GetDateTime`. Sustained-REFINE2 load measured: 16,947 requests /
+  0 failures / 0 backoff over ~8 h (~9 req/min, median service 204 ms).
+- **Still open:** ten-minute host-anchor cadence depends on the client
   supplying anchors (firmware side is ready, `validate_timing.py observe`
-  defaults to 600 s).
+  defaults to 600 s); qualified-tier accuracy needs a ≤100 ms host
+  clock source.
 
 # NEXT
 
@@ -107,39 +112,54 @@ Regression test in `scripts/host_test.c`: empty-probe does not
 invalidate; single differing probe does not invalidate; N consecutive
 differing probes do.
 
-## VERIFY: session-end finalize + next-day fallback path (untested live)
+## VERIFY: session-end finalize + next-day fallback path — VERIFIED (2026-10-05 capture)
 
-The capture ended while therapy was still IN (`state:1`), so
-`drift_finalize_fallback()`, the `drift_fb` NVS commit, and the
-next-session `drift_select()` fallback branch have never run on
-hardware — only in host tests. A full-night `observe` run that spans
-the IN→OUT transition (and ideally the following session) is needed to
-confirm: fb commit on OUT, next-session eligibility, allowance
-application, and `selected_view:"previous_session_fallback"`.
+Originally flagged because the 70-minute capture ended while therapy
+was still IN. Confirmed live in the 6.5-hour overnight capture
+(`/tmp/somnopal-observe-20261004-2348.jsonl`, 8742 records):
 
-## VERIFY: evidence accumulation past the old 96-event cap
+- Session 1 (toilet-break pause, ~51 min): finalize ran at OUT and
+  correctly **declined** — journal `fallback/ref_stale age_us=195571274`,
+  newest evidence was 196 s old > the 180 s freshness gate (§12.6).
+- Session 2 (main night, ~5.3 h): `drift_fb` committed on OUT —
+  `persisted_seq:1`, `model_rev:5`, `clock_drift_ms:−509096`,
+  `half:1504`, `stale:false`, `fallback_eligible:true`.
+- Post-session: `selected_view:"previous_session_fallback"`,
+  `reason:"no_current_candidate"`, `adjusted_half_ms:2504` — the
+  completed-session correction is being served as designed.
 
-The run reached `evidence_total:59` (`evicted:27`, `n_windows` pinned
-32 — rolling eviction proven at the 32-boundary). >96-event sustained
-collection needs the same full-night capture as above.
+Remaining for full closure: observe the *next session's* early
+fallback use (record is committed in NVS — tonight's session is the
+first real next-day exercise), and confirm restored-record behavior
+across a reboot.
+
+## VERIFY: evidence accumulation past the old 96-event cap — VERIFIED
+
+`evidence_total:360`, `evicted:328`, `n_windows` pinned at 32 across
+a 6.5 h session — 3.75× past the old 96-event stop. Estimate stayed
+valid through every eviction; zero `diff_overflow`/`clock_step` flags.
 
 ## MEASURE: qualified accuracy still unproven (host bound)
 
 Anchor exchanges all returned `usable:true, qualified_source:false`
 because the host chrony bound (~±150 ms WAN NTP) exceeds the 100 ms
 qualification gate. The estimate correctly stayed
-`provisional`/`approximate` all run. Independent containment evidence
-is strong (171/171 AS11 `GetDateTime` references inside the firmware
-interval, median midpoint residual −148 ms), but qualified-tier
-reporting needs a ≤100 ms host clock source (LAN NTP / PTP / GPS) or
-acceptance of best-effort for this deployment.
+`provisional`/`approximate` in both captures. Independent containment
+evidence is now very strong — see "Accuracy outcomes" below — but
+qualified-tier reporting still needs a ≤100 ms host clock source
+(LAN NTP / PTP / GPS) or explicit acceptance of best-effort for this
+deployment.
 
-## WATCH: estimate midpoint skew
+## WATCH: estimate midpoint skew — recurred, worth one more night
 
-Median residual vs AS11 truth was −148 ms (interval skews slightly
-early). Well inside the stated ±1.3–1.4 s width and 100% containment,
-but if the same direction/magnitude recurs across nights it is a
-systematic bracket asymmetry worth understanding — no change now.
+- Night 1 (70 min): median residual −148 ms vs AS11 `GetDateTime`.
+- Night 2 (6.5 h): median residual **+5 ms**, σ=186 ms, but a
+  systematic −200…−330 ms bias developed after the ~04:22 file
+  rotation (beacon swap to a different data file). Hypothesis: per-file
+  write→visible latency differences shift the bracket mid.
+  Recommendation: keep watching; if the bias tracks specific beacon
+  files, consider per-beacon bracket calibration or documenting the
+  bias bound. No code change yet.
 
 ## NIT: `phase.reacq_reason` label
 
@@ -261,6 +281,44 @@ replacement rather than inventing a new automatic identity heuristic.
   selection untouched; the latest string is kept as provenance.
 - Verification: `scripts/run_host_tests.sh` all pass;
   `validate_timing.py self-test` passes; `./scripts/idf.sh build` clean.
-- **Still open:** hardware capture spanning an hourly boundary with an
-  eligible committed fallback (no version-induced stale), plus the
-  session-end finalize/next-day fallback verification listed above.
+- **Hardware-verified (2026-10-05 capture):** zero `sot/stale` journal
+  events across the whole night (old firmware showed ~1/h); the
+  committed `drift_fb` record survived the session and is eligible.
+  The version-invalidation source is eliminated.
+
+## Accuracy outcomes (both captures)
+
+| Metric | Night 1 (70 min) | Night 2 (6.5 h) |
+|---|---|---|
+| Interval containment vs AS11 `GetDateTime` | 171/171 (100%) | 1163/1164 (99.9%) |
+| Midpoint residual | median −148 ms | median +5 ms, σ=186 ms |
+| SomnoTrace `measured_stop` agreement | ~21 ms | ~0.2–0.3 s across 3 sessions |
+| Stated half-width (conservative) | ±1.36 s | ±1.27…1.74 s |
+| AS11 RTC drift measured | +3 ms (flat) | **−76 ms / 6.5 h ≈ 3 ppm** |
+| Tier | provisional / best-effort | provisional / best-effort |
+
+Note: the single containment miss was an 84 ms lower-bound shortfall —
+inside the reference's own ±150 ms uncertainty, not a demonstrated
+estimator failure. A side-effect of the +508 s offset: tonight's
+filenames rolled into "tomorrow" (`20261005_000019_BRP.edf` created at
+23:51 UTC Oct 4) — exactly why the correction matters.
+
+## FOLLOW-UP: session-end save freshness margin is thin
+
+The 180 s reference-freshness gate (`DRIFT_CUR_REF_MAX_US`) interacts
+with the 125 s OUT timeout: a session whose final observed flush lands
+>180 s before finalize declines the save (`ref_stale`). Session 1
+tonight declined for exactly this reason. Recommendation: keep the
+gate, but consider measuring freshness against the newest *observed*
+evidence rather than finalize-call time, or relaxing slightly
+(e.g. 240 s) — pauses that end sessions commonly land in the
+125–200 s band. Watch save/decline ratio across more nights before
+changing.
+
+## NIT: journal replay is a lossy window
+
+Each replay returns only a subset of the bounded ring; post-hoc the
+`fallback/save` event line wasn't captured (the `persisted_seq:1`
+record proves the commit regardless). Acceptable — but don't rely on
+journal replay for complete long-session event history; increase
+replay cadence if finer granularity is needed.

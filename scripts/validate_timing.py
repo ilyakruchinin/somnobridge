@@ -1113,14 +1113,14 @@ def main():
     if args.mode == "self-test":
         self_test()
         return
-    if not (0 <= args.exports <= 25 and 1 <= args.duration <= 7200 and
+    if not (0 <= args.exports <= 25 and 1 <= args.duration <= 43200 and
             2 <= args.interval <= 60 and 5 <= args.idle_interval <= 600 and
             5 <= args.reference_interval <= 3600 and
             30 <= args.anchor_interval <= 3600 and
             1 <= args.anchor_rounds <= 10 and
             10 <= args.session_meta_interval <= 3600 and
             0 <= args.journal_interval <= 3600):
-        parser.error("exports 0..25, duration 1..7200s, active interval 2..60s, "
+        parser.error("exports 0..25, duration 1..43200s, active interval 2..60s, "
                      "idle/reference/session intervals within bounds, "
                      "anchor rounds 1..10, journal interval 0..3600s")
     evidence = Evidence(args.output)
