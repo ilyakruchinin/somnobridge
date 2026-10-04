@@ -5,6 +5,7 @@
 import argparse
 import datetime as dt
 import ftplib
+import hashlib
 import json
 import math
 import os
@@ -400,27 +401,55 @@ JOURNAL_KEEP_KINDS = {"anchor", "timing_obs", "sot", "fallback",
 
 def collect_journal(dev, evidence):
     """Replay bounded timing evidence without storing unrelated records."""
+    started = time.monotonic()
     replay = dev.evidence(timeout=45)
     raw = replay.get("raw", b"")
+    begin = replay.get("begin") or {}
+    end = replay.get("end") or {}
+    result = end.get("result") or {}
+    errors = []
+    if not (begin.get("ok") is True and end.get("ok") is True and
+            result.get("ok") is True and
+            result.get("completion_allowed") is True):
+        errors.append("incomplete_stream")
+    try:
+        if int(result.get("actual_bytes", -1)) != len(raw):
+            errors.append("byte_count_mismatch")
+    except (TypeError, ValueError):
+        errors.append("invalid_byte_count")
+    if result.get("sha256") != hashlib.sha256(raw).hexdigest():
+        errors.append("sha256_mismatch")
     records = []
     malformed = skipped = 0
-    for line in raw.decode("utf-8", "replace").splitlines():
+    for line in raw.splitlines():
         if not line.strip():
             continue
         try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
+            rec = json.loads(line.decode("utf-8"))
+            if not isinstance(rec, dict):
+                raise ValueError("journal record is not an object")
+        except (UnicodeDecodeError, ValueError):
             malformed += 1
             continue
         if rec.get("k") in JOURNAL_KEEP_KINDS:
             records.append(rec)
         else:
             skipped += 1
+    if malformed:
+        errors.append("malformed_records")
+    integrity_valid = not errors
+    complete = (integrity_valid and result.get("gaps") == 0 and
+                result.get("truncated") is False and
+                (begin.get("result") or {}).get("truncated") is False)
     evidence.put("journal_replay",
-                 begin=(replay.get("begin") or {}).get("result"),
-                 end=(replay.get("end") or {}).get("result"),
-                 payload_bytes=len(raw), records=records,
+                 begin=begin.get("result"), end=end.get("result"),
+                 payload_bytes=len(raw),
+                 records=records if integrity_valid else [],
+                 integrity_valid=integrity_valid, complete=complete,
+                 errors=errors, elapsed_s=time.monotonic() - started,
                  malformed_records=malformed, skipped_records=skipped)
+    if errors:
+        raise ValueError("journal replay: " + ", ".join(errors))
     return records
 
 
@@ -1059,6 +1088,47 @@ def self_test():
     assert score["journal_preboot_observations"] == 1
     assert score["delay_containing_zero"] == 1
     assert score["latest_estimate_score"]["relation"] == "reference_contained"
+
+    def replay_fixture(raw=b'{"k":"fallback","e":"save"}\n', **updates):
+        result = {"ok": True, "completion_allowed": True,
+                  "actual_bytes": str(len(raw)),
+                  "sha256": hashlib.sha256(raw).hexdigest(),
+                  "gaps": 0, "truncated": False, **updates}
+        return {"begin": {"ok": True, "result": {"truncated": False}},
+                "end": {"ok": True, "result": result}, "raw": raw}
+
+    for fixture in [replay_fixture(), replay_fixture(b""),
+                    replay_fixture(b'{"k":"poll"}\n{"k":"event"}\n')]:
+        sink = Mock()
+        collect_journal(Mock(evidence=Mock(return_value=fixture)), sink)
+        assert sink.put.call_args.kwargs["integrity_valid"] is True
+        assert sink.put.call_args.kwargs["complete"] is True
+        assert all(r["k"] in JOURNAL_KEEP_KINDS
+                   for r in sink.put.call_args.kwargs["records"])
+    for fixture in [replay_fixture(gaps=1), replay_fixture(truncated=True)]:
+        sink = Mock()
+        assert collect_journal(Mock(evidence=Mock(return_value=fixture)), sink)
+        assert sink.put.call_args.kwargs["integrity_valid"] is True
+        assert sink.put.call_args.kwargs["complete"] is False
+    missing_end = replay_fixture()
+    missing_end["end"] = None
+    for fixture in [missing_end, replay_fixture(ok=False),
+                    replay_fixture(completion_allowed=False),
+                    replay_fixture(actual_bytes="invalid"),
+                    replay_fixture(actual_bytes="0"),
+                    replay_fixture(sha256="0" * 64),
+                    replay_fixture(b'{"k":"event"}\n{"k":'),
+                    replay_fixture(b'[]\n'),
+                    replay_fixture(b'{"k":"event","e":"\xff"}\n')]:
+        sink = Mock()
+        try:
+            collect_journal(Mock(evidence=Mock(return_value=fixture)), sink)
+        except ValueError:
+            assert sink.put.call_args.kwargs["integrity_valid"] is False
+            assert sink.put.call_args.kwargs["complete"] is False
+            assert sink.put.call_args.kwargs["records"] == []
+        else:
+            raise AssertionError("invalid replay accepted")
     print("synthetic self-tests passed")
 
 

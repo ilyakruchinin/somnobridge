@@ -124,8 +124,22 @@ Pure-logic modules compile with plain `cc` against stub ESP headers:
 ```
 
 Stubs live in `scripts/test_include/` (`esp_err.h`, `esp_timer.h` with a
-`host_now_us` virtual clock). Modules guarded by `ESP_PLATFORM` ifdefs use
-plain malloc/no-op locks on the host.
+`host_now_us` virtual clock). Host catalog allocation uses plain malloc;
+`run_host_tests.sh` enables `CAT_HOST_THREADS` with `-pthread` to use a real
+mutex and exercise concurrent catalog rebuild/feed/read stress. Without
+that define, catalog locks remain no-ops for single-threaded host use.
+
+For address/undefined-behavior/leak checks, compile the same sources and
+includes as the runner with `-O1 -DCAT_HOST_THREADS -pthread`,
+`-fsanitize=address,undefined`, and `-fno-omit-frame-pointer`, then run with
+`ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` and
+`UBSAN_OPTIONS=halt_on_error=1`. Repeated catalog reset must remain leak-free.
+
+`python3 scripts/validate_timing.py self-test` also checks journal replay
+completion, byte-count/SHA-256 validation, and malformed-record rejection.
+`python3 scripts/ble_query.py --self-test` checks BLE replay timeout/abort
+and stale-frame handling without connecting to a device; it needs the same
+`python3-dbus` and `python3-gi` imports as the query tool.
 
 The host suite does not compile `components/scheduler/sched.c`. For queue
 changes, also check target stack frames: the card task has a 16 KiB stack,

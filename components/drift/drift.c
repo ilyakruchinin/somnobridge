@@ -1709,9 +1709,13 @@ bool drift_finalize_fallback(int64_t now_us)
         return false;
     }
     /* spec §12.6: evidence whose newest reference is older than the
-     * live freshness window is not a "final session estimate" — it is
-     * an aged observation and must not be persisted.                */
-    if (now_us - cand.ref_mono_us > DRIFT_CUR_REF_MAX_US) {
+     * session-end envelope is not a "final session estimate" — it is
+     * an aged observation and must not be persisted. The envelope is
+     * wider than the live-window gate because OUT declaration itself
+     * takes ~125 s of quiet plus up to one flush period of pre-pause
+     * staleness; the normal session-end band reaches ~215 s.         */
+    if (cand.ref_mono_us > now_us ||
+        now_us - cand.ref_mono_us > DRIFT_FIN_REF_MAX_US) {
         drift_jrn("fallback", "\"e\":\"ref_stale\",\"age_us\":%lld",
                   (long long)(now_us - cand.ref_mono_us));
         return false;

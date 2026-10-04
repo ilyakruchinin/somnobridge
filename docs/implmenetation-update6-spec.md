@@ -361,7 +361,8 @@ is separate from numerical half-width and selection provenance.
 | FALLBACK_ALLOWANCE_MS | 1000 | Fixed additional half-width for using an older session |
 | FALLBACK_ADVANTAGE_MS | 500 | Required advantage over current, inclusive |
 | USABLE_HALF_MAX_MS | 5000 | Maximum selected half-width, inclusive |
-| CURRENT_REF_MAX_AGE_US | 180000000 | New implementation default: reference no more than 180 s old |
+| CURRENT_REF_MAX_AGE_US | 180000000 | Live-selection freshness: reference no more than 180 s old |
+| FINAL_REF_MAX_AGE_US | 240000000 | Session-end save envelope: newest reference no more than 240 s old at confirmed OUT |
 
 The first five values implement the approved recommendation. The 5 s limit
 preserves the current provisional numerical ceiling. The 180 s freshness
@@ -504,9 +505,15 @@ At a confirmed therapy transition to OUT:
 
 1. Evaluate latest session evidence, including eligible final writes already
    observed, at the end decision time.
-2. Build a final candidate using the same context/observation/freshness checks
-   as section 8.3. Its effective half-width at that decision time must be
-   ≤2000 ms. Do not save an earlier peak if final evidence is worse or stale.
+2. Build a final candidate using the same context/observation checks
+   as section 8.3. Reference freshness uses the session-end envelope
+   (reference age from zero through FINAL_REF_MAX_AGE_US = 240 s),
+   not the 180 s live-selection gate. OUT declaration waits for ~125 s
+   of quiet plus clean rounds; a bracketed reference may also predate the
+   last growth. The 240 s limit is a bounded best-effort allowance for
+   that delay, not a proven maximum or continuity guarantee. Its
+   effective half-width at that decision time must be ≤2000 ms. Do not
+   save an earlier peak if final evidence is worse or stale.
 3. If qualifying, replace the completed-session fallback in RAM regardless
    of old width, interval overlap, or 250 ms improvement. Store the original
    latest-observation interval and its original reference together; the
@@ -708,7 +715,8 @@ to section 6, cover:
    and non-overlapping valid final records all replace. Exactly 2000 saves;
    2001 does not. Commit success survives round-trip reload.
 6. Earlier good peak followed by a worse final estimate does not save the
-   peak. Reference older than 180 s cannot be treated as fresh or saved.
+   peak. Reference older than 180 s cannot be selected as fresh live
+   evidence; reference older than 240 s cannot be saved at finalize.
 7. Few observations, contradictions, unresolved source, invalidation, and
    missed anchors cannot save/refresh an older record; a valid provisional
    unvalidated estimate can save without becoming qualified.

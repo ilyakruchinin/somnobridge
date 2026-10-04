@@ -57,7 +57,7 @@ uint32_t   jrn_oldest_seq(void);     /* oldest retained (0 = unknown)   */
 bool       jrn_truncated(void);      /* a gap/overflow was observed     */
 
 /* Replay retained payloads oldest->newest, CRC-verified per slot.
- * cb returns false to stop early. Records skipped by damage report
+ * cb returning false aborts with ESP_FAIL. Skipped/overwritten slots report
  * via `gaps_out` (may be NULL).                                      */
 typedef bool (*jrn_walk_cb_t)(const char *payload, uint16_t len,
                               uint32_t seq, void *ctx);

@@ -49,21 +49,29 @@ suspend observation.
 
 - `scripts/host_test.c` `test_update6` covers: rolling eviction past the
   old cap, fallback restore/expiry/allowance, current-vs-fallback margin
-  selection, wider-final replacement, below-gate keep-old, 180 s stale
-  reference rejection, model-incompatible record non-application, and
-  corrupt-blob invalidation.
-- `python3 scripts/validate_timing.py self-test`: passes.
-- `./scripts/idf.sh build`: clean.
+  selection, wider-final replacement, below-gate keep-old, inclusive
+  180 s live and 240 s finalization boundaries, future-reference rejection,
+  unchanged fallback on rejection, elapsed-time width widening,
+  model-incompatible record non-application, and corrupt-blob invalidation.
+- Host tests also cover recovery-reason clearing and interrupted/overwritten
+  journal replays. `./scripts/run_host_tests.sh`: passes.
+- `python3 scripts/validate_timing.py self-test`: passes, including replay
+  completion, byte-count/SHA-256, and malformed-record rejection.
+- `python3 scripts/ble_query.py --self-test`: passes; no device connection.
+- `./scripts/idf.sh build`: clean, app size `0x12fe90`, 70% partition free.
 - **Overnight hardware evidence collected** (2026-10-04 70-min +
   2026-10-05 6.5-h captures): sustained REFINE2 with graceful
   reacquisition, rolling evidence to 360 events, fallback commit +
-  next-session selection, and 1163/1164 interval containment vs AS11
-  `GetDateTime`. Sustained-REFINE2 load measured: 16,947 requests /
-  0 failures / 0 backoff over ~8 h (~9 req/min, median service 204 ms).
-- **Still open:** ten-minute host-anchor cadence depends on the client
-  supplying anchors (firmware side is ready, `validate_timing.py observe`
-  defaults to 600 s); qualified-tier accuracy needs a ≤100 ms host
-  clock source.
+  post-OUT selection, and 1163/1164 interval containment vs AS11
+  `GetDateTime`. Final HTTP counters reported 16,947 samples and zero
+  failures; median service was 204 ms and observed backoff was zero.
+  These are since-boot counters, not a capture-only request rate.
+- **Decision:** best-effort/provisional accuracy is accepted for this
+  deployment. Qualified-tier accuracy is not a release requirement; quality
+  labels and qualification thresholds remain truthful and unchanged.
+- **Still open:** hardware verification of the strengthened fixes below,
+  next-session fallback use, and restore across a reboot. Ten-minute
+  host-anchor cadence remains client-supplied (`--anchor-interval 600`).
 
 # NEXT
 
@@ -112,7 +120,7 @@ Regression test in `scripts/host_test.c`: empty-probe does not
 invalidate; single differing probe does not invalidate; N consecutive
 differing probes do.
 
-## VERIFY: session-end finalize + next-day fallback path — VERIFIED (2026-10-05 capture)
+## VERIFY: session-end finalize + next-day fallback path — PARTLY VERIFIED
 
 Originally flagged because the 70-minute capture ended while therapy
 was still IN. Confirmed live in the 6.5-hour overnight capture
@@ -128,10 +136,10 @@ was still IN. Confirmed live in the 6.5-hour overnight capture
   `reason:"no_current_candidate"`, `adjusted_half_ms:2504` — the
   completed-session correction is being served as designed.
 
-Remaining for full closure: observe the *next session's* early
-fallback use (record is committed in NVS — tonight's session is the
-first real next-day exercise), and confirm restored-record behavior
-across a reboot.
+The confirmed result is save plus post-OUT fallback selection, not yet use
+in the next therapy session. Remaining for full closure: observe early
+fallback use in a resumed/new session and restore across a reboot. Neither
+has been established by the overnight capture alone.
 
 ## VERIFY: evidence accumulation past the old 96-event cap — VERIFIED
 
@@ -139,16 +147,15 @@ across a reboot.
 a 6.5 h session — 3.75× past the old 96-event stop. Estimate stayed
 valid through every eviction; zero `diff_overflow`/`clock_step` flags.
 
-## MEASURE: qualified accuracy still unproven (host bound)
+## DECIDED: best-effort accuracy is sufficient
 
-Anchor exchanges all returned `usable:true, qualified_source:false`
-because the host chrony bound (~±150 ms WAN NTP) exceeds the 100 ms
-qualification gate. The estimate correctly stayed
-`provisional`/`approximate` in both captures. Independent containment
-evidence is now very strong — see "Accuracy outcomes" below — but
-qualified-tier reporting still needs a ≤100 ms host clock source
-(LAN NTP / PTP / GPS) or explicit acceptance of best-effort for this
-deployment.
+The maintainer accepts best-effort/provisional accuracy for this deployment.
+No better host clock or relaxed qualification threshold is required.
+Anchors remain `usable:true, qualified_source:false` when the chrony bound
+(~±150 ms in these captures) exceeds 100 ms; the estimate must continue to
+report `provisional`/`approximate`, not claim qualified accuracy. The fixed
+fallback allowance and expiry remain operating assumptions, not certified
+RTC bounds. Qualified-tier characterization is optional future work.
 
 ## WATCH: estimate midpoint skew — recurred, worth one more night
 
@@ -161,12 +168,13 @@ deployment.
   files, consider per-beacon bracket calibration or documenting the
   bias bound. No code change yet.
 
-## NIT: `phase.reacq_reason` label
+## NIT: `phase.reacq_reason` label — FIXED
 
 `"day_change"` persisted as the reason string for the entire session
-after the initial acquisition — the last reason is never cleared on
-successful transitions. Cosmetic; clear or annotate it when the phase
-state is next touched.
+after the initial acquisition — the last reason was never cleared on
+successful transitions. Fixed in `phase_obs` (clears on an accepted
+bracket); see "NIT: `phase.reacq_reason` label — IMPLEMENTED / HOST-VERIFIED"
+below for semantics and regression coverage.
 
 ## Appendix — revised recommendation: ignore EZShare version for timing validity
 
@@ -281,10 +289,12 @@ replacement rather than inventing a new automatic identity heuristic.
   selection untouched; the latest string is kept as provenance.
 - Verification: `scripts/run_host_tests.sh` all pass;
   `validate_timing.py self-test` passes; `./scripts/idf.sh build` clean.
-- **Hardware-verified (2026-10-05 capture):** zero `sot/stale` journal
-  events across the whole night (old firmware showed ~1/h); the
-  committed `drift_fb` record survived the session and is eligible.
-  The version-invalidation source is eliminated.
+- **Hardware evidence (2026-10-05 capture):** no `sot/stale` events were
+  found in collected replays (old firmware showed ~1/h), and a committed
+  fallback was eligible after OUT. Replay history was incomplete, so absence
+  of an event is not proof of complete event coverage. The code and host
+  regression establish removal of version-based invalidation; an eligible
+  fallback surviving into the following session remains a hardware check.
 
 ## Accuracy outcomes (both captures)
 
@@ -297,28 +307,146 @@ replacement rather than inventing a new automatic identity heuristic.
 | AS11 RTC drift measured | +3 ms (flat) | **−76 ms / 6.5 h ≈ 3 ppm** |
 | Tier | provisional / best-effort | provisional / best-effort |
 
-Note: the single containment miss was an 84 ms lower-bound shortfall —
-inside the reference's own ±150 ms uncertainty, not a demonstrated
-estimator failure. A side-effect of the +508 s offset: tonight's
-filenames rolled into "tomorrow" (`20261005_000019_BRP.edf` created at
+Note: the single non-containment was an 84 ms lower-bound shortfall with
+partial interval overlap. It was not full containment and must not be
+counted as such; the capture does not establish absolute clock accuracy.
+A side-effect of the +508 s offset: filenames rolled into "tomorrow" (`20261005_000019_BRP.edf` created at
 23:51 UTC Oct 4) — exactly why the correction matters.
 
-## FOLLOW-UP: session-end save freshness margin is thin
+## FOLLOW-UP: session-end save freshness margin — IMPLEMENTED / HOST-VERIFIED
 
-The 180 s reference-freshness gate (`DRIFT_CUR_REF_MAX_US`) interacts
-with the 125 s OUT timeout: a session whose final observed flush lands
->180 s before finalize declines the save (`ref_stale`). Session 1
-tonight declined for exactly this reason. Recommendation: keep the
-gate, but consider measuring freshness against the newest *observed*
-evidence rather than finalize-call time, or relaxing slightly
-(e.g. 240 s) — pauses that end sessions commonly land in the
-125–200 s band. Watch save/decline ratio across more nights before
-changing.
+Live selection remains limited to 180 s. Confirmed-OUT finalization uses
+its own inclusive 240 s limit, allowing more decision latency without
+retimestamping the measurement. Future references and references beyond
+240 s are rejected; the effective ±2000 ms width gate, original timestamp,
+36 h expiry, and fixed fallback allowance remain unchanged.
 
-## NIT: journal replay is a lossy window
+The earlier ~215 s normal-end estimate is not a proven maximum. The 240 s
+limit is an accepted best-effort trade-off: it admits an additional minute
+of evidence age and cannot detect an unobserved RTC step during that gap.
+The historical 196 s decline followed the old policy; it is not proof that
+all similarly aged evidence is safe under every circumstance.
 
-Each replay returns only a subset of the bounded ring; post-hoc the
-`fallback/save` event line wasn't captured (the `persisted_seq:1`
-record proves the commit regardless). Acceptable — but don't rely on
-journal replay for complete long-session event history; increase
-replay cadence if finer granularity is needed.
+Host regressions cover exactly 180/240 s and 1 µs beyond, future references,
+original reference preservation, unchanged record/dirty state on age
+rejection, and exactly 2000 ms effective width versus 2001 ms after elapsed
+widening. A new real session-end capture is still needed.
+
+## FIX: journal replay integrity — IMPLEMENTED / HOST-VERIFIED
+
+The shorter replay interval was not a root-cause fix. `GET_EVIDENCE` streams
+the entire retained committed journal oldest-first, not just new events.
+The overnight replays all reported completion, but coverage varied and
+some contained malformed records; ordinary ring eviction alone was not
+established as the cause.
+
+Implemented without a new protocol, flash layout, or larger ring:
+
+- `jrn_walk()` returns failure when its consumer stops early. The existing
+  BLE completion path therefore reports failed transport rather than
+  falsely declaring a partial replay complete. A regression reproduced
+  the old success-on-interruption bug before the fix.
+- Replay rechecks the indexed chunk sequence before emission. A slot
+  overwritten during replay is reported as a gap, not emitted as another
+  generation's chunk. CRC and payload-length checks remain enforced.
+- The collector verifies stream completion, byte count, SHA-256, UTF-8,
+  and JSON-object records. Invalid replays retain diagnostic metadata but
+  no observations, and are reported through the existing observer-error
+  path. Valid transferred subsets with reported gaps/truncation have
+  `integrity_valid:true, complete:false`; they cannot prove event absence.
+- The BLE client sends ABORT when an opened replay times out or raises,
+  and ignores foreign-request or late byte frames. This prevents a timeout
+  from leaving the credit-waiting stream active indefinitely when abort
+  delivery succeeds. Failed abort delivery remains visible in verbose logs.
+- Default replay cadence is restored to 600 s. Each replay records elapsed
+  time; choose any tighter cadence only after measuring download cost and
+  retention. No immediate retry loop or incremental replay subsystem added.
+
+Host tests cover interrupted consumers, recovery on a later replay,
+slot replacement during replay, completion/byte-count/hash failures,
+malformed JSON/UTF-8, empty journals, gap/truncation flags, BLE timeout
+abort, credit failure, and stale/late frames.
+
+`complete` describes the transferred retained committed journal, not all
+session history: evicted records, the uncommitted RAM tail, and events
+written after replay indexing may be absent. `persisted_seq` plus dirty
+state remains the evidence for a durable fallback commit. The fixes do
+not establish the exact cause of every missing event in the old capture.
+
+## NIT: `phase.reacq_reason` label — IMPLEMENTED / HOST-VERIFIED
+
+The reason now denotes recovery pending until an enabled model accepts a
+bracket, not the historical last reason and not completion of the entire
+refinement ladder. Accepted recovery clears it to `none`; unchanged/wide
+observations do not. A disabled model keeps its `disabled` reason even if
+it accepts a bracket; recovery after re-enabling clears it normally.
+
+Direct regressions cover miss, beacon/day changes, unchanged observations,
+wide brackets, disabled-model visibility, and re-enabled recovery. No
+polling schedule or estimate-validity gate is changed by this field.
+
+## NEXT: hardware verification of strengthened follow-ups
+
+1. Flash the new build when requested; these changes are built but have
+   not been flashed or tested live in this follow-up.
+2. Capture therapy OUT and a resumed/new session: verify final save,
+   unchanged true reference age, early fallback use, then preference for
+   fresh current evidence. Also verify restored fallback after reboot and
+   an authenticated anchor.
+3. Exercise journal replay success and timeout/link loss: verify truthful
+   completion, observer rejection of invalid payloads, and successful
+   later requests after abort. Measure replay elapsed time and snapshot
+   gaps before deciding whether 600 s should change.
+4. Continue observing midpoint skew; no per-file calibration from one
+   night's bias. Keep best-effort labels and do not require qualified-tier
+   accuracy for this deployment.
+
+Verification: host tests, timing self-test, BLE stream self-test, and
+ESP-IDF build pass; `git diff --check` is clean. App size is `0x12fe90`
+with 70% partition free. No commit, push, or flash performed.
+
+## FOLLOW-UP: catalog reinitialization leak — FIXED / HOST-VERIFIED
+
+The earlier sanitizer finding (2584 bytes in 14 leaked allocations) came
+from `cat_init()` clearing folder pointers without releasing their arrays.
+The same path is used by the portal's rebuild-catalog action.
+
+Implemented in `components/catalog/catalog.c`:
+
+- Reuse the existing mutex and `free_files()` helper to release every
+  folder's resident allocation before clearing catalog state. Cleanup and
+  reset are one locked operation; empty/repeated resets are safe.
+- Account new file arrays only when they are published under the mutex.
+  Scratch preparation outside the lock no longer updates resident PSRAM
+  usage, so a rebuild cannot reset the counter underneath an in-flight feed.
+  Failed publication frees its scratch array without changing accounting.
+- Protect the scalar state/count/PSRAM queries with the same mutex. Existing
+  file/list queries already copy under that mutex, so caller-owned snapshots
+  remain valid after reset. Separate query calls are not a single combined
+  atomic status snapshot.
+
+The portal caller, catalog API, PSRAM budget, timing policy, and polling
+schedule are unchanged. A feed completing after reset may repopulate the
+catalog, as expected for a rebuild; no new generation/identity subsystem is
+introduced.
+
+Regression and verification:
+
+- A new 64-cycle populate/reset test reproduced the leak before the fix
+  under LeakSanitizer; it now passes. It covers multiple resident folders,
+  an empty folder, filtered directory entries, stale/hot state, accounting,
+  idempotent empty resets, and preservation of copied file snapshots.
+- Host catalog locking can use a real pthread mutex via `CAT_HOST_THREADS`;
+  the standard runner enables it with `-pthread`. A stress test runs 10,000
+  resets concurrently with 10,000 feeds and 10,000 reader iterations, then
+  confirms that a final reset leaves no resident allocation.
+- Full host suite passes AddressSanitizer/UndefinedBehaviorSanitizer with
+  `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` and
+  `UBSAN_OPTIONS=halt_on_error=1`. No leak suppression or disabled detection.
+- Standard host tests, timing self-test, BLE stream self-test, ESP-IDF build,
+  and `git diff --check` pass. Latest app size is `0x12ff80`, 70% free.
+
+Remaining hardware check: after flashing when requested, repeat portal
+catalog rebuilds while listing/monitoring and confirm stable PSRAM and
+continued catalog reconstruction. Host stress tests do not replace this
+on-device check. No flash, commit, or push performed.

@@ -13,6 +13,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef CAT_HOST_THREADS
+#include <pthread.h>
+#endif
 
 #include "esp_crc.h"
 
@@ -468,6 +471,125 @@ static void test_catalog(void)
            nh > 2 ? hot[2] : "-");
     CHECK(nh >= 2, "hot set nonempty");
 }
+
+static void test_catalog_reset(void)
+{
+    ezs_entry_t parent[] = {
+        mk("20240101", 0, NULL, true),
+        mk("20240102", 0, NULL, true),
+        mk("20240103", 0, NULL, true),
+    };
+    ezs_entry_t files[] = {
+        mk("20240103_220000_BRP.edf", 4096, "2024-01-03 22:01:00", false),
+        mk("20240103_220000_PLD.edf", 8192, "2024-01-03 22:01:00", false),
+        mk("SUBDIR", 0, NULL, true),
+    };
+    char days[3][CAT_DAY_STR];
+    cat_file_t snapshot[2], found;
+    cat_init();
+    cat_init();
+    CHECK(cat_psram_used() == 0 && cat_folder_count() == 0,
+          "empty reset is idempotent");
+    for (int i = 0; i < 64; i++) {
+        CHECK(cat_feed_parent(parent, 3, 1000) == ESP_OK, "reset test parent feed");
+        cat_set_hot_base("20240103", "time");
+        CHECK(cat_feed_day("20240103", files, 3, 2000, NULL) == ESP_OK &&
+              cat_feed_day("20240102", files, 1, 3000, NULL) == ESP_OK &&
+              cat_feed_day("20240101", NULL, 0, 4000, NULL) == ESP_OK,
+              "resident, directory-filtered, and empty folders populated");
+        CHECK(cat_psram_used() == 4 * (int)sizeof(cat_file_t) &&
+              cat_catalog_complete(), "resident capacity accurately accounted");
+        CHECK(cat_day_entries("20240103", snapshot, 2) == 2,
+              "entries copied before reset");
+        cat_mark_folder_stale("20240102");
+        cat_init();
+        CHECK(cat_psram_used() == 0 && cat_folder_count() == 0 &&
+              cat_state() == CAT_SCANNING && !cat_catalog_complete(),
+              "reset restores empty catalog and zero resident accounting");
+        CHECK(cat_list_days(days, 3) == 0 && cat_hot_days(days, 3) == 0 &&
+              cat_scan_queue(days, 3) == 0 && cat_incomplete_count() == 0,
+              "reset clears folders, hot flags, and pending scans");
+        CHECK(!cat_find_file("20240103", files[0].name, &found) &&
+              cat_day_entries("20240103", NULL, 0) < 0 &&
+              cat_day_last_scan("20240103") == 0,
+              "reset removes old file and scan state");
+        CHECK(!strcmp(snapshot[0].name, files[0].name) &&
+              snapshot[0].size == 4096 && snapshot[1].size == 8192,
+              "caller-owned snapshot survives catalog reset");
+        cat_init();
+    }
+}
+
+#ifdef CAT_HOST_THREADS
+static void *catalog_feed_thread(void *ctx)
+{
+    int *errors = ctx;
+    ezs_entry_t files[] = {
+        mk("20240103_220000_BRP.edf", 4096, "2024-01-03 22:01:00", false),
+        mk("20240103_220000_PLD.edf", 8192, "2024-01-03 22:01:00", false),
+    };
+    for (int i = 0; i < 10000; i++) {
+        if (cat_feed_day("20240103", files, 1 + i % 2, i + 1, NULL) != ESP_OK)
+            (*errors)++;
+        cat_mark_folder_stale("20240103");
+    }
+    return NULL;
+}
+
+static void *catalog_read_thread(void *ctx)
+{
+    int *errors = ctx;
+    cat_file_t files[2], found;
+    char days[2][CAT_DAY_STR], newest[CAT_DAY_STR];
+    for (int i = 0; i < 10000; i++) {
+        int n = cat_day_entries("20240103", files, 2);
+        if (n != -99 && (n < 1 || n > 2)) (*errors)++;
+        if (n > 0 && n <= 2) {
+            if (strcmp(files[0].name, "20240103_220000_BRP.edf") ||
+                files[0].size != 4096) (*errors)++;
+            if (n == 2 && (strcmp(files[1].name, "20240103_220000_PLD.edf") ||
+                           files[1].size != 8192)) (*errors)++;
+        }
+        if (cat_find_file("20240103", "20240103_220000_BRP.edf", &found) &&
+            found.size != 4096) (*errors)++;
+        if (cat_newest_day(newest) && strcmp(newest, "20240103")) (*errors)++;
+        n = cat_list_days(days, 2);
+        if (n < 0 || n > 1 || (n == 1 && strcmp(days[0], "20240103")))
+            (*errors)++;
+        n = cat_folder_count();
+        if (n < 0 || n > 1) (*errors)++;
+        n = cat_psram_used();
+        if (n < 0 || n > 2 * (int)sizeof(cat_file_t) ||
+            n % (int)sizeof(cat_file_t)) (*errors)++;
+        cat_state_t state = cat_state();
+        if (state != CAT_SCANNING && state != CAT_READY) (*errors)++;
+    }
+    return NULL;
+}
+
+static void test_catalog_concurrent_reset(void)
+{
+    cat_init();
+    int feed_errors = 0, read_errors = 0;
+    pthread_t feeder, reader;
+    bool feed_started = pthread_create(&feeder, NULL, catalog_feed_thread,
+                                       &feed_errors) == 0;
+    bool read_started = pthread_create(&reader, NULL, catalog_read_thread,
+                                       &read_errors) == 0;
+    CHECK(feed_started && read_started, "catalog stress threads started");
+    for (int i = 0; i < 10000; i++) {
+        cat_init();
+        cat_set_hot_base("20240103", "time");
+    }
+    if (feed_started) CHECK(pthread_join(feeder, NULL) == 0, "catalog feeder joined");
+    if (read_started) CHECK(pthread_join(reader, NULL) == 0, "catalog reader joined");
+    CHECK(!feed_errors && !read_errors,
+          "concurrent rebuild, feed, and snapshot reads preserve valid state");
+    cat_init();
+    CHECK(cat_psram_used() == 0 && cat_folder_count() == 0,
+          "post-stress reset releases all resident allocations");
+}
+#endif
 
 /* ---------------- therapy FSM ---------------- */
 
@@ -1726,14 +1848,55 @@ static void test_update6(void)
         ls->off_hi_us = mid + 1900000;
     }
     int64_t want_half = (ls->off_hi_us - ls->off_lo_us) / 2000;
-    CHECK(!drift_finalize_fallback(now + 200000000),
-          "stale reference is never saved (§12.6)");
+    CHECK(drift_finalize_fallback(now + 200000000),
+          "session-tail evidence saves inside the OUT envelope");
+    CHECK(!drift_finalize_fallback(now + 250000000),
+          "genuinely aged reference is never saved (§12.6)");
     CHECK(drift_finalize_fallback(now),
           "wider final estimate still saves");
     CHECK(drift_fallback_view(&fbr) &&
           fbr.accuracy_half_ms >= want_half - 1,
           "latest completed session replaced regardless of width");
     int64_t fb_ref = fbr.reference_at_ms;
+    int64_t saved_lo = ls->off_lo_us, saved_hi = ls->off_hi_us;
+    int64_t ref = ls->ref_mono_us, aligned_mid = mid / 1000 * 1000;
+    ls->off_lo_us = aligned_mid - 1800000;
+    ls->off_hi_us = aligned_mid + 1800000;
+    CHECK(drift_select(ref + DRIFT_CUR_REF_MAX_US, &sel) &&
+          sel.cur_fresh, "live reference exactly 180 s old is fresh");
+    CHECK(drift_select(ref + DRIFT_CUR_REF_MAX_US + 1, &sel) &&
+          !sel.cur_fresh, "finalize allowance does not extend live freshness");
+    CHECK(drift_finalize_fallback(ref + DRIFT_FIN_REF_MAX_US),
+          "final reference exactly 240 s old is accepted");
+    CHECK(drift_fallback_view(&fbr) && fbr.reference_at_ms == fb_ref &&
+          fbr.ref_mono_us == ref,
+          "delayed finalize preserves the actual measurement reference");
+    CHECK(drift_sot_commit(true, now) == ESP_OK, "boundary save committed");
+    drift_sot_t saved_fb = fbr;
+    CHECK(drift_fallback_view(&saved_fb), "snapshot committed fallback");
+    CHECK(!drift_finalize_fallback(ref + DRIFT_FIN_REF_MAX_US + 1),
+          "final reference just beyond 240 s is rejected");
+    CHECK(!drift_finalize_fallback(ref - 1),
+          "future measurement reference is rejected");
+    CHECK(drift_fallback_view(&fbr) &&
+          !memcmp(&saved_fb, &fbr, sizeof(fbr)) && !drift_sot_dirty(),
+          "age rejection leaves committed fallback and dirty state unchanged");
+    int64_t widening = (DRIFT_FIN_REF_MAX_US * drift_profile()->dev_rate_ppm +
+                        999999999LL) / 1000000000LL;
+    ls->off_lo_us = aligned_mid - (DRIFT_SAVE_GOOD_MS - widening) * 1000;
+    ls->off_hi_us = aligned_mid + (DRIFT_SAVE_GOOD_MS - widening) * 1000;
+    CHECK(drift_finalize_fallback(ref + DRIFT_FIN_REF_MAX_US),
+          "effective final half-width exactly 2000 ms is accepted");
+    CHECK(drift_fallback_view(&saved_fb), "snapshot width-boundary fallback");
+    ls->off_lo_us -= 1000;
+    ls->off_hi_us += 1000;
+    CHECK(!drift_finalize_fallback(ref + DRIFT_FIN_REF_MAX_US),
+          "elapsed-time widening above 2000 ms rejects age-eligible evidence");
+    CHECK(drift_fallback_view(&fbr) && !memcmp(&saved_fb, &fbr, sizeof(fbr)),
+          "width rejection does not refresh old fallback");
+    ls->off_lo_us = saved_lo;
+    ls->off_hi_us = saved_hi;
+    CHECK(drift_finalize_fallback(now), "restore wider-final test candidate");
 
     /* ---- commit failure: dirty survives, bounded retry, success ---- */
     CHECK(drift_sot_commit(true, now) == ESP_OK && !drift_sot_dirty(),
@@ -1928,6 +2091,8 @@ static void test_phase(void)
     sim_fl_next = INT64_MAX;
     sim_run(&p, &now, 500000000);
     CHECK(p.st == PH_HUNT && p.n_misses == 1, "miss -> hunt");
+    CHECK(!strcmp(phase_reacq_name(p.reacq_reason), "miss"),
+          "miss reason remains visible until recovery");
 
     /* flush resumes shifted +20 s: HUNT brackets it at 5 s and the
      * ladder restarts                                               */
@@ -1936,11 +2101,21 @@ static void test_phase(void)
     CHECK(p.n_brackets >= 5, "reacquired after the phase jump");
     CHECK(p.st != PH_WATCH && p.st != PH_HUNT,
           "ladder re-entered after reacquire");
+    CHECK(!strcmp(phase_reacq_name(p.reacq_reason), "none"),
+          "accepted recovery clears the miss reason");
 
     /* beacon swap must not reuse the old file's phase              */
     phase_reacquire(&p);
     CHECK(p.st == PH_HUNT && !p.n_obs && !p.mark_us,
           "beacon swap resets the fit");
+    CHECK(!strcmp(phase_reacq_name(p.reacq_reason), "beacon_swap"),
+          "beacon swap reason is visible before a new bracket");
+    phase_obs(&p, 710000000, 710240000, false);
+    CHECK(!strcmp(phase_reacq_name(p.reacq_reason), "beacon_swap"),
+          "unchanged observation does not clear recovery reason");
+    phase_obs(&p, 715000000, 715240000, true);
+    CHECK(!strcmp(phase_reacq_name(p.reacq_reason), "none"),
+          "accepted new-beacon bracket clears recovery reason");
 
     /* day change resets everything                                 */
     phase_track(&p, "20240104", false);
@@ -1952,12 +2127,16 @@ static void test_phase(void)
     phase_obs(&p, 1000000, 1240000, false);
     phase_obs(&p, 3000000, 3240000, true);     /* 2 s bracket        */
     CHECK(p.st == PH_NARROW1 && p.n_brackets == 1, "narrow1 armed");
+    CHECK(!strcmp(phase_reacq_name(p.reacq_reason), "none"),
+          "accepted day-change bracket clears the reason");
     /* consumed bound -> fresh unchanged, then a transition whose
      * bracket spans a whole cycle: the phase model was wrong       */
     phase_obs(&p, 10000000, 10240000, false);  /* unch at 10 s       */
     phase_obs(&p, 75000000, 75240000, true);   /* w=65 s             */
     CHECK(p.st == PH_HUNT && p.n_misses >= 1,
           "oversized bracket -> reacquire");
+    CHECK(!strcmp(phase_reacq_name(p.reacq_reason), "wide_bracket"),
+          "rejected wide bracket keeps its failure reason");
 
     /* failed pulls count toward the window: deterministic miss     */
     phase_track(&p, "20240105", true);
@@ -1988,6 +2167,21 @@ static void test_phase(void)
                                      .enabled = false });
     CHECK(phase_due(&p, 80000000, sim_svc_us, &due, &gap) &&
           gap == 0, "disabled -> fixed watch spacing");
+    phase_t disabled;
+    phase_init(&disabled);
+    phase_track(&disabled, "20240105", true);
+    phase_config(&disabled, &(phase_cfg_t){ .watch_gap_us = 5000000,
+                                          .enabled = false });
+    phase_obs(&disabled, 1000000, 1240000, false);
+    phase_obs(&disabled, 3000000, 3240000, true);
+    CHECK(!strcmp(phase_reacq_name(disabled.reacq_reason), "disabled"),
+          "accepted bracket does not hide the disabled-model reason");
+    phase_config(&disabled, &(phase_cfg_t){ .watch_gap_us = 5000000,
+                                          .enabled = true });
+    phase_obs(&disabled, 61000000, 61240000, false);
+    phase_obs(&disabled, 63000000, 63240000, true);
+    CHECK(!strcmp(phase_reacq_name(disabled.reacq_reason), "none"),
+          "enabled-model recovery clears the disabled reason");
 
     /* update6: with refinement enabled the ladder ends in sustained
      * REFINE2 — a centered 0.5 s cluster every cycle for the whole
@@ -2091,6 +2285,25 @@ static bool ev_count(const char *p, uint16_t len, uint32_t seq, void *c)
     return true;
 }
 
+static bool ev_stop(const char *p, uint16_t len, uint32_t seq, void *ctx)
+{
+    (void)p; (void)len; (void)seq;
+    (*(int *)ctx)++;
+    return false;
+}
+
+static bool ev_replace(const char *p, uint16_t len, uint32_t seq, void *ctx)
+{
+    (void)p; (void)len; (void)seq;
+    if (++(*(int *)ctx) == 1) {
+        int i = kv_find("b000");
+        CHECK(i >= 0 && nvs_set_blob(1, "b001", s_kv[i].data,
+                                    s_kv[i].len) == ESP_OK,
+              "replace indexed chunk while replay is in progress");
+    }
+    return true;
+}
+
 static void test_journal(void)
 {
     nvs_stub_reset();
@@ -2111,6 +2324,27 @@ static void test_journal(void)
     CHECK(jrn_walk(ev_count, NULL, &gaps) == ESP_OK, "walk ok");
     CHECK(s_walk_n == 1 && gaps == 0, "one contiguous record");
 
+    int stop_calls = 0;
+    CHECK(jrn_walk(ev_stop, &stop_calls, &gaps) == ESP_FAIL &&
+          stop_calls == 1,
+          "interrupted journal replay is not successful completion");
+    s_walk_n = 0;
+    CHECK(jrn_walk(ev_count, NULL, &gaps) == ESP_OK && s_walk_n == 1,
+          "replay succeeds after an interrupted consumer");
+
+    CHECK(jrn_put("poll", "\"i\":3") == ESP_OK && jrn_commit() == ESP_OK,
+          "second replay chunk committed");
+    uint8_t original_chunk[JRN_PAYLOAD_MAX + 64];
+    size_t original_len = sizeof(original_chunk);
+    CHECK(nvs_get_blob(1, "b001", original_chunk, &original_len) == ESP_OK,
+          "snapshot second chunk");
+    int replace_calls = 0;
+    CHECK(jrn_walk(ev_replace, &replace_calls, &gaps) == ESP_OK &&
+          replace_calls == 1 && gaps == 1,
+          "overwritten indexed chunk is a gap, not a duplicate emission");
+    CHECK(nvs_set_blob(1, "b001", original_chunk, original_len) == ESP_OK,
+          "restore second chunk");
+
     /* corrupt the slot → CRC gap reported, not silently skipped      */
     nvs_stub_corrupt("b000");
     s_walk_n = 0; gaps = 0;
@@ -2130,6 +2364,10 @@ int main(void)
     test_parser();
     test_paths();
     test_catalog();
+    test_catalog_reset();
+#ifdef CAT_HOST_THREADS
+    test_catalog_concurrent_reset();
+#endif
     test_therapy();
     test_framing();
     test_drift();
@@ -2140,6 +2378,7 @@ int main(void)
     test_phase();
     test_edf();
     test_journal();
+    cat_init();
     if (fails) {
         printf("\n%d FAILURES\n", fails);
         return 1;

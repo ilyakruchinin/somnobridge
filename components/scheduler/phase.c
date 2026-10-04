@@ -577,6 +577,9 @@ void phase_obs(phase_t *p, int64_t req_us, int64_t resp_us,
         return;
     }
 
+    /* a bracket the model accepted resolves the last invalidation   */
+    if (p->cfg.enabled) p->reacq_reason = PH_RQ_NONE;
+
     if (p->session) {
         switch (p->st) {
         case PH_WATCH:

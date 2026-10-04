@@ -203,6 +203,8 @@ class SomnoPal:
             self._time_reply[rid] = (payload, time.time_ns() // 1000,
                                      time.monotonic_ns() // 1000)
         elif kind in (K_FILE_BYTES, K_EV_BYTES):
+            if not self._stream_open or rid != self._stream_rid:
+                return
             if off > len(self._stream):
                 self._stream.extend(b"\x00" * (off - len(self._stream)))
             self._stream[off:off + len(payload)] = payload
@@ -370,16 +372,24 @@ class SomnoPal:
         if not begin or not begin.get("ok"):
             return {"begin": begin, "raw": b"", "end": None}
         self._stream_open = True
-        self._ack(rid, 0)
-        while time.monotonic() < end:
-            self._pump(0.02)
-            if self._ack_pending:
-                self._ack_pending = False
-                self._ack(rid, self._stream_bytes)
-            if rid in self._done:          # STREAM_END
-                self._stream_end = json.loads(self._done.pop(rid))
-                break
-        self._stream_open = False
+        try:
+            self._ack(rid, 0)
+            while time.monotonic() < end:
+                self._pump(0.02)
+                if self._ack_pending:
+                    self._ack_pending = False
+                    self._ack(rid, self._stream_bytes)
+                if rid in self._done:          # STREAM_END
+                    self._stream_end = json.loads(self._done.pop(rid))
+                    break
+        finally:
+            self._stream_open = False
+            if self._stream_end is None:
+                try:
+                    self._write(self.ctrl_path, self._ctrl,
+                                frame(K_ABORT, rid, 0, FLAG_START | FLAG_END))
+                except dbus.exceptions.DBusException as error:
+                    self.log("evidence abort failed:", error)
         return {"begin": begin, "raw": bytes(self._stream),
                 "end": self._stream_end}
 
@@ -717,6 +727,63 @@ def print_evidence(r):
 
 # ---------- main ----------
 
+def self_test():
+    from unittest.mock import Mock, patch
+
+    def client():
+        dev = SomnoPal.__new__(SomnoPal)
+        dev._next_rid = Mock(return_value=42)
+        dev._write = Mock()
+        dev._ack = Mock()
+        dev.log = Mock()
+        dev.ctrl_path = dev._ctrl = None
+        dev._done = {}
+        dev._rx = {}
+        return dev
+
+    begin = {"ok": True, "result": {"truncated": False}}
+    end = {"ok": True, "result": {"ok": True}}
+    dev = client()
+    def pump(seconds):
+        if not dev._stream_open:
+            dev._done[42] = json.dumps(begin)
+        else:
+            dev._on_value(None, {"Value": frame(K_FILE_BYTES, 41, 0, 0,
+                                                b"stale")}, [])
+            dev._on_value(None, {"Value": frame(K_FILE_BYTES, 42, 0, 0,
+                                                b"current")}, [])
+            dev._done[42] = json.dumps(end)
+    dev._pump = pump
+    with patch(__name__ + ".time.monotonic", return_value=0):
+        replay = dev.evidence()
+    assert replay["raw"] == b"current" and replay["end"] == end
+    assert dev._write.call_count == 1 and not dev._stream_open
+    dev._on_value(None, {"Value": frame(K_FILE_BYTES, 42, 7, 0,
+                                        b"late")}, [])
+    assert bytes(dev._stream) == b"current"
+
+    dev = client()
+    dev._pump = lambda seconds: dev._done.update({42: json.dumps(begin)})
+    with patch(__name__ + ".time.monotonic", side_effect=[0, 0, 2]):
+        replay = dev.evidence(timeout=1)
+    assert replay["end"] is None and not dev._stream_open
+    assert HDR.unpack(dev._write.call_args.args[2][:HDR_LEN])[1] == K_ABORT
+
+    dev = client()
+    dev._pump = lambda seconds: dev._done.update({42: json.dumps(begin)})
+    dev._ack.side_effect = RuntimeError("synthetic credit failure")
+    with patch(__name__ + ".time.monotonic", return_value=0):
+        try:
+            dev.evidence()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("credit failure must propagate")
+    assert not dev._stream_open
+    assert HDR.unpack(dev._write.call_args.args[2][:HDR_LEN])[1] == K_ABORT
+    print("BLE stream self-tests passed")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Query a bonded SomnoPal over BLE (BlueZ D-Bus).",
@@ -747,9 +814,14 @@ def main():
                     help="replay the evidence journal (GET_EVIDENCE)")
     ap.add_argument("--json", action="store_true", help="print raw JSON")
     ap.add_argument("--timeout", type=float, default=15.0)
+    ap.add_argument("--self-test", action="store_true",
+                    help="run synthetic stream tests without connecting")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
+    if args.self_test:
+        self_test()
+        return
     if args.drift_best:
         args.drift = True
     if not any([args.status, args.catalog, args.days is not None, args.day,

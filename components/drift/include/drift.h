@@ -530,6 +530,12 @@ void      drift_card_fw_note(const char *fw); /* diagnostic only      */
 #define DRIFT_FB_ADV_MS        500         /* required fallback margin */
 #define DRIFT_USABLE_HALF_MS   5000        /* nothing beyond this      */
 #define DRIFT_CUR_REF_MAX_US   (180LL*1000*1000) /* current ref age   */
+/* Session-end save gate is wider than the live-window gate: OUT is
+ * declared ~125 s of quiet + clean rounds after the last growth, and
+ * the newest bracketed reference may predate the pause by up to one
+ * flush period (~62 s). The 240 s limit is a best-effort allowance,
+ * not a guarantee of continuity; the effective-width gate remains.  */
+#define DRIFT_FIN_REF_MAX_US   (240LL*1000*1000) /* finalize ref age  */
 
 typedef enum {
     DRIFT_SEL_NONE = 0,

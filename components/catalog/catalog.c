@@ -30,9 +30,16 @@ static void *cat_alloc(size_t n)
 static int64_t now_stub(void) { return esp_timer_get_time(); }
 #define CAT_LOG(...)  ESP_LOGI("cat", __VA_ARGS__)
 #else
+#ifdef CAT_HOST_THREADS
+#include <pthread.h>
+static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+#define LOCK()    pthread_mutex_lock(&s_lock)
+#define UNLOCK()  pthread_mutex_unlock(&s_lock)
+#else
 static int s_lock_dummy;
 #define LOCK()    ((void)s_lock_dummy)
 #define UNLOCK()  ((void)s_lock_dummy)
+#endif
 static void *cat_alloc(size_t n) { return malloc(n); }
 static int64_t now_stub(void) { return 0; }
 #define CAT_LOG(...)  ((void)0)
@@ -175,6 +182,8 @@ void cat_init(void)
         s_lock = xSemaphoreCreateMutex();
     }
 #endif
+    LOCK();
+    for (int i = 0; i < s_nfolders; i++) free_files(&s_folders[i]);
     memset(s_folders, 0, sizeof(s_folders));
     s_nfolders = 0;
     s_psram_used = 0;
@@ -182,6 +191,7 @@ void cat_init(void)
     s_base[0] = '\0';
     strcpy(s_base_src, "none");
     s_date_uncertain = true;
+    UNLOCK();
 }
 
 void cat_set_hot_base(const char base[CAT_DAY_STR], const char *source)
@@ -319,10 +329,9 @@ esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
         nf = cat_alloc((size_t)n * sizeof(cat_file_t));
         if (!nf) {
             CAT_LOG("feed %s: alloc %u B failed (psram_used=%d)",
-                     day, (unsigned)(n * sizeof(cat_file_t)), s_psram_used);
+                     day, (unsigned)(n * sizeof(cat_file_t)), cat_psram_used());
             return ESP_ERR_NO_MEM;
         }
-        s_psram_used += n * (int)sizeof(cat_file_t);
     }
     int w = 0;
     for (int i = 0; i < n; i++) {
@@ -351,7 +360,6 @@ esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
     if (!f) {
         UNLOCK();
         free(nf);
-        s_psram_used -= n * (int)sizeof(cat_file_t);
         return ESP_ERR_NO_MEM;
     }
     if (diff) {
@@ -414,6 +422,7 @@ esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
     free_files(f);
     f->files = nf;
     f->n_cap = n;
+    s_psram_used += n * (int)sizeof(cat_file_t);
     f->n_files = w;
     f->state = CAT_FOLDER_RESIDENT;
     f->stale = false;
@@ -453,10 +462,31 @@ void cat_mark_folder_stale(const char day[CAT_DAY_STR])
     UNLOCK();
 }
 
-cat_state_t cat_state(void)        { return s_state; }
-bool cat_catalog_complete(void)    { return s_state == CAT_READY; }
-int  cat_folder_count(void)        { return s_nfolders; }
-int  cat_psram_used(void)          { return s_psram_used; }
+cat_state_t cat_state(void)
+{
+    LOCK();
+    cat_state_t state = s_state;
+    UNLOCK();
+    return state;
+}
+
+bool cat_catalog_complete(void) { return cat_state() == CAT_READY; }
+
+int cat_folder_count(void)
+{
+    LOCK();
+    int count = s_nfolders;
+    UNLOCK();
+    return count;
+}
+
+int cat_psram_used(void)
+{
+    LOCK();
+    int used = s_psram_used;
+    UNLOCK();
+    return used;
+}
 
 bool cat_hot_ready(void)
 {

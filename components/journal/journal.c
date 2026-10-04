@@ -310,6 +310,7 @@ esp_err_t jrn_walk(jrn_walk_cb_t cb, void *ctx, uint32_t *gaps_out)
         }
         jrn_hdr_t *h = (jrn_hdr_t *)s_slot_buf;
         if (h->magic != JRN_MAGIC || h->version != JRN_VERSION ||
+            h->seq != idx[i].seq || h->len > JRN_PAYLOAD_MAX ||
             want != sizeof(*h) + h->len ||
             esp_crc32_le(0, s_slot_buf + sizeof(*h), h->len) != h->crc32) {
             if (gaps_out) (*gaps_out)++;   /* torn/corrupt → counted  */
@@ -317,7 +318,7 @@ esp_err_t jrn_walk(jrn_walk_cb_t cb, void *ctx, uint32_t *gaps_out)
         }
         if (!cb((const char *)s_slot_buf + sizeof(*h), h->len,
                 h->seq, ctx)) {
-            return ESP_OK;                 /* caller stopped early   */
+            return ESP_FAIL;               /* caller stopped early   */
         }
     }
     return ESP_OK;

@@ -80,7 +80,7 @@ typedef struct {
     int64_t  mark_us;           /* prediction midpoint                 */
     bool     fit_valid;
     bool     cycle_ambig;
-    uint8_t  reacq_reason;      /* last fit invalidation cause         */
+    uint8_t  reacq_reason;      /* recovery cause until accepted fit   */
 
     /* armed cycle window */
     bool     armed;
