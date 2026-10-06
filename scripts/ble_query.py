@@ -237,7 +237,7 @@ class SomnoBridge:
         mtu = int(self._get(self.ctrl_path, "org.bluez.GattCharacteristic1",
                             "MTU", 247) or 247)
         pay = max(mtu - 3 - HDR_LEN, 20)
-        window = window_bytes if window_bytes is not None else 32 * pay
+        window = window_bytes if window_bytes is not None else 128 * pay
         blob = frame(K_ACK, rid, offset, 0, struct.pack("<I", window))
         self._write(self.ctrl_path, self._ctrl, blob)
 

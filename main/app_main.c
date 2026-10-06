@@ -358,16 +358,20 @@ void app_main(void)
             static int s_tick;
             if (++s_tick % 10 == 0) {
                 bool adv, susp, syncd, htask; uint16_t ch; int stg;
-                ble_svc_diag_state(&adv, &susp, &ch, &syncd, &stg, &htask);
+                uint16_t itvl; uint8_t tph, rph;
+                ble_svc_diag_state(&adv, &susp, &ch, &syncd, &stg, &htask,
+                                   &itvl, &tph, &rph);
                 ESP_LOGI(TAG,
                          "diag adv=%d susp=%d sync=%d stage=%d htask=%d "
-                         "conn=%u bonded=%d heap_i=%u lrg_i=%u stream=%d",
+                         "conn=%u bonded=%d heap_i=%u lrg_i=%u stream=%d "
+                         "itvl=%u phy=%u/%u",
                          adv, susp, syncd, stg, htask, ch,
                          ble_svc_peer_bonded(),
                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                          (unsigned)heap_caps_get_largest_free_block(
                              MALLOC_CAP_INTERNAL),
-                         xTaskGetHandle("ble_stream") != NULL);
+                         xTaskGetHandle("ble_stream") != NULL,
+                         itvl, tph, rph);
                 if (!adv && !susp && ch == 0xFFFF) {
                     ESP_LOGI(TAG, "diag: re-arming advertising");
                     ble_svc_advertise();

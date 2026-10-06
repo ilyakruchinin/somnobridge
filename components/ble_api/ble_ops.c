@@ -46,6 +46,8 @@ static struct {
     uint64_t    sent;          /* body bytes notified               */
     uint64_t    acked;         /* contiguous ACK offset             */
     uint32_t    window;        /* remaining credit                  */
+    uint32_t    stall_ms;      /* diag: ms spent waiting for credit */
+    uint32_t    retry_ms;      /* diag: ms spent in send retries    */
     char        src_stamp[EZS_STAMP_MAX];
     bool        has_src_stamp;
     char        day[CAT_DAY_STR];
@@ -596,6 +598,7 @@ static void op_get_file(uint32_t rid, cJSON *args)
     s_stream.request_id = rid;
     s_stream.sent = s_stream.acked = 0;
     s_stream.window = 0;
+    s_stream.stall_ms = s_stream.retry_ms = 0;
     s_stream.is_evidence = false;
     s_stream.src_clen = -1;
     strncpy(s_stream.canon_dir, canon, sizeof(s_stream.canon_dir)-1);
@@ -650,6 +653,7 @@ static bool stream_sink(const uint8_t *d, size_t n, void *ctx)
         while (s_stream.window == 0) {
             /* wait for credit — sustained abort/link-loss breaks it   */
             vTaskDelay(pdMS_TO_TICKS(5));
+            s_stream.stall_ms += 5;
             if (stream_gate_broken(&miss_ms)) {
                 ESP_LOGW("ble", "stream_sink: gate lost, sent=%llu",
                          (unsigned long long)s_stream.sent);
@@ -691,7 +695,12 @@ static bool stream_sink(const uint8_t *d, size_t n, void *ctx)
                          "sent=%llu", (unsigned long long)s_stream.sent);
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(10));
+            /* wakes on NOTIFY_TX (mbuf freed); 15 ms timeout bounds
+             * the sleep if a TX-complete event is missed           */
+            int64_t w0 = esp_timer_get_time();
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(15));
+            s_stream.retry_ms +=
+                (uint32_t)((esp_timer_get_time() - w0) / 1000);
         }
         if (!sent) {
             ESP_LOGW("ble", "stream_sink: send retries exhausted, "
@@ -737,6 +746,7 @@ static void op_get_evidence(uint32_t rid)
     s_stream.request_id = rid;
     s_stream.sent = s_stream.acked = 0;
     s_stream.window = 0;
+    s_stream.stall_ms = s_stream.retry_ms = 0;
     s_stream.is_evidence = true;
     s_stream.ev_gaps = 0;
     s_stream.day[0] = '\0';
@@ -905,9 +915,12 @@ static void ble_stream_task(void *arg)
                 completion ? "true" : "false", reason);
             send_stream_end(s_stream.request_id, "STREAM_END", end);
         }
-        ESP_LOGI("ble", "stream done sent=%llu stack_hwm=%u",
+        ESP_LOGI("ble", "stream done sent=%llu stack_hwm=%u "
+                 "stall_ms=%lu retry_ms=%lu",
                  (unsigned long long)s_stream.sent,
-                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                 (unsigned long)s_stream.stall_ms,
+                 (unsigned long)s_stream.retry_ms);
         s_stream.active = false;
         continue;
 

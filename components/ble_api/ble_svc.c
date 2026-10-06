@@ -141,7 +141,9 @@ bool ble_svc_peer_bonded(void) { return s_have_peer; }
 
 void ble_svc_diag_state(bool *adv_active, bool *suspended,
                         uint16_t *conn_handle, bool *synced,
-                        int *init_stage, bool *host_task_up)
+                        int *init_stage, bool *host_task_up,
+                        uint16_t *conn_itvl, uint8_t *tx_phy,
+                        uint8_t *rx_phy)
 {
     if (adv_active)   *adv_active   = ble_gap_adv_active();
     if (suspended)    *suspended    = s_suspended;
@@ -149,6 +151,21 @@ void ble_svc_diag_state(bool *adv_active, bool *suspended,
     if (synced)       *synced       = ble_hs_synced();
     if (init_stage)   *init_stage   = s_init_stage;
     if (host_task_up) *host_task_up = xTaskGetHandle("nimble_host") != NULL;
+    struct ble_gap_conn_desc cd;
+    if (s_conn != BLE_HS_CONN_HANDLE_NONE &&
+        ble_gap_conn_find(s_conn, &cd) == 0) {
+        if (conn_itvl) *conn_itvl = cd.conn_itvl;
+    } else if (conn_itvl) {
+        *conn_itvl = 0;
+    }
+    if (tx_phy || rx_phy) {
+        uint8_t t = 0, r = 0;
+        if (s_conn != BLE_HS_CONN_HANDLE_NONE) {
+            ble_gap_read_le_phy(s_conn, &t, &r);
+        }
+        if (tx_phy) *tx_phy = t;
+        if (rx_phy) *rx_phy = r;
+    }
 }
 uint16_t ble_svc_att_mtu(void) { return s_mtu; }
 uint16_t ble_svc_conn_handle(void) { return s_conn; }
@@ -288,6 +305,24 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
             ESP_LOGI(TAG, "connected h=%u", s_conn);
             /* negotiate MTU early; link encrypts on bond/secured req  */
             ble_att_set_preferred_mtu(247);
+            /* Throughput levers: 251-octet DLE, 2M PHY, short conn
+             * interval. All are requests — the central decides what
+             * actually lands; the diag line reports the outcome.     */
+            ble_gap_set_data_len(s_conn, 251, 2120);
+            ble_gap_set_prefered_le_phy(s_conn, BLE_GAP_LE_PHY_2M_MASK,
+                                        BLE_GAP_LE_PHY_2M_MASK, 0);
+            struct ble_gap_upd_params upd = {
+                .itvl_min = 6,              /* 7.5 ms   */
+                .itvl_max = 12,             /* 15 ms    */
+                .latency  = 0,
+                .supervision_timeout = 400, /* 4 s      */
+                .min_ce_len = 0,
+                .max_ce_len = 0xFFFF,
+            };
+            int urc = ble_gap_update_params(s_conn, &upd);
+            if (urc != 0) {
+                ESP_LOGW(TAG, "conn param update req rc=%d", urc);
+            }
         } else {
             ble_svc_advertise();
         }
@@ -303,7 +338,20 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
         ble_svc_advertise();
         break;
 
-    case BLE_GAP_EVENT_CONN_UPDATE:
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        struct ble_gap_conn_desc cd;
+        if (ble_gap_conn_find(ev->conn_update.conn_handle, &cd) == 0) {
+            ESP_LOGI(TAG, "conn update status=%u itvl=%u lat=%u to=%u",
+                     ev->conn_update.status, cd.conn_itvl,
+                     cd.conn_latency, cd.supervision_timeout);
+        }
+        break;
+    }
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        ESP_LOGI(TAG, "phy update status=%u tx=%u rx=%u",
+                 ev->phy_updated.status,
+                 ev->phy_updated.tx_phy, ev->phy_updated.rx_phy);
         break;
 
     case BLE_GAP_EVENT_MTU:
@@ -345,7 +393,15 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
         break;
 
     case BLE_GAP_EVENT_NOTIFY_TX:
-        /* indication confirm — the streamer tracks via tx failure */
+        /* a completed TX frees a notify mbuf — wake the streamer so a
+         * stalled send retry resumes on the freed slot immediately
+         * instead of sleeping a fixed interval                     */
+        if (ev->notify_tx.status == 0) {
+            TaskHandle_t t = xTaskGetHandle("ble_stream");
+            if (t) {
+                xTaskNotifyGive(t);
+            }
+        }
         break;
 
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
