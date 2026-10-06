@@ -222,7 +222,16 @@ class SomnoBridge:
         value = dbus.Array([dbus.Byte(b) for b in blob], signature="y")
         opts = dbus.Dictionary({"offset": dbus.UInt16(0),
                                 "type": "request"}, signature="sv")
-        obj.WriteValue(value, opts)
+        last = None
+        for _ in range(8):
+            try:
+                obj.WriteValue(value, opts)
+                return
+            except dbus.DBusException as e:
+                last = e
+                # transient GATT errors (auth flap, busy): pace and retry
+                time.sleep(0.05)
+        raise last
 
     def _ack(self, rid, offset, window_bytes=None):
         mtu = int(self._get(self.ctrl_path, "org.bluez.GattCharacteristic1",
@@ -427,13 +436,20 @@ class SomnoBridge:
         args = {"directory": directory, "name": name}
         if expected_size is not None:
             args["expected_size"] = str(expected_size)
-        rid, begin, end = self._stream_open_op("GET_FILE", args,
-                                             timeout=timeout)
-        if not begin or not begin.get("ok"):
-            return {"begin": begin, "raw": b"", "end": None}
-        res = self._stream_collect(rid, end)
-        res["begin"] = begin
-        return res
+        for attempt in range(3):
+            rid, begin, end = self._stream_open_op("GET_FILE", args,
+                                                 timeout=timeout)
+            if not begin or not begin.get("ok"):
+                code = ((begin or {}).get("error") or {}).get("code")
+                if code == "STALE" and attempt < 2:
+                    # day listing older than 90 s: the device queued a
+                    # rescan (~10 s) and answered honestly — wait it out
+                    time.sleep(12)
+                    continue
+                return {"begin": begin, "raw": b"", "end": None}
+            res = self._stream_collect(rid, end)
+            res["begin"] = begin
+            return res
 
     def close(self):
         try:

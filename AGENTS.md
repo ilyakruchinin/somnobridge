@@ -95,6 +95,8 @@ Host-side diagnostic for a bonded SomnoBridge (needs `python3-dbus` +
 ./scripts/ble_query.py --drift              # live estimate + SOT envelope
 ./scripts/ble_query.py --time-sync 5        # run+commit a §8.1 anchor
 ./scripts/ble_query.py --evidence           # replay the evidence journal
+./scripts/ble_query.py --get 'A:\DATALOG\YYYYMMDD\file.edf' --out FILE
+                                            # download w/ SHA-256 verify
 ./scripts/ble_query.py --json               # raw JSON
 ```
 
@@ -104,6 +106,23 @@ commits the lowest-RTT one (device ack shows `accepted`/`reason`/anchors),
 which is the fastest way to confirm the drift machinery end to end.
 Measured RTT includes host D-Bus/Python overhead, so treat it as an
 upper bound — on-device processing shows up separately.
+
+**`GET_FILE` may return error `STALE` for the first request touching a
+catalog day whose listing is >90 s old.** The device schedules a rescan
+(~10 s) and refuses rather than serving stale metadata — retry the same
+op after ~12 s (`--get` already does this automatically; other clients
+must too). Never treat `STALE` as a hard failure.
+
+**Internal-RAM fragmentation can silently kill NimBLE.** The
+`nimble_host` task (~12 KiB internal stack), MSYS pools, and SM pairing
+crypto (`esp-aes` needs a multi-KiB contiguous block) all allocate from
+internal RAM — `xTaskCreatePinnedToCore` failure is silent, leaving a
+device that polls the card fine but never advertises (`sync=0`,
+advertise rc=30). The 10 s `diag` log line reports
+`adv/susp/sync/stage/htask/conn/bonded/heap_i/lrg_i/stream`; use it
+instead of chasing early-boot serial output across the USB
+re-enumeration gap. Keep BLE allocations early in `app_main` and budget
+internal RAM conservatively.
 
 ## Timing characterization
 

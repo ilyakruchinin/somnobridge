@@ -472,12 +472,55 @@ flashed:
    host-side SHA-256 match; 1.24 MB `BRP.edf` streamed correctly until
    the host-side test harness timed out at 90 s.
 
+Follow-on defects found during month-scale verification (all fixed):
+
+4. **NimBLE host task silently never created → no advertising.** Larger
+   stream stack + MSYS bump exhausted fragmented internal RAM;
+   `xTaskCreatePinnedToCore` inside `nimble_port_freertos_init` failed
+   silently, `ble_hs_synced()` stayed false, `ble_gap_adv_start` returned
+   `BLE_HS_ENOTSYNCED` (rc 30) while the app kept polling the card —
+   looked alive, was unreachable. Fixed: `ble_svc_init` moved before
+   `netw_init` so NimBLE allocs land on a fresh heap; MSYS_1 64→32,
+   MSYS_2 24→12, `ble_stream` 16→12 KiB (observed peak ~8.9 KiB),
+   `SPIRAM_MALLOC_ALWAYSINTERNAL` 4096→1024. The same fragmentation also
+   starved SM pairing crypto (`esp-aes: Failed to allocate memory` →
+   auth failure) — pairing now works with ~16 KiB internal free.
+   `ble_svc_diag_state()` + the 10 s `diag` log line (adv/susp/sync/
+   stage/htask/conn/bonded/heap_i/lrg_i/stream) made this diagnosable
+   without early-boot serial capture.
+
+5. **Transient auth flaps killed streams at ~13.7 KB.** `peer_is_authorized`
+   did `settings_load_peer` (NVS read) + bond-store lookup on every call;
+   a colliding NVS op flipped authorized→false for an instant, aborting
+   `stream_sink` and rejecting host ACKs with ATT 0x11. Fixed: peer
+   identity cached in RAM (`s_peer_cached`, set once from NVS), and
+   `stream_sink` tolerates ~500 ms of auth loss before aborting.
+
+6. **First file per catalog day returned `EC_STALE`.** Intended firmware
+   behavior: a day's resident listing older than 90 s triggers a
+   scheduled rescan (~10 s) and an honest refusal rather than a
+   stale-metadata download. `ble_query.py --get` now retries `STALE`
+   automatically (up to 2 retries, 12 s wait) — SomnoTrace's host side
+   must do the same; `STALE` is a transient "come back in ~10 s", not a
+   failure.
+
 Host-side (`ble_query.py`): added `--get PATH --out FILE` with SHA-256 +
 byte-count verification; the stream deadline is now a rolling 30 s idle
 timer (was a fixed absolute timeout that killed >90 s transfers); ACK
-credit window raised 8→32 ATT payloads (~7.3 KB) per grant.
+credit window raised 8→32 ATT payloads (~7.3 KB) per grant; ACK writes
+retry on transient ATT errors; `STALE` begin-responses auto-retry.
 
-## FOLLOW-UP: mid-stream link drop wedges BLE security until reboot — OPEN
+**Month-scale verification (2026-10-06, post-fix):** full catalog sweep —
+95 files / ~7.3 MB across 6 populated days (20260930–20261006 plus empty
+20260814), **95/95 SHA-256 verified**, zero failures including every
+day-boundary first file via the STALE retry (~18 s vs ~6 s typical).
+1.24–1.53 MB BRP files stream at ~18–19 KiB/s. Device: zero panics,
+zero resets, `stack_hwm` steady at ~3096 words, internal heap stable
+(~16–18 KiB free, 7.7 KiB largest block), sched 5 s card polls
+uninterrupted throughout — BLE transfers do not interfere with polling.
+`/tmp/dl_day.sh YYYYMMDD` is the per-day batch driver used.
+
+## FOLLOW-UP: mid-stream link drop wedges BLE security until reboot — LIKELY RESOLVED
 
 Twice observed: a file stream aborts mid-flight (client timeout / link
 drop), then all subsequent GATT writes fail "insufficient auth" even
@@ -488,10 +531,17 @@ died mid-procedure), the device is left bondless while the host still
 thinks it is paired. A bondless device-side + paired host-side = exactly
 this wedge. Serial capture had a ~100 s gap during the failure window
 (USB-serial-jtag drops bursts when the host reader stalls), so the actual
-SM event was not captured. Investigate: does enc re-establishment on
-reconnect fail because the bond was deleted? If so the delete-then-retry
-needs to also clear/recheck `s_have_peer` so a subsequent fresh pair can
-recover without the physical pairing window.
+SM event was not captured.
+
+Update (2026-10-06): the surviving evidence points away from bond loss —
+the "insufficient auth" stream aborts were the NVS-read-per-call auth
+flap (fix #5 above: `peer_is_authorized` hit `settings_load_peer` on
+every check; now RAM-cached with a ~500 ms grace in `stream_sink`).
+Post-fix: 95-file / ~7.3 MB month-scale sweep completed with zero auth
+failures and zero wedges. The repeat-pairing delete-then-retry window
+remains theoretically dangerous on a genuinely racing link drop, but no
+instance has been observed since the auth cache landed. Re-open if a
+post-fix wedge reproduces with an SM event captured.
 
 Recovery note: re-pairing requires the physical short-press pairing
 window plus the LCD passkey. `CONFIG_SOMNOBRIDGE_DIAG_FIXED_PASSKEY=y`
@@ -531,11 +581,11 @@ reset — serial tails must follow the live node.
    bias; no per-file calibration yet).
 5. Optional live check: portal catalog rebuild while listing/monitoring —
    confirm stable PSRAM over repeated rebuilds (host-verified only so far).
-6. **BLE file downloads end-to-end** — needs the host BT adapter back
-   (reboot host): pull a full night's file set (~15 EDFs, ~2 MB) then a
-   larger multi-day batch; confirm zero reboots, zero wedge, sched 5 s
-   polls keep running throughout, and per-file SHA-256 verifies.
-   A multi-file smoke script could loop `--get` over `LIST_DAY` output.
+6. ~~**BLE file downloads end-to-end**~~ — DONE (2026-10-06): full
+   catalog sweep, 95 files / ~7.3 MB / 95 SHA-256 verified / zero
+   failures / zero reboots / sched 5 s polls uninterrupted. Details in
+   the "BLE file downloads" section above. `/tmp/dl_day.sh` loops
+   `--get` over `LIST_DAY` output as suggested.
 7. Journal replay replay-rate check — the pacing fix should lift the
    ~57% abort rate seen night 3; rerun a few `--evidence` pulls.
 

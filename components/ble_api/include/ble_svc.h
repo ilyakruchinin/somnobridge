@@ -31,6 +31,11 @@ void      ble_svc_pairing_tick(int64_t now_us);
 bool      ble_svc_peer_bonded(void);
 bool      ble_svc_connected(void);
 bool      ble_svc_authorized(void);   /* encrypted + bonded + identity  */
+/* DIAG: runtime advert state for serial bring-up/debug (adv_active,
+ * suspended, conn handle)                                       */
+void      ble_svc_diag_state(bool *adv_active, bool *suspended,
+                             uint16_t *conn_handle, bool *synced,
+                             int *init_stage, bool *host_task_up);
 
 /** Forget the authorized peer: disconnect + erase bond + app record. */
 void      ble_svc_forget_peer(void);

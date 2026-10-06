@@ -60,7 +60,12 @@ static int64_t  s_pairing_deadline_us;
 static int64_t  s_pairing_attempt_us;
 static int      s_pairing_fails;
 static bool     s_have_peer;
+static uint8_t  s_peer_addr[6];      /* cached authorized identity addr */
+static uint8_t  s_peer_type;
+static bool     s_peer_cached;
 static bool     s_suspended;         /* SETUP AP window: radio yielded */
+static int      s_init_stage;        /* 0 none, 1 port, 2 gatts, 3 store,
+                                      * 4 host task spawned            */
 
 /* ---------------- access gate ---------------- */
 
@@ -98,7 +103,11 @@ static const struct ble_gatt_svc_def s_svcs[] = {
 
 /* Compare the connected peer's bonded identity address against our
  * stored authorized peer (§3.1). Private random resolvable addresses
- * map to the same identity after bonding, so compare identity addr. */
+ * map to the same identity after bonding, so compare identity addr.
+ * The peer identity is cached in RAM: settings_load_peer() hits NVS
+ * flash on every call, and a colliding NVS write (journal flush, bond
+ * store update) could return a transient error that flaps
+ * authorized->false mid-stream and kills transfers. */
 static bool peer_is_authorized(uint16_t conn)
 {
     struct ble_gap_conn_desc d;
@@ -112,12 +121,14 @@ static bool peer_is_authorized(uint16_t conn)
     if (!s_have_peer) {
         return false;
     }
-    uint8_t want_type, want_addr[6];
-    if (settings_load_peer(&want_type, want_addr) != ESP_OK) {
-        return false;
+    if (!s_peer_cached) {
+        if (settings_load_peer(&s_peer_type, s_peer_addr) != ESP_OK) {
+            return false;
+        }
+        s_peer_cached = true;
     }
     /* d.peer_id_addr = identity address (post-bonding) */
-    return memcmp(d.peer_id_addr.val, want_addr, 6) == 0;
+    return memcmp(d.peer_id_addr.val, s_peer_addr, 6) == 0;
 }
 
 bool ble_svc_authorized(void)
@@ -127,6 +138,18 @@ bool ble_svc_authorized(void)
 }
 bool ble_svc_connected(void)   { return s_conn != BLE_HS_CONN_HANDLE_NONE; }
 bool ble_svc_peer_bonded(void) { return s_have_peer; }
+
+void ble_svc_diag_state(bool *adv_active, bool *suspended,
+                        uint16_t *conn_handle, bool *synced,
+                        int *init_stage, bool *host_task_up)
+{
+    if (adv_active)   *adv_active   = ble_gap_adv_active();
+    if (suspended)    *suspended    = s_suspended;
+    if (conn_handle)  *conn_handle  = s_conn;
+    if (synced)       *synced       = ble_hs_synced();
+    if (init_stage)   *init_stage   = s_init_stage;
+    if (host_task_up) *host_task_up = xTaskGetHandle("nimble_host") != NULL;
+}
 uint16_t ble_svc_att_mtu(void) { return s_mtu; }
 uint16_t ble_svc_conn_handle(void) { return s_conn; }
 
@@ -186,10 +209,20 @@ static int on_passkey(struct ble_gap_event *ev, void *arg)
         if (s_have_peer &&
             ble_gap_conn_find(s_conn, &d) == 0) {
             uint8_t t, a[6];
-            known = settings_load_peer(&t, a) == ESP_OK &&
-                    memcmp(d.peer_id_addr.val, a, 6) == 0;
+            if (settings_load_peer(&t, a) == ESP_OK) {
+                known = memcmp(d.peer_id_addr.val, a, 6) == 0;
+                ESP_LOGI(TAG,
+                         "passkey gate: peer=%02x%02x%02x%02x%02x%02x/%d "
+                         "stored=%02x%02x%02x%02x%02x%02x/%d known=%d",
+                         d.peer_id_addr.val[0], d.peer_id_addr.val[1],
+                         d.peer_id_addr.val[2], d.peer_id_addr.val[3],
+                         d.peer_id_addr.val[4], d.peer_id_addr.val[5],
+                         d.peer_id_addr.type,
+                         a[0], a[1], a[2], a[3], a[4], a[5], t, known);
+            }
         }
         if (!known) {
+            ESP_LOGW(TAG, "passkey refused: window closed, peer unknown");
             return BLE_HS_EINVAL;
         }
     }
@@ -231,6 +264,9 @@ static void bond_to_peer(const struct ble_gap_conn_desc *d)
         return;
     }
     settings_save_peer(d->peer_id_addr.type, d->peer_id_addr.val);
+    memcpy(s_peer_addr, d->peer_id_addr.val, 6);
+    s_peer_type = d->peer_id_addr.type;
+    s_peer_cached = true;
     s_have_peer = true;
     s_pairing_open = false;         /* window closes on success (§3.1) */
     ble_svc_hide_pin();
@@ -393,6 +429,7 @@ void ble_svc_forget_peer(void)
     }
     settings_clear_peer();
     s_have_peer = false;
+    s_peer_cached = false;
     if (s_conn != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn, BLE_ERR_REM_USER_CONN_TERM);
     }
@@ -418,14 +455,20 @@ void ble_svc_advertise(void)
     f.uuids128 = (ble_uuid128_t *)&UUID_SVC;
     f.num_uuids128 = 1;
     f.uuids128_is_complete = 1;
-    ble_gap_adv_set_fields(&f);
+    int rc = ble_gap_adv_set_fields(&f);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "adv set_fields rc=%d", rc);
+    }
 
     p.conn_mode = BLE_GAP_CONN_MODE_UND;
     p.disc_mode = BLE_GAP_DISC_MODE_GEN;
     p.itvl_min = BLE_GAP_ADV_ITVL_MS(100);
     p.itvl_max = BLE_GAP_ADV_ITVL_MS(150);
-    ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
-                      &p, gap_event, NULL);
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
+                           &p, gap_event, NULL);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGE(TAG, "adv start rc=%d", rc);
+    }
 }
 
 /* ---------------- setup-mode suspend ----------------
@@ -510,6 +553,7 @@ bool ble_svc_pin_take_request(char *code, size_t len)
 
 static void on_sync(void)
 {
+    ESP_LOGI(TAG, "nimble synced, advertising");
     ble_svc_advertise();
     if (settings_has_peer()) {
         s_have_peer = true;
@@ -524,8 +568,9 @@ static void host_task(void *p) { nimble_port_run(); }
 esp_err_t ble_svc_init(void)
 {
     esp_err_t err = nimble_port_init();
+    s_init_stage = 1;
     if (err != ESP_OK) {
-        return err;
+        return -err;          /* negative = nimble_port_init failed   */
     }
     ble_hs_cfg.reset_cb = on_reset;
     ble_hs_cfg.sync_cb = on_sync;
@@ -546,9 +591,11 @@ esp_err_t ble_svc_init(void)
     ble_svc_gatt_init();
 
     int rc = ble_gatts_count_cfg(s_svcs);
-    if (rc) return ESP_FAIL;
+    s_init_stage = 2;
+    if (rc) return ESP_FAIL + 10;
     rc = ble_gatts_add_svcs(s_svcs);
-    if (rc) return ESP_FAIL;
+    s_init_stage = 3;
+    if (rc) return ESP_FAIL + 11;
 
         /* persistent bond storage — ble_store_config uses NVS when
      * CONFIG_BT_NIMBLE_NVS_PERSIST=y (spec §3.1)                   */
@@ -556,5 +603,6 @@ esp_err_t ble_svc_init(void)
     ble_ops_init();
 
     nimble_port_freertos_init(host_task);
+    s_init_stage = 4;
     return ESP_OK;
 }

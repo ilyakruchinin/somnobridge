@@ -21,10 +21,12 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
-# 4096 (not the 16384 default): mid-size allocs (httpd/NVS/lwIP buffers)
+# 1024 (not the 16384 default): mid-size allocs (httpd/NVS/lwIP buffers)
 # must not burn internal RAM — the WiFi driver needs ~10+ KB free internal
-# for per-station attach/mgmt TX in SoftAP mode or clients see auth storms.
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# for per-station attach/mgmt TX in SoftAP mode or clients see auth storms,
+# and NimBLE SM pairing needs a ~10 KiB contiguous internal block for the
+# ECC ladder (observed: esp-aes alloc failure -> disconnect reason 517).
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 # BLE: NimBLE host, single connection, Secure Connections, persistent bonds
@@ -32,9 +34,14 @@ CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
-# file streaming bursts through notify: 12 default blocks exhaust in
-# ~5 frames at MTU 247; 64×256B (~16 KiB) makes it pacing, not failure
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=64
+# MSYS_1 = notify/indicate mbuf pool: file streams burst through notify.
+# 12 default blocks exhaust in ~5 frames at MTU 247; 32×256B covers the
+# 32-frame stream ACK window so pool drain paces sends, not kills them.
+# Larger values exhaust internal RAM (NimBLE uses MEM_ALLOC_MODE_INTERNAL)
+# and silently kill the nimble_host task + SM pairing crypto. MSYS_2
+# halved likewise (24→12).
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=32
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_BT_NIMBLE_SM_SC=y
 

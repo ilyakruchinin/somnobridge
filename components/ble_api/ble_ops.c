@@ -617,6 +617,23 @@ static void op_get_file(uint32_t rid, cJSON *args)
 }
 
 /* sink: sends FILE_BYTES frames honoring credit window */
+/* A single auth check can flap false on a transient store/conn lookup
+ * hiccup; only abandon the stream after the link has been unauthorized
+ * (or the stream torn down) for ~500 ms continuously. */
+static bool stream_gate_broken(int *miss_ms)
+{
+    if (!s_stream.active) {
+        *miss_ms += 1000;
+        return true;
+    }
+    if (ble_svc_authorized()) {
+        *miss_ms = 0;
+        return false;
+    }
+    *miss_ms += 5;
+    return *miss_ms >= 500;
+}
+
 static bool stream_sink(const uint8_t *d, size_t n, void *ctx)
 {
     /* capture the EDF prefix while it streams past (≤16 KiB, U2 —
@@ -628,11 +645,14 @@ static bool stream_sink(const uint8_t *d, size_t n, void *ctx)
         s_stream.hdr_got += take;
     }
     size_t off = 0;
+    int miss_ms = 0;
     while (off < n) {
         while (s_stream.window == 0) {
-            /* wait for credit — abort/link-loss must also break it    */
+            /* wait for credit — sustained abort/link-loss breaks it   */
             vTaskDelay(pdMS_TO_TICKS(5));
-            if (!s_stream.active || !ble_svc_authorized()) {
+            if (stream_gate_broken(&miss_ms)) {
+                ESP_LOGW("ble", "stream_sink: gate lost, sent=%llu",
+                         (unsigned long long)s_stream.sent);
                 return false;
             }
         }
@@ -666,12 +686,16 @@ static bool stream_sink(const uint8_t *d, size_t n, void *ctx)
                 sent = true;
                 break;
             }
-            if (!s_stream.active || !ble_svc_authorized()) {
+            if (stream_gate_broken(&miss_ms)) {
+                ESP_LOGW("ble", "stream_sink: gate lost mid-send, "
+                         "sent=%llu", (unsigned long long)s_stream.sent);
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
         if (!sent) {
+            ESP_LOGW("ble", "stream_sink: send retries exhausted, "
+                     "sent=%llu", (unsigned long long)s_stream.sent);
             return false;
         }
         mbedtls_sha256_update(&s_stream.sha, d + off, take);
@@ -1186,8 +1210,10 @@ esp_err_t ble_ops_init(void)
     /* ble_stream_task runs ezs_download -> esp_http_client (stack-hungry)
      * plus journal NVS reads on the evidence path. 6 KiB overflowed and
      * corrupted the heap (crash in esp_http_client_init's calloc under a
-     * second download). Match card_task's proven size.                */
-    xTaskCreate(ble_stream_task, "ble_stream", 16384, NULL, 8,
+     * second download). Peak observed 8.9 KiB (hwm 7448 on 16 KiB) —
+     * 12 KiB keeps margin while sparing contiguous internal RAM that
+     * the nimble_host task and SM pairing crypto must have.           */
+    xTaskCreate(ble_stream_task, "ble_stream", 12288, NULL, 8,
                 &s_ble_task);
     return ESP_OK;
 }

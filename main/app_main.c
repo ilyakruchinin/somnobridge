@@ -245,7 +245,27 @@ void app_main(void)
         sched_note_task_created(true);
     }
 
-    /* 4. WiFi — STA with stored config, or fall back to setup AP     */
+    /* 4. BLE stack — moved BEFORE netw_init: NimBLE needs ~42 KiB of
+     * contiguous internal-RAM allocs in one shot (MSYS pools, ble_tx,
+     * ble_stream 16 KiB, nimble_host 12 KiB), and nimble_port's own
+     * xTaskCreatePinnedToCore failure is silent — post-WiFi the heap
+     * was fragmented enough (largest block 7.6 KiB) that nimble_host
+     * never spawned, leaving the device alive but permanently
+     * non-advertising. Same failure class as the card_task comment
+     * above. BLE adv already overlaps WiFi attach regardless.       */
+    err = ble_svc_init();
+    if (err == ESP_OK) {
+        ble_svc_advertise();
+        if (!ble_svc_peer_bonded()) {
+            lcd_ui_row(10, "PRESS BTN: PAIR", 0);
+        }
+    } else {
+        ESP_LOGE(TAG, "ble_svc_init failed");
+        lcd_ui_row(10, "BLE FAIL", 1);
+    }
+    heap_ck("ble");
+
+    /* 5. WiFi — STA with stored config, or fall back to setup AP     */
     err = netw_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "netw_init failed");
@@ -262,18 +282,6 @@ void app_main(void)
     }
     heap_ck("netw");
 
-    /* 5. BLE stack — advertises; pairing window opens on button      */
-    err = ble_svc_init();
-    if (err == ESP_OK) {
-        ble_svc_advertise();
-        if (!ble_svc_peer_bonded()) {
-            lcd_ui_row(10, "PRESS BTN: PAIR", 0);
-        }
-    } else {
-        ESP_LOGE(TAG, "ble_svc_init failed");
-        lcd_ui_row(10, "BLE FAIL", 1);
-    }
-    heap_ck("ble");
 #if !defined(CONFIG_HEAP_POISONING_DISABLED)
     ESP_LOGI(TAG, "mem internal free=%u largest=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -347,6 +355,24 @@ void app_main(void)
         int64_t now = esp_timer_get_time();
         if (now - last > 1000 * 1000) {
             last = now;
+            static int s_tick;
+            if (++s_tick % 10 == 0) {
+                bool adv, susp, syncd, htask; uint16_t ch; int stg;
+                ble_svc_diag_state(&adv, &susp, &ch, &syncd, &stg, &htask);
+                ESP_LOGI(TAG,
+                         "diag adv=%d susp=%d sync=%d stage=%d htask=%d "
+                         "conn=%u bonded=%d heap_i=%u lrg_i=%u stream=%d",
+                         adv, susp, syncd, stg, htask, ch,
+                         ble_svc_peer_bonded(),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_largest_free_block(
+                             MALLOC_CAP_INTERNAL),
+                         xTaskGetHandle("ble_stream") != NULL);
+                if (!adv && !susp && ch == 0xFFFF) {
+                    ESP_LOGI(TAG, "diag: re-arming advertising");
+                    ble_svc_advertise();
+                }
+            }
             jrn_tick(now);         /* 60-s evidence batch flush        */
             ble_svc_pairing_tick(now);   /* 120-s window / 60-s try   */
             netw_refresh_rssi();
