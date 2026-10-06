@@ -82,6 +82,9 @@ static const struct ble_gatt_svc_def s_svcs[] = {
                 .uuid = &UUID_CTRL.u,
                 .access_cb = access_gate,
                 .flags = BLE_GATT_CHR_F_WRITE |
+                         BLE_GATT_CHR_F_WRITE_NO_RSP | /* ACK credits:
+                             fire-and-forget, never queues behind an
+                             in-flight GATT op on a saturated link    */
                          BLE_GATT_CHR_F_INDICATE |
                          BLE_GATT_CHR_F_READ_ENC,    /* subscription too */
                 .val_handle = &s_ctrl_handle,
@@ -393,15 +396,9 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
         break;
 
     case BLE_GAP_EVENT_NOTIFY_TX:
-        /* a completed TX frees a notify mbuf — wake the streamer so a
-         * stalled send retry resumes on the freed slot immediately
-         * instead of sleeping a fixed interval                     */
-        if (ev->notify_tx.status == 0) {
-            TaskHandle_t t = xTaskGetHandle("ble_stream");
-            if (t) {
-                xTaskNotifyGive(t);
-            }
-        }
+        /* a submission-completion event, not a controller-buffer
+         * release — the streamer paces itself on a short deadline
+         * (update7 §3); nothing to do here                          */
         break;
 
     case BLE_GAP_EVENT_REPEAT_PAIRING: {

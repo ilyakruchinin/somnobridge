@@ -241,6 +241,40 @@ esp_err_t ezs_client_version(char *buf, size_t cap, ezw_obs_t *obs)
 
 /* ---------------- /download ---------------- */
 
+/* Download-handle reuse (update7 §4): the card pays TCP connect +
+ * request setup on every file otherwise (~0.2–0.4 s each). The handle
+ * survives between calls while it stays fresh; after 60 s idle, or any
+ * failed/aborted transfer, it is torn down and re-initialised so a
+ * half-consumed response can never poison the next request.         */
+static esp_http_client_handle_t s_dl_client;
+static int64_t                  s_dl_last_us;
+#define DL_KEEPALIVE_US  (60LL * 1000 * 1000)
+
+static esp_http_client_handle_t dl_get(const char *url, ezw_obs_t *obs)
+{
+    if (s_dl_client &&
+        esp_timer_get_time() - s_dl_last_us > DL_KEEPALIVE_US) {
+        esp_http_client_cleanup(s_dl_client);
+        s_dl_client = NULL;
+    }
+    if (s_dl_client) {
+        /* keep-alive reuse; esp_http_client_open() reconnects the
+         * transport itself if the card closed the connection         */
+        esp_http_client_set_url(s_dl_client, url);
+        if (esp_http_client_open(s_dl_client, 0) == ESP_OK &&
+            esp_http_client_fetch_headers(s_dl_client) >= 0 &&
+            esp_http_client_get_status_code(s_dl_client) > 0) {
+            obs->http_status =
+                esp_http_client_get_status_code(s_dl_client);
+            return s_dl_client;
+        }
+        esp_http_client_cleanup(s_dl_client);
+        s_dl_client = NULL;
+    }
+    s_dl_client = open_get(url, true, obs);
+    return s_dl_client;
+}
+
 esp_err_t ezs_download(const char *canon_dir, const char *name,
                        const char *dl_name, uint64_t listed_size,
                        uint8_t size_unit_shift,
@@ -291,11 +325,13 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
             build_url(url, sizeof(url), "download",
                       "fname", name, "fdir", fdir);
         }
-        c = open_get(url, true, obs);
+        c = dl_get(url, obs);
         if (c && esp_http_client_get_status_code(c) != 200) {
             ESP_LOGW(TAG, "form %d status=%d url=%.96s", form,
                      esp_http_client_get_status_code(c), url);
+            /* a non-200 body was never drained — do not reuse        */
             esp_http_client_cleanup(c);
+            s_dl_client = NULL;
             c = NULL;
         }
     }
@@ -313,7 +349,9 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
         /* announced length outside the ceil-unit envelope -> the
          * catalog tuple no longer describes this file (U8)          */
         obs->resp_end_us = esp_timer_get_time();
+        /* body unread — the response cannot be drained cleanly       */
         esp_http_client_cleanup(c);
+        s_dl_client = NULL;
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -345,7 +383,14 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
     }
     obs->resp_end_us = esp_timer_get_time();
     obs->body_bytes = sent;
-    esp_http_client_cleanup(c);
+    if (ok) {
+        /* fully consumed response: keep the handle for keep-alive
+         * reuse by the next ezs_download()                          */
+        s_dl_last_us = esp_timer_get_time();
+    } else {
+        esp_http_client_cleanup(c);
+        s_dl_client = NULL;
+    }
 
     if (!ok) {
         return ESP_FAIL;

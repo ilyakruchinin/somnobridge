@@ -25,6 +25,7 @@
 #include "sched.h"
 #include "phase.h"
 #include "ble_proto.h"
+#include "stream_codec.h"
 #include "drift.h"
 #include "edf_hdr.h"
 #include "journal.h"
@@ -137,6 +138,14 @@ esp_err_t nvs_erase_all(nvs_handle_t h)
     return ESP_OK;
 }
 esp_err_t nvs_commit(nvs_handle_t h) { (void)h; return ESP_OK; }
+void nvs_close(nvs_handle_t h) { (void)h; }
+esp_err_t nvs_flash_erase_partition(const char *p)
+{
+    (void)p;
+    for (int i = 0; i < s_kv_n; i++) free(s_kv[i].data);
+    s_kv_n = 0;
+    return ESP_OK;
+}
 
 static int fails;
 #define CHECK(cond, msg) do { \
@@ -620,6 +629,14 @@ static void test_therapy(void)
 
 /* ---------------- BLE framing ---------------- */
 
+static size_t stc_test_emit_len;
+static bool stc_test_emit(const uint8_t *d, size_t n, void *ctx)
+{
+    (void)d; (void)ctx;
+    stc_test_emit_len += n;
+    return true;
+}
+
 static void test_framing(void)
 {
     uint8_t frame[64];
@@ -685,6 +702,71 @@ static void test_framing(void)
         CHECK(done, "stream completes");
         CHECK(r.len == sizeof(src) && !memcmp(r.buf, src, sizeof(src)),
               "multi-fragment payload byte-exact");
+    }
+
+    /* compact stream-data frames (update7 §10.1): 4-byte header */
+    {
+        uint8_t f[280];
+        uint16_t fl = blep_build_cframe(f, sizeof(f), 0x1234,
+                                        (const uint8_t *)"data", 4);
+        CHECK(fl == BLEP_CDATA_HDR_LEN + 4, "cframe length");
+        CHECK(f[0] == 1 && f[1] == BLEP_STREAM_DATA,
+              "cframe ver+kind");
+        CHECK(f[2] == 0x34 && f[3] == 0x12, "cframe seq LE");
+        CHECK(!memcmp(f + 4, "data", 4), "cframe payload");
+        /* clamp: cap smaller than header+payload truncates payload   */
+        fl = blep_build_cframe(f, BLEP_CDATA_HDR_LEN + 2, 1,
+                               (const uint8_t *)"data", 4);
+        CHECK(fl == BLEP_CDATA_HDR_LEN + 2, "cframe clamps payload");
+    }
+
+    /* block codec (update7 §10.5): raw pack + delta16 round-trip */
+    {
+        uint8_t buf[256];
+        const uint8_t pl[] = {9, 8, 7, 6, 5};
+        size_t n = stc_pack_block(buf, sizeof(buf), STC_RAW,
+                                  pl, sizeof(pl), sizeof(pl));
+        CHECK(n == STC_BLOCK_HDR_LEN + 5, "block length");
+        CHECK(buf[0] == STC_RAW && buf[1] == STC_WIRE_VER,
+              "block codec+ver");
+        uint32_t raw_len = buf[4] | (buf[5] << 8) |
+                           ((uint32_t)buf[6] << 16) |
+                           ((uint32_t)buf[7] << 24);
+        uint32_t enc_len = buf[8] | (buf[9] << 8) |
+                           ((uint32_t)buf[10] << 16) |
+                           ((uint32_t)buf[11] << 24);
+        CHECK(raw_len == 5 && enc_len == 5, "block lens");
+        CHECK(!memcmp(buf + STC_BLOCK_HDR_LEN, pl, 5),
+              "block payload");
+        CHECK(stc_pack_block(buf, STC_BLOCK_HDR_LEN + 2, STC_RAW,
+                             pl, sizeof(pl), sizeof(pl)) == 0,
+              "block cap enforced");
+
+        /* delta16: samples {1,5,3,2} -> deltas {1,4,-2,-1}           */
+        const uint8_t in[8] = {1,0, 5,0, 3,0, 2,0};
+        uint8_t d[8], back[8];
+        const uint8_t want[8] = {1,0, 4,0, 0xFE,0xFF, 0xFF,0xFF};
+        stc_delta16(in, d, sizeof(in));
+        CHECK(!memcmp(d, want, 8), "delta16 transform");
+        stc_inv_delta16(d, back, sizeof(in));
+        CHECK(!memcmp(back, in, 8), "delta16 inverse");
+        /* odd length: trailing byte passes through                   */
+        const uint8_t in2[5] = {7,0, 2,0, 0xAB};
+        stc_delta16(in2, d, 5);
+        stc_inv_delta16(d, back, 5);
+        CHECK(!memcmp(back, in2, 5), "delta16 odd-tail round-trip");
+
+        /* raw-mode feed/flush (host build has no deflate)            */
+        const uint8_t body[100] = {0};
+        stc_test_emit_len = 0;
+        CHECK(stc_begin() == 0, "stc begin");
+        CHECK(stc_feed(body, sizeof(body), stc_test_emit, NULL),
+              "feed ok");
+        CHECK(stc_flush(stc_test_emit, NULL), "flush ok");
+        CHECK(stc_test_emit_len ==
+              STC_BLOCK_HDR_LEN + sizeof(body),
+              "wire bytes = hdr + payload");
+        stc_end();
     }
 }
 

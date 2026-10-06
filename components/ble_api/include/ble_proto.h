@@ -31,6 +31,7 @@ typedef enum {
     BLEP_TIME_REPLY     = 7,
     BLEP_TIME_COMMIT    = 8,
     BLEP_EVIDENCE_BYTES = 9,
+    BLEP_STREAM_DATA    = 10,   /* compact data frame (update7 §10.1) */
 } blep_kind_t;
 
 #define BLEP_FLAG_START 0x0001
@@ -82,6 +83,19 @@ uint16_t blep_build_frame(uint8_t *out, uint16_t mtu_payload,
                           const uint8_t *payload, uint16_t plen,
                           bool first, bool last);
 
+/* Compact stream-data frame (update7 §10.1): 4-byte header
+ *   ver:u8 | kind:u8 | seq:u16 | payload[N]
+ * replaces the 16-byte blep_hdr_t on the Data characteristic for bulk
+ * stream bytes. seq counts frames mod 65536; the receiver derives byte
+ * offsets from in-order delivery, so there is no per-frame offset and
+ * no request_id — streams are exclusive on the link and bounded by the
+ * rid-keyed STREAM_BEGIN/STREAM_END JSON indications.               */
+#define BLEP_CDATA_HDR_LEN 4
+
+uint16_t blep_build_cframe(uint8_t *out, uint16_t out_cap,
+                           uint16_t seq,
+                           const uint8_t *payload, uint16_t plen);
+
 /* ---- op names (spec §10.2) ---- */
 #define OP_GET_STATUS        "GET_STATUS"
 #define OP_GET_CATALOG_STATUS "GET_CATALOG_STATUS"
@@ -89,6 +103,8 @@ uint16_t blep_build_frame(uint8_t *out, uint16_t mtu_payload,
 #define OP_LIST_DAY          "LIST_DAY"
 #define OP_LIST_DIRECTORY    "LIST_DIRECTORY"
 #define OP_GET_FILE          "GET_FILE"
+#define OP_PREPARE_DAYS      "PREPARE_DAYS"
+#define OP_STREAM_TEST       "STREAM_TEST"
 #define OP_GET_DRIFT         "GET_DRIFT"
 #define OP_GET_EVIDENCE      "GET_EVIDENCE"
 

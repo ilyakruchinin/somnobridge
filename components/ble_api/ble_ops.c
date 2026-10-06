@@ -8,6 +8,7 @@
 
 #include "ble_proto.h"
 #include "ble_svc.h"
+#include "stream_codec.h"
 #include "catalog.h"
 #include "drift.h"
 #include "ezshare.h"
@@ -28,6 +29,17 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+/* bounded copy that always NUL-terminates; GCC 14 promotes the
+ * truncating forms (strncpy cap-1 / snprintf %s) to errors            */
+static void copy_bounded(char *dst, size_t cap, const char *src)
+{
+    const char *e = memchr(src, 0, cap - 1);
+    size_t n = e ? (size_t)(e - src) : cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+
 /* ---------------- state ---------------- */
 
 static blep_reasm_t s_reasm;
@@ -43,15 +55,20 @@ static struct {
     uint64_t    src_size;      /* pre-listing tuple (listed token)   */
     uint8_t     src_unit_shift;/* ceil-unit of the listing display   */
     int64_t     src_clen;      /* exact Content-Length seen (-1 TBD) */
-    uint64_t    sent;          /* body bytes notified               */
-    uint64_t    acked;         /* contiguous ACK offset             */
-    uint32_t    window;        /* remaining credit                  */
+    uint64_t    sent;          /* wire bytes notified               */
+    uint64_t    raw_bytes;     /* pre-codec bytes fed               */
+    uint64_t    limit;         /* right-edge credit: contig+window  */
     uint32_t    stall_ms;      /* diag: ms spent waiting for credit */
     uint32_t    retry_ms;      /* diag: ms spent in send retries    */
     char        src_stamp[EZS_STAMP_MAX];
     bool        has_src_stamp;
     char        day[CAT_DAY_STR];
     bool        is_evidence;   /* evidence stream: no card checks    */
+    bool        is_test;       /* STREAM_TEST: synthetic, no card    */
+    bool        v2;            /* peer opted into compact+codec wire */
+    uint64_t    test_bytes;    /* STREAM_TEST: synthetic bytes left  */
+    bool        test_rand;     /* pattern: PRNG vs slow EDF ramp     */
+    uint32_t    test_idx;      /* ramp pattern position              */
     uint32_t    ev_gaps;       /* journal gaps observed while replay */
     uint8_t    *hdr_cap;       /* EDF prefix capture (diagnostic)    */
     size_t      hdr_got;
@@ -59,6 +76,26 @@ static struct {
 } s_stream;
 
 static TaskHandle_t s_ble_task;
+
+/* Wire bytes accumulate into s_pend until a full notification is
+ * ready — the receiver never sees a short frame in the middle of a
+ * chunk, and every notify carries the full payload budget.          */
+static uint8_t  s_pend[260];
+static size_t   s_pend_len;
+static uint16_t s_seq;             /* compact frame counter          */
+
+/* post-download verification rescan: the JOB_DAY completion callback
+ * flips this — no fixed settle delay (update7 §10.3)               */
+static volatile bool s_scan_done;
+
+static void scan_done_cb(const sched_result_t *r, void *ctx)
+{
+    (void)r; (void)ctx;
+    s_scan_done = true;
+    if (s_ble_task) {
+        xTaskNotifyGive(s_ble_task);
+    }
+}
 
 /* ---------------- JSON helpers ---------------- */
 
@@ -455,6 +492,74 @@ static void op_list_dir(uint32_t rid, cJSON *args)
     free(buf);
 }
 
+/* ---------------- PREPARE_DAYS (update7 §10.2) ----------------
+ * Batch pre-refresh: the client lists the DATALOG days it is about to
+ * pull; any day whose resident listing is stale gets a required rescan
+ * queued immediately, so the per-file GET_FILE no longer hits the
+ * ~90 s freshness guard (~12 s STALE retry per day boundary). The op
+ * answers synchronously — refresh completion is observed via LIST_DAY
+ * or simply by retrying GET_FILE after eta_ms.                    */
+
+static void op_prepare_days(uint32_t rid, cJSON *args)
+{
+    cJSON *days = args ? cJSON_GetObjectItem(args, "days") : NULL;
+    if (!cJSON_IsArray(days)) {
+        send_error(rid, OP_PREPARE_DAYS, EC_BAD_REQUEST);
+        return;
+    }
+    char *inner = malloc(2048);
+    if (!inner) {
+        send_error(rid, OP_PREPARE_DAYS, EC_RESOURCE_LIMIT);
+        return;
+    }
+    size_t o = (size_t)snprintf(inner, 2048, "{\"days\":[");
+    bool queued = false;
+    int cnt = 0;
+    char seen[16][CAT_DAY_STR];
+    cJSON *d;
+    cJSON_ArrayForEach(d, days) {
+        if (!cJSON_IsString(d) || !d->valuestring ||
+            strlen(d->valuestring) != 8 || cnt >= 16) {
+            continue;
+        }
+        const char *day = d->valuestring;
+        bool dup = false;
+        for (int i = 0; i < cnt; i++) {
+            if (!strcmp(seen[i], day)) { dup = true; break; }
+        }
+        if (dup) {
+            continue;
+        }
+        strncpy(seen[cnt], day, CAT_DAY_STR - 1);
+        cnt++;
+        int64_t last = cat_day_last_scan(day);
+        bool fresh = last &&
+            (esp_timer_get_time() - last) <= 90LL * 1000 * 1000;
+        if (!fresh) {
+            sched_job_t j = { .kind = JOB_DAY, .prio = 1,
+                              .deadline_us = esp_timer_get_time() +
+                                            20LL * 1000 * 1000,
+                              .required = true };
+            strncpy(j.dir, day, CAT_DAY_STR);
+            j.dir[CAT_DAY_STR - 1] = '\0';
+            sched_submit(&j);
+            queued = true;
+        }
+        o += (size_t)snprintf(inner + o, 2048 - o,
+                              "{\"day\":\"%s\",\"status\":\"%s\"},",
+                              day, fresh ? "fresh" : "queued");
+    }
+    if (o && inner[o - 1] == ',') {
+        o--;
+    }
+    snprintf(inner + o, 2048 - o,
+             "],\"eta_ms\":%d,\"transfer_allowed\":%s}",
+             queued ? 12000 : 0,
+             therapy_status()->transfer_allowed ? "true" : "false");
+    send_ok(rid, OP_PREPARE_DAYS, inner);
+    free(inner);
+}
+
 /* ---------------- GET_FILE streaming ---------------- */
 
 static bool stream_sink(const uint8_t *d, size_t n, void *ctx);
@@ -528,10 +633,10 @@ static void op_get_file(uint32_t rid, cJSON *args)
                 s_stream.src_size = ents[i].size;
                 s_stream.src_unit_shift = ents[i].size_unit_shift;
                 s_stream.has_src_stamp = ents[i].has_timestamp;
-                strncpy(s_stream.src_stamp, ents[i].timestamp_raw,
-                        sizeof(s_stream.src_stamp)-1);
-                strncpy(s_stream.dl_name, ents[i].dl_name,
-                        sizeof(s_stream.dl_name)-1);
+                copy_bounded(s_stream.src_stamp, sizeof(s_stream.src_stamp),
+                     ents[i].timestamp_raw);
+                copy_bounded(s_stream.dl_name, sizeof(s_stream.dl_name),
+                             ents[i].dl_name);
                 break;
             }
         }
@@ -552,10 +657,10 @@ static void op_get_file(uint32_t rid, cJSON *args)
         s_stream.src_size = ft.size;
         s_stream.src_unit_shift = ft.size_unit_shift;
         s_stream.has_src_stamp = ft.has_timestamp;
-        strncpy(s_stream.src_stamp, ft.timestamp_raw,
-                sizeof(s_stream.src_stamp)-1);
-        strncpy(s_stream.dl_name, ft.dl_name,
-                sizeof(s_stream.dl_name)-1);
+        copy_bounded(s_stream.src_stamp, sizeof(s_stream.src_stamp),
+                     ft.timestamp_raw);
+        copy_bounded(s_stream.dl_name, sizeof(s_stream.dl_name),
+                     ft.dl_name);
     }
     s_stream.dl_name[sizeof(s_stream.dl_name) - 1] = '\0';
     if (ev && cJSON_IsString(ev)) {
@@ -587,23 +692,32 @@ static void op_get_file(uint32_t rid, cJSON *args)
                                             : nv->valuestring);
     snprintf(begin + bo, 640 - bo,
         "\",\"listed_size\":\"%llu\",\"size_unit_shift\":%u,"
+        "\"wire\":%d,"
         "\"source_before\":{\"size\":\"%llu\",\"ts\":%s%s%s}}",
         (unsigned long long)s_stream.src_size,
         (unsigned)s_stream.src_unit_shift,
+        s_stream.v2 ? 2 : 1,
         (unsigned long long)s_stream.src_size,
         s_stream.has_src_stamp ? "\"" : "",
         s_stream.has_src_stamp ? s_stream.src_stamp : "null",
         s_stream.has_src_stamp ? "\"" : "");
     s_stream.active = true;
     s_stream.request_id = rid;
-    s_stream.sent = s_stream.acked = 0;
-    s_stream.window = 0;
+    s_stream.sent = s_stream.raw_bytes = 0;
+    s_stream.limit = 0;
     s_stream.stall_ms = s_stream.retry_ms = 0;
+    s_pend_len = 0;
+    s_seq = 0;
     s_stream.is_evidence = false;
+    s_stream.is_test = false;
+    s_stream.test_bytes = 0;
+    /* wire v2 (compact frames + block codec) only when the requester
+     * opts in — an unmodified v1 client keeps the legacy stream     */
+    s_stream.v2 = cJSON_IsTrue(cJSON_GetObjectItem(args, "v2"));
     s_stream.src_clen = -1;
-    strncpy(s_stream.canon_dir, canon, sizeof(s_stream.canon_dir)-1);
-    strncpy(s_stream.name, nv->valuestring, sizeof(s_stream.name)-1);
-    strncpy(s_stream.day, day, CAT_DAY_STR-1);
+    copy_bounded(s_stream.canon_dir, sizeof(s_stream.canon_dir), canon);
+    copy_bounded(s_stream.name, sizeof(s_stream.name), nv->valuestring);
+    copy_bounded(s_stream.day, sizeof(s_stream.day), day);
     /* opportunistic EDF prefix capture: the first ≤16 KiB of a DATALOG
      * .edf body feeds the header diagnostic — zero extra card reads  */
     s_stream.hdr_cap = NULL;
@@ -619,8 +733,10 @@ static void op_get_file(uint32_t rid, cJSON *args)
     xTaskNotifyGive(s_ble_task);
 }
 
-/* sink: sends FILE_BYTES frames honoring credit window */
-/* A single auth check can flap false on a transient store/conn lookup
+/* sink: raw bytes -> block codec -> compact frames honoring the
+ * receiver's right-edge credit (update7 §10.3/§10.5).
+ *
+ * A single auth check can flap false on a transient store/conn lookup
  * hiccup; only abandon the stream after the link has been unauthorized
  * (or the stream torn down) for ~500 ms continuously. */
 static bool stream_gate_broken(int *miss_ms)
@@ -637,6 +753,125 @@ static bool stream_gate_broken(int *miss_ms)
     return *miss_ms >= 500;
 }
 
+/* ---- compact-frame packing ------------------------------------ */
+
+/* payload bytes per compact data frame */
+static uint16_t wire_room(void)
+{
+    uint16_t mtu = ble_svc_att_mtu();
+    return mtu > 3 + BLEP_CDATA_HDR_LEN
+           ? (uint16_t)(mtu - 3 - BLEP_CDATA_HDR_LEN) : 0;
+}
+
+/* shared pacing for one on-air frame: wait for right-edge credit,
+ * then retry through transient mbuf-pool drains. `charge` is the
+ * number of stream bytes the frame carries (the receiver's window is
+ * denominated in stream bytes, not ATT bytes).                      */
+static bool wire_tx(const uint8_t *frame, uint16_t flen, size_t charge)
+{
+    int miss_ms = 0;
+    /* right-edge credit: send only while sent+charge <= limit        */
+    while (s_stream.sent + charge > s_stream.limit) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+        s_stream.stall_ms += 2;
+        if (stream_gate_broken(&miss_ms)) {
+            ESP_LOGW("ble", "wire: credit wait aborted, sent=%llu",
+                     (unsigned long long)s_stream.sent);
+            return false;
+        }
+    }
+    /* ble_svc_send_bytes fails transiently when the NimBLE mbuf pool
+     * drains (mbufs free each connection event). Pace with a short
+     * yield — a fixed sleep longer than an interval would skip event
+     * slots. A sustained outage (>2 s) or lost authorization aborts. */
+    int64_t giveup = esp_timer_get_time() + 2LL * 1000 * 1000;
+    while (!ble_svc_send_bytes(frame, flen)) {
+        if (stream_gate_broken(&miss_ms) ||
+            esp_timer_get_time() > giveup) {
+            ESP_LOGW("ble", "wire: send failed, sent=%llu",
+                     (unsigned long long)s_stream.sent);
+            return false;
+        }
+        int64_t w0 = esp_timer_get_time();
+        vTaskDelay(pdMS_TO_TICKS(1));
+        s_stream.retry_ms +=
+            (uint32_t)((esp_timer_get_time() - w0) / 1000);
+    }
+    s_stream.sent += charge;
+    return true;
+}
+
+static bool wire_send_frame(const uint8_t *pl, size_t plen)
+{
+    uint8_t frame[BLEP_CDATA_HDR_LEN + 260];
+    uint16_t fl = blep_build_cframe(frame, sizeof(frame),
+                                    s_seq++, pl, (uint16_t)plen);
+    return wire_tx(frame, fl, plen);
+}
+
+/* legacy §10.1 wire: 16-byte FILE_BYTES frames, offset = stream
+ * position, START/END flags on the chunk boundaries — what an
+ * unmodified v1 receiver parses. Used when the requester did not
+ * advertise wire v2.                                               */
+static bool legacy_emit(const uint8_t *d, size_t n)
+{
+    uint16_t mtu = ble_svc_att_mtu();
+    uint16_t budget = mtu > 3 ? (uint16_t)(mtu - 3) : 0;
+    uint16_t room = budget > sizeof(blep_hdr_t)
+                      ? (uint16_t)(budget - sizeof(blep_hdr_t)) : 0;
+    if (!room) {
+        return false;
+    }
+    size_t off = 0;
+    uint8_t frame[16 + 260];
+    while (off < n) {
+        size_t take = n - off;
+        if (take > room) take = room;
+        bool last = off + take >= n;
+        uint16_t fl = blep_build_frame(
+            frame, budget, BLEP_FILE_BYTES, s_stream.request_id,
+            s_stream.sent, d + off, (uint16_t)take,
+            s_stream.sent == 0, last);
+        if (!wire_tx(frame, fl, take)) {
+            return false;
+        }
+        off += take;
+    }
+    return true;
+}
+
+static bool wire_emit(const uint8_t *d, size_t n, void *ctx)
+{
+    (void)ctx;
+    uint16_t room = wire_room();
+    if (!room) {
+        return false;
+    }
+    while (n) {
+        size_t take = n < room - s_pend_len ? n : room - s_pend_len;
+        memcpy(s_pend + s_pend_len, d, take);
+        s_pend_len += take;
+        d += take; n -= take;
+        if (s_pend_len == room) {
+            if (!wire_send_frame(s_pend, room)) {
+                return false;
+            }
+            s_pend_len = 0;
+        }
+    }
+    return true;
+}
+
+static bool wire_flush(void)
+{
+    bool ok = true;
+    if (s_pend_len) {
+        ok = wire_send_frame(s_pend, s_pend_len);
+        s_pend_len = 0;
+    }
+    return ok;
+}
+
 static bool stream_sink(const uint8_t *d, size_t n, void *ctx)
 {
     /* capture the EDF prefix while it streams past (≤16 KiB, U2 —
@@ -647,72 +882,15 @@ static bool stream_sink(const uint8_t *d, size_t n, void *ctx)
         memcpy(s_stream.hdr_cap + s_stream.hdr_got, d, take);
         s_stream.hdr_got += take;
     }
-    size_t off = 0;
-    int miss_ms = 0;
-    while (off < n) {
-        while (s_stream.window == 0) {
-            /* wait for credit — sustained abort/link-loss breaks it   */
-            vTaskDelay(pdMS_TO_TICKS(5));
-            s_stream.stall_ms += 5;
-            if (stream_gate_broken(&miss_ms)) {
-                ESP_LOGW("ble", "stream_sink: gate lost, sent=%llu",
-                         (unsigned long long)s_stream.sent);
-                return false;
-            }
-        }
-        size_t take = n - off;
-        /* budget = whole ATT payload (header + payload); the chunk
-         * must not exceed the builder's room, or the frame silently
-         * carries fewer bytes than s_stream.sent advances by.       */
-        uint16_t mtu = ble_svc_att_mtu();
-        uint16_t budget = mtu > 3 ? (uint16_t)(mtu - 3) : 0;
-        uint16_t room = budget > sizeof(blep_hdr_t)
-                          ? (uint16_t)(budget - sizeof(blep_hdr_t)) : 0;
-        if (!room) {
-            return false;
-        }
-        if (take > room) take = room;
-        if (take > s_stream.window) take = s_stream.window;
-
-        uint8_t frame[260];
-        bool last = (off + take >= n);
-        uint16_t fl = blep_build_frame(
-            frame, budget, BLEP_FILE_BYTES, s_stream.request_id,
-            s_stream.sent, d + off, take,
-            s_stream.sent == 0, last);
-        /* ble_svc_send_bytes fails transiently when the NimBLE mbuf
-         * pool drains (mbufs free each connection interval). Pace and
-         * retry briefly instead of killing the stream — a sustained
-         * outage (>~2 s) or lost authorization still aborts.        */
-        bool sent = false;
-        for (int tries = 0; tries < 200; tries++) {
-            if (ble_svc_send_bytes(frame, fl)) {
-                sent = true;
-                break;
-            }
-            if (stream_gate_broken(&miss_ms)) {
-                ESP_LOGW("ble", "stream_sink: gate lost mid-send, "
-                         "sent=%llu", (unsigned long long)s_stream.sent);
-                break;
-            }
-            /* wakes on NOTIFY_TX (mbuf freed); 15 ms timeout bounds
-             * the sleep if a TX-complete event is missed           */
-            int64_t w0 = esp_timer_get_time();
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(15));
-            s_stream.retry_ms +=
-                (uint32_t)((esp_timer_get_time() - w0) / 1000);
-        }
-        if (!sent) {
-            ESP_LOGW("ble", "stream_sink: send retries exhausted, "
-                     "sent=%llu", (unsigned long long)s_stream.sent);
-            return false;
-        }
-        mbedtls_sha256_update(&s_stream.sha, d + off, take);
-        s_stream.sent += take;
-        s_stream.window -= take;
-        off += take;
+    /* SHA-256 stays over the raw file bytes (§10.2 verdict)          */
+    mbedtls_sha256_update(&s_stream.sha, d, n);
+    s_stream.raw_bytes += n;
+    /* v2 peers get the block codec over compact frames; v1 peers get
+     * the classic 16-byte FILE_BYTES stream unchanged                */
+    if (s_stream.v2) {
+        return stc_feed(d, n, wire_emit, NULL);
     }
-    return true;
+    return legacy_emit(d, n);
 }
 
 /* ---------------- GET_EVIDENCE ----------------
@@ -726,7 +904,7 @@ static bool ev_cb(const char *p, uint16_t len, uint32_t seq, void *ctx)
     return stream_sink((const uint8_t *)p, len, NULL);
 }
 
-static void op_get_evidence(uint32_t rid)
+static void op_get_evidence(uint32_t rid, cJSON *args)
 {
     if (s_stream.active) {
         send_error(rid, OP_GET_EVIDENCE, EC_BUSY);
@@ -737,18 +915,84 @@ static void op_get_evidence(uint32_t rid)
         return;
     }
     char begin[192];
+    bool v2 = args &&
+              cJSON_IsTrue(cJSON_GetObjectItem(args, "v2"));
     snprintf(begin, sizeof(begin),
         "{\"stream_type\":\"evidence\",\"journal_seq\":\"%lu\","
-        "\"oldest_seq\":\"%lu\",\"truncated\":%s}",
+        "\"oldest_seq\":\"%lu\",\"truncated\":%s,\"wire\":%d}",
         (unsigned long)jrn_seq(), (unsigned long)jrn_oldest_seq(),
-        jrn_truncated() ? "true" : "false");
+        jrn_truncated() ? "true" : "false", v2 ? 2 : 1);
     s_stream.active = true;
     s_stream.request_id = rid;
-    s_stream.sent = s_stream.acked = 0;
-    s_stream.window = 0;
+    s_stream.sent = s_stream.raw_bytes = 0;
+    s_stream.limit = 0;
     s_stream.stall_ms = s_stream.retry_ms = 0;
+    s_pend_len = 0;
+    s_seq = 0;
     s_stream.is_evidence = true;
+    s_stream.is_test = false;
+    s_stream.test_bytes = 0;
+    s_stream.v2 = v2;
     s_stream.ev_gaps = 0;
+    s_stream.day[0] = '\0';
+    send_ok(rid, "STREAM_BEGIN", begin);
+    xTaskNotifyGive(s_ble_task);
+}
+
+/* ---------------- STREAM_TEST (update7 §10.7) ----------------
+ * Synthetic bulk source: generates `bytes` patterned data through the
+ * same sink/codec/credit path as GET_FILE but touches no card and no
+ * NVS — usable while therapy is active because nothing contends with
+ * the EZShare poll. Measures the pure BLE wire path.
+ *   args: {"bytes": <n up to 32 MiB>, "pattern": "ramp"|"rand",
+ *          "v2": true}                                              */
+static void op_stream_test(uint32_t rid, cJSON *args)
+{
+    if (s_stream.active) {
+        send_error(rid, OP_STREAM_TEST, EC_BUSY);
+        return;
+    }
+    uint64_t want = 0;
+    const char *pat = "ramp";
+    if (args) {
+        cJSON *b = cJSON_GetObjectItem(args, "bytes");
+        if (cJSON_IsNumber(b)) {
+            want = (uint64_t)b->valuedouble;
+        } else if (cJSON_IsString(b) && b->valuestring) {
+            want = strtoull(b->valuestring, NULL, 10);
+        }
+        cJSON *p = cJSON_GetObjectItem(args, "pattern");
+        if (cJSON_IsString(p) && p->valuestring) {
+            pat = p->valuestring;
+        }
+    }
+    if (!want || want > 32ULL * 1024 * 1024) {
+        send_error(rid, OP_STREAM_TEST, EC_BAD_REQUEST);
+        return;
+    }
+    char begin[128];
+    bool v2 = args && cJSON_IsTrue(cJSON_GetObjectItem(args, "v2"));
+    snprintf(begin, sizeof(begin),
+             "{\"stream_type\":\"test\",\"bytes\":\"%llu\",\"wire\":%d}",
+             (unsigned long long)want, v2 ? 2 : 1);
+    s_stream.active = true;
+    s_stream.request_id = rid;
+    s_stream.sent = s_stream.raw_bytes = 0;
+    s_stream.limit = 0;
+    s_stream.stall_ms = s_stream.retry_ms = 0;
+    s_pend_len = 0;
+    s_seq = 0;
+    s_stream.is_evidence = false;
+    s_stream.is_test = true;
+    s_stream.v2 = v2;
+    s_stream.test_bytes = want;
+    s_stream.test_rand = !strcmp(pat, "rand");
+    s_stream.test_idx = 0;
+    s_stream.ev_gaps = 0;
+    s_stream.src_size = want;
+    s_stream.src_clen = -1;
+    s_stream.hdr_cap = NULL;
+    s_stream.hdr_got = 0;
     s_stream.day[0] = '\0';
     send_ok(rid, "STREAM_BEGIN", begin);
     xTaskNotifyGive(s_ble_task);
@@ -765,21 +1009,61 @@ static void ble_stream_task(void *arg)
 
         /* wait for initial credit (ACK with window>0) */
         int64_t deadline = esp_timer_get_time() + 10LL * 1000 * 1000;
-        while (s_stream.window == 0 &&
+        while (s_stream.limit == 0 &&
                esp_timer_get_time() < deadline) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-        if (s_stream.window == 0) {
+        if (s_stream.limit == 0) {
             goto finish_fail;
         }
 
         mbedtls_sha256_init(&s_stream.sha);
         mbedtls_sha256_starts(&s_stream.sha, 0);
+        if (s_stream.v2) {
+            stc_begin();             /* codec staging (PSRAM); raw
+                                        passthrough if unavailable    */
+        }
         bool transport_ok;
         if (s_stream.is_evidence) {
             /* journal replay — no card I/O, no post-checks (§10.2)   */
             transport_ok =
                 jrn_walk(ev_cb, NULL, &s_stream.ev_gaps) == ESP_OK;
+        } else if (s_stream.is_test) {
+            /* synthetic bulk source: patterned data through the same
+             * sink/codec/credit path; no card, no NVS (§10.7)       */
+            static uint8_t tbuf[4096];
+            uint32_t seed = 0x243F6A88u;
+            transport_ok = true;
+            while (s_stream.test_bytes && transport_ok) {
+                size_t n = s_stream.test_bytes < sizeof(tbuf)
+                           ? (size_t)s_stream.test_bytes : sizeof(tbuf);
+                if (s_stream.test_rand) {
+                    for (size_t i = 0; i + 4 <= n; i += 4) {
+                        seed ^= seed << 13; seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        memcpy(tbuf + i, &seed, 4);
+                    }
+                    for (size_t i = n & ~(size_t)3; i < n; i++) {
+                        tbuf[i] = (uint8_t)(seed >> (i & 3) * 8);
+                    }
+                } else {
+                    /* EDF-like: 16-bit samples, slow ramp + 2 noise
+                     * bits — compresses ~2-3x like BRP waveforms     */
+                    uint16_t *w = (uint16_t *)tbuf;
+                    for (size_t i = 0; i + 2 <= n; i += 2) {
+                        seed ^= seed << 13; seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        w[i / 2] = (uint16_t)((s_stream.test_idx >> 4) +
+                                              (seed & 3));
+                        s_stream.test_idx++;
+                    }
+                    if (n & 1) {
+                        tbuf[n - 1] = (uint8_t)seed;
+                    }
+                }
+                transport_ok = stream_sink(tbuf, n, NULL);
+                s_stream.test_bytes -= n;
+            }
         } else {
             ezw_obs_t obs;
             esp_err_t err =
@@ -790,6 +1074,15 @@ static void ble_stream_task(void *arg)
             s_stream.src_clen = obs.content_length;
             transport_ok = err == ESP_OK;
         }
+        /* flush the codec's trailing partial block and the residue
+         * frame so the wire carries every byte the sink accepted     */
+        if (s_stream.v2 && transport_ok &&
+            (!stc_flush(wire_emit, NULL) || !wire_flush())) {
+            transport_ok = false;
+        }
+        if (s_stream.v2) {
+            stc_end();
+        }
         uint8_t hash[32] = {0};
         char hex[65];
         if (transport_ok) {
@@ -799,37 +1092,59 @@ static void ble_stream_task(void *arg)
         for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", hash[i]);
         hex[64] = '\0';
 
-        if (s_stream.is_evidence) {
-            char end[384];
+        if (s_stream.is_test || s_stream.is_evidence) {
+            char end[512];
             snprintf(end, sizeof(end),
                 "{\"ok\":%s,\"actual_bytes\":\"%llu\","
-                "\"sha256\":\"%s\",\"gaps\":%lu,\"truncated\":%s,"
+                "\"encoded_bytes\":\"%llu\",\"sha256\":\"%s\","
+                "\"gaps\":%lu,\"truncated\":%s,"
+                "\"stall_ms\":%lu,\"retry_ms\":%lu,\"encode_ms\":%lu,"
+                "\"blocks\":{\"raw\":%lu,\"def\":%lu,\"d16\":%lu},"
                 "\"completion_allowed\":%s,\"error\":\"%s\"}",
                 transport_ok ? "true" : "false",
+                (unsigned long long)s_stream.raw_bytes,
                 (unsigned long long)s_stream.sent, hex,
                 (unsigned long)s_stream.ev_gaps,
                 jrn_truncated() ? "true" : "false",
+                (unsigned long)s_stream.stall_ms,
+                (unsigned long)s_stream.retry_ms,
+                (unsigned long)(s_stream.v2 ? stc_encode_ms() : 0),
+                (unsigned long)(s_stream.v2 ? stc_raw_blocks() : 0),
+                (unsigned long)(s_stream.v2 ? stc_def_blocks() : 0),
+                (unsigned long)(s_stream.v2 ? stc_d16_blocks() : 0),
                 transport_ok ? "true" : "false",
                 transport_ok ? "ok" : "journal_error");
             send_stream_end(s_stream.request_id, "STREAM_END", end);
             s_stream.active = false;
             s_stream.is_evidence = false;
+            s_stream.is_test = false;
             continue;
         }
 
         /* post-check: therapy + source tuple refresh (§12.1 step 6-7) */
         bool completion = false;
         char reason[40] = "ok";
-        if (transport_ok) {
-            /* give the scheduler a beat, then refresh */
+        if (transport_ok && s_stream.day[0]) {
+            /* refresh the source folder, woken by its completion
+             * callback — the old fixed 2.5 s settle added ~4 min to a
+             * month-scale batch                                       */
+            s_scan_done = false;
             sched_job_t j = { .kind = JOB_DAY, .prio = 0,
                               .deadline_us = esp_timer_get_time() +
                                             5LL * 1000 * 1000,
-                              .required = true };
+                              .required = true,
+                              .done = scan_done_cb };
             strncpy(j.dir, s_stream.day, CAT_DAY_STR);
             sched_submit(&j);
-            /* wait a fixed settle window; the refresh lands in catalog */
-            vTaskDelay(pdMS_TO_TICKS(2500));
+            /* bounded wait: proceed on timeout and let the tuple
+             * check judge whatever the catalog holds                */
+            int64_t dl = esp_timer_get_time() + 10LL * 1000 * 1000;
+            while (!s_scan_done &&
+                   esp_timer_get_time() < dl) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+        }
+        if (transport_ok) {
             const therapy_status_t *t = therapy_status();
             if (t->state == THERAPY_IN) {
                 strncpy(reason, "therapy_active", sizeof(reason));
@@ -901,26 +1216,42 @@ static void ble_stream_task(void *arg)
             char end[640];
             snprintf(end, sizeof(end),
                 "{\"ok\":%s,\"actual_bytes\":\"%llu\","
-                "\"listed_size\":\"%llu\",\"content_length\":\"%lld\","
+                "\"encoded_bytes\":\"%llu\",\"listed_size\":\"%llu\","
+                "\"content_length\":\"%lld\","
                 "\"sha256\":\"%s\","
                 "\"source_unchanged\":%s,"
                 "\"therapy_status\":%d,\"monitoring_checked\":true,"
+                "\"stall_ms\":%lu,\"retry_ms\":%lu,\"encode_ms\":%lu,"
+                "\"blocks\":{\"raw\":%lu,\"def\":%lu,\"d16\":%lu},"
                 "\"completion_allowed\":%s,\"error\":\"%s\"}",
                 transport_ok ? "true" : "false",
+                (unsigned long long)s_stream.raw_bytes,
                 (unsigned long long)s_stream.sent,
                 (unsigned long long)s_stream.src_size,
                 (long long)s_stream.src_clen, hex,
                 completion ? "true" : "false",
                 (int)therapy_status()->state,
+                (unsigned long)s_stream.stall_ms,
+                (unsigned long)s_stream.retry_ms,
+                (unsigned long)(s_stream.v2 ? stc_encode_ms() : 0),
+                (unsigned long)(s_stream.v2 ? stc_raw_blocks() : 0),
+                (unsigned long)(s_stream.v2 ? stc_def_blocks() : 0),
+                (unsigned long)(s_stream.v2 ? stc_d16_blocks() : 0),
                 completion ? "true" : "false", reason);
             send_stream_end(s_stream.request_id, "STREAM_END", end);
         }
-        ESP_LOGI("ble", "stream done sent=%llu stack_hwm=%u "
-                 "stall_ms=%lu retry_ms=%lu",
+        ESP_LOGI("ble", "stream done raw=%llu wire=%llu stack_hwm=%u "
+                 "stall_ms=%lu retry_ms=%lu enc_ms=%lu "
+                 "blk r%lu/d%lu/d16%lu",
+                 (unsigned long long)s_stream.raw_bytes,
                  (unsigned long long)s_stream.sent,
                  (unsigned)uxTaskGetStackHighWaterMark(NULL),
                  (unsigned long)s_stream.stall_ms,
-                 (unsigned long)s_stream.retry_ms);
+                 (unsigned long)s_stream.retry_ms,
+                 (unsigned long)(s_stream.v2 ? stc_encode_ms() : 0),
+                 (unsigned long)(s_stream.v2 ? stc_raw_blocks() : 0),
+                 (unsigned long)(s_stream.v2 ? stc_def_blocks() : 0),
+                 (unsigned long)(s_stream.v2 ? stc_d16_blocks() : 0));
         s_stream.active = false;
         continue;
 
@@ -934,7 +1265,7 @@ void ble_svc_stream_abort(uint32_t request_id, const char *why)
 {
     if (s_stream.active) {
         s_stream.active = false;
-        s_stream.window = 0;
+        s_stream.limit = 0;
         send_error(s_stream.request_id, "STREAM_END", EC_LINK_LOST);
     }
 }
@@ -1172,8 +1503,10 @@ int ble_ops_on_write(uint16_t conn, const uint8_t *data, uint16_t len)
         else if (!strcmp(opn, OP_LIST_DAY)) op_list_day(rid, args);
         else if (!strcmp(opn, OP_LIST_DIRECTORY)) op_list_dir(rid, args);
         else if (!strcmp(opn, OP_GET_FILE)) op_get_file(rid, args);
+        else if (!strcmp(opn, OP_PREPARE_DAYS)) op_prepare_days(rid, args);
         else if (!strcmp(opn, OP_GET_DRIFT)) op_get_drift(rid, args);
-        else if (!strcmp(opn, OP_GET_EVIDENCE)) op_get_evidence(rid);
+        else if (!strcmp(opn, OP_GET_EVIDENCE)) op_get_evidence(rid, args);
+        else if (!strcmp(opn, OP_STREAM_TEST)) op_stream_test(rid, args);
         else send_error(rid, opn, EC_UNSUPPORTED_OP);
         cJSON_Delete(j);
         return 0;
@@ -1182,10 +1515,17 @@ int ble_ops_on_write(uint16_t conn, const uint8_t *data, uint16_t len)
         const uint8_t *pl = data + sizeof(h);
         if (len >= sizeof(h) + 4 && s_stream.active &&
             h.request_id == s_stream.request_id) {
+            /* right-edge credit (update7 §10.3): offset = contiguous
+             * wire bytes received, payload = receiver window. The
+             * sender may transmit while sent < offset + window.
+             * Stale/replayed ACKs can only widen the edge, never
+             * shrink it — so a max() update is race-free.            */
             uint32_t w;
             memcpy(&w, pl, 4);
-            s_stream.acked = h.offset;
-            s_stream.window = w;
+            uint64_t edge = h.offset + w;
+            if (edge > s_stream.limit) {
+                s_stream.limit = edge;
+            }
         }
         return 0;
     }
@@ -1219,14 +1559,17 @@ esp_err_t ble_ops_init(void)
     if (!s_txq) {
         return ESP_ERR_NO_MEM;
     }
-    xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 6, &s_tx_task);
+    xTaskCreatePinnedToCore(ble_tx_task, "ble_tx", 4096, NULL, 6,
+                            &s_tx_task, 1);
     /* ble_stream_task runs ezs_download -> esp_http_client (stack-hungry)
      * plus journal NVS reads on the evidence path. 6 KiB overflowed and
      * corrupted the heap (crash in esp_http_client_init's calloc under a
      * second download). Peak observed 8.9 KiB (hwm 7448 on 16 KiB) —
      * 12 KiB keeps margin while sparing contiguous internal RAM that
-     * the nimble_host task and SM pairing crypto must have.           */
-    xTaskCreate(ble_stream_task, "ble_stream", 12288, NULL, 8,
-                &s_ble_task);
+     * the nimble_host task and SM pairing crypto must have.
+     * Core 1: NimBLE host + controller live on core 0; HTTP/compression
+     * work must not compete with them (update7 §3).                  */
+    xTaskCreatePinnedToCore(ble_stream_task, "ble_stream", 12288, NULL, 8,
+                            &s_ble_task, 1);
     return ESP_OK;
 }

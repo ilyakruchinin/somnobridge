@@ -23,6 +23,17 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+/* bounded copy that always NUL-terminates; GCC 14 promotes the
+ * truncating forms (strncpy cap-1 / snprintf %s) to errors            */
+static void copy_bounded(char *dst, size_t cap, const char *src)
+{
+    const char *e = memchr(src, 0, cap - 1);
+    size_t n = e ? (size_t)(e - src) : cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+
 static const char *TAG = "sched";
 
 /* -------- tunables (spec §6, update2 §3/§5) ----------------------- */
@@ -532,7 +543,7 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
         break;
     }
     case JOB_DAY: {
-        strncpy(r->day, j->dir, CAT_DAY_STR - 1);
+        copy_bounded(r->day, CAT_DAY_STR, j->dir);
         char canon[12 + CAT_DAY_STR];   /* "A:\DATALOG\" + day + NUL   */
         memcpy(canon, "A:\\DATALOG\\", 11);
         memcpy(canon + 11, j->dir, CAT_DAY_STR);   /* day is NUL-term */
@@ -775,7 +786,7 @@ static void plan_cover(int64_t now)
         sched_job_t d = { .kind = JOB_DAY, .prio = 3,
                           .deadline_us = now + COVER_PERIOD_US,
                           .required = true };
-        strncpy(d.dir, hot[i], CAT_DAY_STR);
+        copy_bounded(d.dir, CAT_DAY_STR, hot[i]);
         sched_submit(&d);
     }
 }
@@ -877,8 +888,8 @@ esp_err_t sched_submit(const sched_job_t *job)
         .deadline_us = job->deadline_us,
         .required = job->required, .phase_job = job->phase_job,
     };
-    strncpy(q.dir, job->dir, JOB_DIR_MAX - 1);
-    strncpy(q.name, job->name, JOB_NAME_MAX - 1);
+    copy_bounded(q.dir, JOB_DIR_MAX, job->dir);
+    copy_bounded(q.name, JOB_NAME_MAX, job->name);
 
     qjob_t *held = heap_caps_malloc(Q_LEN * sizeof(*held),
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

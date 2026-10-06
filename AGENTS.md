@@ -17,13 +17,13 @@ Maintained/architected by Ilya Kruchinin (@ilyakruchinin).
 ## Build (Docker is the only host dependency)
 
 ```bash
-./scripts/idf.sh build            # idf.py build inside espressif/idf:v5.5.1
+./scripts/idf.sh build            # idf.py build inside espressif/idf:v5.5.5
 ./scripts/idf.sh set-target esp32s3
 ./scripts/idf.sh flash monitor    # IDF_PORT=/dev/ttyUSB0 to override default
 ./scripts/build-dist.sh           # merged image into dist/
 ```
 
-ESP-IDF is pinned to `v5.5.1` (`IDF_TAG=` overrides).
+ESP-IDF is pinned to `v5.5.5` (`IDF_TAG=` overrides).
 
 **GEEK flashing quirk:** the board uses native USB-Serial/JTAG (`/dev/ttyACM0`).
 After `flash`, esptool's RTS reset produces `USB_UART_CHIP_RESET`, which does

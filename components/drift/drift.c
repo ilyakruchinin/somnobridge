@@ -17,6 +17,17 @@
 #include "nvs_flash.h"
 #include "settings.h"
 
+/* bounded copy that always NUL-terminates; GCC 14 promotes the
+ * truncating forms (strncpy cap-1 / snprintf %s) to errors            */
+static void copy_bounded(char *dst, size_t cap, const char *src)
+{
+    const char *e = memchr(src, 0, cap - 1);
+    size_t n = e ? (size_t)(e - src) : cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+
 static const char *TAG = "drift";
 
 static void drift_jrn(const char *kind, const char *fmt, ...)
@@ -1038,8 +1049,8 @@ static void publish(const drift_session_t *s, int64_t now_us)
     r.complete_records  = s->complete_records;
     r.record_bytes      = s->record_bytes;
     r.record_duration_s = s->record_duration_s;
-    strncpy(r.day, s->day, sizeof(r.day) - 1);
-    strncpy(r.beacon, s->beacon, sizeof(r.beacon) - 1);
+    copy_bounded(r.day, sizeof(r.day), s->day);
+    copy_bounded(r.beacon, sizeof(r.beacon), s->beacon);
     if (s->beacon[0]) {
         drift_file_start_iso(s->beacon, r.session_start_as10,
                              sizeof(r.session_start_as10));
@@ -1060,7 +1071,7 @@ static void publish(const drift_session_t *s, int64_t now_us)
     r.jitter_us = p->jitter_us;
     r.dev_rate_ppm = p->dev_rate_ppm;
     r.assumptions = assumption_mask(s, p);
-    strncpy(r.source_reason, s->source_reason, sizeof(r.source_reason) - 1);
+    copy_bounded(r.source_reason, sizeof(r.source_reason), s->source_reason);
     if (s->est_bound_valid) {
         r.has_drift = true;
         r.drift_lo_ms = us_floor_ms(s->off_lo_us);
@@ -1424,9 +1435,8 @@ static void sot_fill(drift_sot_t *r, const drift_session_t *s,
                    ? p->fname_period_lo_us : p->fname_create_lo_us;
     r->fname_hi_us = s->preferred_source == DRIFT_SRC_FNAME_PERIODIC
                    ? p->fname_period_hi_us : p->fname_create_hi_us;
-    strncpy(r->source_reason, s->source_reason,
-            sizeof(r->source_reason) - 1);
-    strncpy(r->card_fw, s_card_fw, sizeof(r->card_fw) - 1);
+    copy_bounded(r->source_reason, sizeof(r->source_reason), s->source_reason);
+    copy_bounded(r->card_fw, sizeof(r->card_fw), s_card_fw);
     drift_sot_slot_t slot = quality == DRIFT_Q_QUALIFIED
                           ? DRIFT_SOT_QUALIFIED : DRIFT_SOT_PROVISIONAL;
     r->persisted_seq = s_sot_persist_seq[slot];
@@ -2484,8 +2494,8 @@ static esp_err_t fb_commit(nvs_handle_t h, bool force, int64_t now_us)
     b.fname_lo_us = r->fname_lo_us;
     b.fname_hi_us = r->fname_hi_us;
     b.period_us = r->filename_period_us;
-    strncpy(b.reason, r->source_reason, sizeof(b.reason) - 1);
-    strncpy(b.fw, s_card_fw, sizeof(b.fw) - 1);
+    copy_bounded(b.reason, sizeof(b.reason), r->source_reason);
+    copy_bounded(b.fw, sizeof(b.fw), s_card_fw);
     b.crc32 = esp_crc32_le(0, (const uint8_t *)&b,
                            offsetof(fb_blob_t, crc32));
     esp_err_t err = nvs_set_blob(h, FB_KEY, &b, sizeof(b));
@@ -2551,8 +2561,8 @@ static esp_err_t sot_commit_slot(nvs_handle_t h, drift_sot_slot_t slot,
     b.fname_lo_us = r->fname_lo_us;
     b.fname_hi_us = r->fname_hi_us;
     b.period_us = r->filename_period_us;
-    strncpy(b.reason, r->source_reason, sizeof(b.reason) - 1);
-    strncpy(b.fw, s_card_fw, sizeof(b.fw) - 1);
+    copy_bounded(b.reason, sizeof(b.reason), r->source_reason);
+    copy_bounded(b.fw, sizeof(b.fw), s_card_fw);
     b.crc32 = esp_crc32_le(0, (const uint8_t *)&b,
                            offsetof(sot_v2_blob_t, crc32));
     esp_err_t err = nvs_set_blob(h, sot_key(slot), &b, sizeof(b));

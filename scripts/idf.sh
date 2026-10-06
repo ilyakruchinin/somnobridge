@@ -8,7 +8,7 @@
 #   ./scripts/idf.sh                  # interactive shell
 set -euo pipefail
 
-IMAGE="espressif/idf:${IDF_TAG:-v5.5.1}"
+IMAGE="espressif/idf:${IDF_TAG:-v5.5.5}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 args=()

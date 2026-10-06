@@ -18,11 +18,12 @@ SRCS="$SRCS components/catalog/catalog.c"
 SRCS="$SRCS components/scheduler/therapy.c"
 SRCS="$SRCS components/scheduler/phase.c"
 SRCS="$SRCS components/ble_api/ble_proto.c"
+SRCS="$SRCS components/ble_api/stream_codec.c"
 SRCS="$SRCS components/drift/drift.c"
 SRCS="$SRCS components/drift/edf_hdr.c"
 SRCS="$SRCS components/journal/journal.c"
 
 OUT="${TMPDIR:-/tmp}/somnobridge-host-test"
-cc -std=c11 -Wall -Wextra -Werror -g -O0 -DCAT_HOST_THREADS -pthread \
-    $INC $SRCS scripts/host_test.c -lm -o "$OUT"
+cc -std=c11 -Wall -Wextra -Werror -g -O0 -DCAT_HOST_THREADS -DSTC_HOST_TEST \
+    -pthread $INC $SRCS scripts/host_test.c -lm -o "$OUT"
 "$OUT"

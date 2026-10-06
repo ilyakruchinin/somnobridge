@@ -14,6 +14,17 @@
 #include "ezs_parse.h"
 #include "ezs_path.h"
 
+/* bounded copy that always NUL-terminates; GCC 14 promotes the
+ * truncating forms (strncpy cap-1 / snprintf %s) to errors            */
+static void copy_bounded(char *dst, size_t cap, const char *src)
+{
+    const char *e = memchr(src, 0, cap - 1);
+    size_t n = e ? (size_t)(e - src) : cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+
 /* ---------------- helpers ---------------- */
 
 static int hexv(char c)
@@ -532,7 +543,7 @@ ezs_err_t ezs_parse_dir(const char *body,
                 if (!lname[0]) {
                     return EZS_ERR_MALFORMED;
                 }
-                strncpy(e.name, lname, sizeof(e.name) - 1);
+                copy_bounded(e.name, sizeof(e.name), lname);
             }
             /* retain the ?file= basename when it is a sane filename —
              * the download path prefers the card's own addressing    */
@@ -541,7 +552,7 @@ ezs_err_t ezs_parse_dir(const char *body,
                 e.dl_name[0] = '\0';
             }
         } else {
-            strncpy(e.name, lname, sizeof(e.name) - 1);
+            copy_bounded(e.name, sizeof(e.name), lname);
         }
 
         if (*n_out >= EZS_ENTRIES_MAX) {

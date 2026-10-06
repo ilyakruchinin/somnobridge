@@ -26,10 +26,16 @@ import re
 import struct
 import sys
 import time
+import zlib
 
 import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
+
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
 
 from clock_source import clock_source
 
@@ -39,11 +45,16 @@ DATA_UUID = "8ba7d102-6e4b-4bb4-9f1d-7306766e6f50"
 
 # blep_kind_t (components/ble_api/include/ble_proto.h)
 K_JSON_REQ, K_JSON_RESP, K_FILE_BYTES, K_ACK, K_ABORT, \
-    K_TIME_REQ, K_TIME_REPLY, K_TIME_COMMIT, K_EV_BYTES = range(1, 10)
+    K_TIME_REQ, K_TIME_REPLY, K_TIME_COMMIT, K_EV_BYTES, \
+    K_STREAM_DATA = range(1, 11)
 
 FLAG_START, FLAG_END = 0x0001, 0x0002
 HDR = struct.Struct("<BBHIQ")           # 16-byte packed LE header
 HDR_LEN = HDR.size
+CHDR_LEN = 4                            # compact data frame header
+BLK_HDR = struct.Struct("<BBHII")       # stream block envelope (12 B)
+
+STREAM_WINDOW = 128 * 240               # credit grant, wire bytes
 
 DEFAULT_ADDR = "8C:FD:49:93:74:76"
 TIMESTAMP_ALLOWANCE_US = 5000           # §8.1 provisional 5 ms
@@ -67,13 +78,17 @@ class SomnoBridge:
         self.ctrl_path = self.data_path = None
         self._ctrl = self._data = None
         self._rx = {}                   # rid -> bytearray (JSON reassembly)
+        self._rx_poisoned = set()       # rids with a lost fragment
         self._done = {}                 # rid -> decoded JSON string
         self._time_reply = {}           # rid -> raw TIME_REPLY payload
-        self._stream = bytearray()      # evidence/file bytes
+        self._stream = bytearray()      # evidence/file wire bytes
         self._stream_end = None         # STREAM_END JSON
         self._stream_rid = None
         self._stream_bytes = 0
         self._stream_open = False
+        self._stream_seq = 0            # next expected compact seq
+        self._seq_errors = 0
+        self._last_acked = 0            # last right-edge credit grant
         self._ack_pending = False
         # rotate the request_id base per run so a retry never collides
         # with a still-cached exchange from a previous invocation
@@ -184,6 +199,24 @@ class SomnoBridge:
         if "Value" not in changed:
             return
         data = bytes(bytearray(changed["Value"]))
+        if len(data) < 2:
+            return
+        # compact stream-data frame: [ver][kind=10][seq:u16][payload]
+        if data[0] == 1 and data[1] == K_STREAM_DATA:
+            if not self._stream_open:
+                return
+            seq = data[2] | (data[3] << 8)
+            if seq != (self._stream_seq & 0xFFFF):
+                # missed frame(s): count the gap, then resync so later
+                # frames don't each count as an error
+                self._seq_errors += \
+                    (seq - (self._stream_seq & 0xFFFF)) & 0xFFFF
+                self._stream_seq = seq
+            self._stream_seq += 1
+            self._stream += data[CHDR_LEN:]
+            self._stream_bytes = len(self._stream)
+            self._ack_pending = True
+            return
         if len(data) < HDR_LEN:
             return
         ver, kind, flags, rid, off = HDR.unpack(data[:HDR_LEN])
@@ -194,10 +227,19 @@ class SomnoBridge:
         if kind == K_JSON_RESP:
             buf = self._rx.setdefault(rid, bytearray())
             if off > len(buf):
+                # a fragment was lost at the host (BlueZ can drop
+                # indications under load) — poison rather than
+                # zero-fill so the caller sees a clean failure
                 buf.extend(b"\x00" * (off - len(buf)))
+                self._rx_poisoned.add(rid)
             buf[off:off + len(payload)] = payload
             if flags & FLAG_END:
-                self._done[rid] = bytes(buf).decode("utf-8", "replace")
+                if rid in self._rx_poisoned:
+                    self._done[rid] = None
+                    self._rx_poisoned.discard(rid)
+                else:
+                    self._done[rid] = \
+                        bytes(buf).decode("utf-8", "replace")
                 self._rx.pop(rid, None)
         elif kind == K_TIME_REPLY:
             # t4 = receipt of the *complete* reply (§8.1) — stamp UTC and
@@ -218,18 +260,31 @@ class SomnoBridge:
 
     # ---------- outbound ----------
 
-    def _write(self, path, obj, blob):
+    def _write(self, path, obj, blob, busy_ms=4000, cmd=False):
         value = dbus.Array([dbus.Byte(b) for b in blob], signature="y")
+        # "command" = write-without-response: no ATT response to wait
+        # for, so it can never stall behind a saturated notify path.
         opts = dbus.Dictionary({"offset": dbus.UInt16(0),
-                                "type": "request"}, signature="sv")
+                                "type": "command" if cmd else "request"},
+                               signature="sv")
         last = None
+        busy_until = time.monotonic() + busy_ms / 1000.0
         for _ in range(8):
             try:
                 obj.WriteValue(value, opts)
                 return
             except dbus.DBusException as e:
                 last = e
-                # transient GATT errors (auth flap, busy): pace and retry
+                name = getattr(e, "get_dbus_name", lambda: "")() or ""
+                # one outstanding GATT request per connection: a slow
+                # device-side response leaves the next write InProgress.
+                # It clears as soon as the pending op completes.
+                if "InProgress" in name or "Busy" in name:
+                    if time.monotonic() < busy_until:
+                        time.sleep(0.05)
+                        continue
+                    break
+                # other transient GATT errors (auth flap): pace + retry
                 time.sleep(0.05)
         raise last
 
@@ -239,28 +294,40 @@ class SomnoBridge:
         pay = max(mtu - 3 - HDR_LEN, 20)
         window = window_bytes if window_bytes is not None else 128 * pay
         blob = frame(K_ACK, rid, offset, 0, struct.pack("<I", window))
-        self._write(self.ctrl_path, self._ctrl, blob)
+        # write-without-response: credit grants are idempotent (the
+        # device tracks max right-edge) so a fire-and-forget write is
+        # safe, and it avoids queueing behind in-flight GATT ops while
+        # the notify path is saturated
+        self._write(self.ctrl_path, self._ctrl, blob, cmd=True)
 
     def _next_rid(self):
         self._rid = (self._rid % 0xFFFFFF) + 1
         return self._rid
 
     def request(self, op, args=None, timeout=15.0):
-        rid = self._next_rid()
         doc = {"op": op}
         if args:
             doc["args"] = args
-        blob = frame(K_JSON_REQ, rid, 0, FLAG_START | FLAG_END,
-                     json.dumps(doc, separators=(",", ":")).encode())
-        self._write(self.ctrl_path, self._ctrl, blob)
-        end = time.monotonic() + timeout
-        while time.monotonic() < end:
-            # fine-grained pump: the device serialises indications and
-            # waits for our ATT confirmation, so confirm promptly
-            self._pump(0.005)
-            if rid in self._done:
-                return json.loads(self._done.pop(rid))
-        raise TimeoutError(f"{op}: no response in {timeout:.0f}s")
+        body = json.dumps(doc, separators=(",", ":")).encode()
+        last = None
+        for _ in range(2):                   # retry once on a lost fragment
+            rid = self._next_rid()
+            blob = frame(K_JSON_REQ, rid, 0, FLAG_START | FLAG_END, body)
+            self._write(self.ctrl_path, self._ctrl, blob)
+            end = time.monotonic() + timeout
+            while time.monotonic() < end:
+                # fine-grained pump: the device serialises indications
+                # and waits for our ATT confirmation — confirm promptly
+                self._pump(0.005)
+                if rid in self._done:
+                    resp = self._done.pop(rid)
+                    if resp is None:         # poisoned: fragment lost
+                        last = TimeoutError(f"{op}: fragment lost")
+                        break
+                    return json.loads(resp)
+            if last is None:
+                last = TimeoutError(f"{op}: no response in {timeout:.0f}s")
+        raise last
 
     # ---------- §8.1 time exchange ----------
 
@@ -300,7 +367,8 @@ class SomnoBridge:
                 self._pump(0.005)
             if rid in self._done:      # device answered with a JSON error
                 results.append({"rid": rid, "ok": False,
-                                "why": self._done.pop(rid)[:120]})
+                                "why": (self._done.pop(rid) or
+                                        "fragment lost")[:120]})
                 continue
             raw = self._time_reply.pop(rid, None)
             if raw is None:
@@ -354,7 +422,9 @@ class SomnoBridge:
         while time.monotonic() < end and best["rid"] not in self._done:
             self._pump(0.05)
         if best["rid"] in self._done:
-            ack = json.loads(self._done.pop(best["rid"]))
+            ack_raw = self._done.pop(best["rid"])
+            ack = json.loads(ack_raw) if ack_raw else \
+                {"ok": False, "error": "fragment_lost"}
         response.update({"committed": best, "ack": ack})
         return response
 
@@ -367,6 +437,9 @@ class SomnoBridge:
         self._stream_bytes = 0
         self._stream_end = None
         self._stream_open = False
+        self._stream_seq = 0
+        self._seq_errors = 0
+        self._last_acked = 0
         self._ack_pending = False
         self._stream_rid = rid
         doc = {"op": op}
@@ -382,7 +455,9 @@ class SomnoBridge:
         while time.monotonic() < end:
             self._pump(0.02)
             if rid in self._done:
-                begin = json.loads(self._done.pop(rid))
+                raw_begin = self._done.pop(rid)
+                begin = json.loads(raw_begin) if raw_begin else \
+                    {"ok": False, "error": {"code": "fragment_lost"}}
                 break
         return rid, begin, end
 
@@ -396,7 +471,7 @@ class SomnoBridge:
         last_progress = time.monotonic()
         last_bytes = -1
         try:
-            self._ack(rid, 0)
+            self._ack(rid, 0, STREAM_WINDOW)
             while True:
                 now = time.monotonic()
                 if self._stream_bytes != last_bytes:
@@ -407,11 +482,26 @@ class SomnoBridge:
                 if end is not None and now > end and last_bytes <= 0:
                     break                       # never started
                 self._pump(0.02)
-                if self._ack_pending:
+                # right-edge credits: re-grant after ~¼ window of
+                # contiguous wire bytes has arrived (update7 §10.3)
+                if self._ack_pending and \
+                        self._stream_bytes - self._last_acked >= \
+                        STREAM_WINDOW // 4:
                     self._ack_pending = False
-                    self._ack(rid, self._stream_bytes)
+                    self._last_acked = self._stream_bytes
+                    self._ack(rid, self._stream_bytes, STREAM_WINDOW)
                 if rid in self._done:          # STREAM_END
-                    self._stream_end = json.loads(self._done.pop(rid))
+                    raw_end = self._done.pop(rid)
+                    if raw_end is None:
+                        self._stream_end = {"ok": False,
+                                            "error": "fragment_lost"}
+                    else:
+                        try:
+                            self._stream_end = json.loads(raw_end)
+                        except ValueError:
+                            self._stream_end = {"ok": False,
+                                                "error": "bad_end",
+                                                "raw": raw_end[:200]}
                     break
         finally:
             self._stream_open = False
@@ -421,19 +511,79 @@ class SomnoBridge:
                                 frame(K_ABORT, rid, 0, FLAG_START | FLAG_END))
                 except dbus.exceptions.DBusException as error:
                     self.log("stream abort failed:", error)
-        return {"raw": bytes(self._stream), "end": self._stream_end}
+        return {"wire": bytes(self._stream), "end": self._stream_end,
+                "seq_errors": self._seq_errors}
+
+    # ---------- update7 block codec (§10.5) ----------
+
+    @staticmethod
+    def _inv_delta16(b):
+        """LE u16 running-sum reconstruction of a delta16 block."""
+        if _np is not None:
+            a = _np.frombuffer(b, dtype="<u2").copy()
+            _np.cumsum(a, dtype=_np.uint16, out=a)
+            out = a.tobytes()
+            if len(b) & 1:
+                out += b[-1:]
+            return out
+        out = bytearray(len(b))
+        acc = 0
+        for i in range(0, len(b) & ~1, 2):
+            acc = (acc + (b[i] | (b[i + 1] << 8))) & 0xFFFF
+            out[i] = acc & 0xFF
+            out[i + 1] = acc >> 8
+        if len(b) & 1:
+            out[-1] = b[-1]
+        return bytes(out)
+
+    def _decode_wire(self, wire):
+        """Walk the block envelope; return (raw_bytes, stats)."""
+        out = bytearray()
+        pos = 0
+        nblk = {"raw": 0, "def": 0, "d16": 0}
+        while pos + BLK_HDR.size <= len(wire):
+            codec, ver, _rsv, raw_len, enc_len = \
+                BLK_HDR.unpack_from(wire, pos)
+            if ver != 1:
+                raise ValueError(f"bad block ver {ver} at +{pos}")
+            enc = wire[pos + BLK_HDR.size:pos + BLK_HDR.size + enc_len]
+            if len(enc) < enc_len:
+                break               # truncated tail (aborted stream)
+            if codec == 0:
+                raw = enc
+                nblk["raw"] += 1
+            elif codec == 1:
+                raw = zlib.decompress(enc, -15)
+                nblk["def"] += 1
+            elif codec == 2:
+                raw = self._inv_delta16(zlib.decompress(enc, -15))
+                nblk["d16"] += 1
+            else:
+                raise ValueError(f"bad codec {codec} at +{pos}")
+            if len(raw) != raw_len:
+                raise ValueError(
+                    f"block raw_len {raw_len} != decoded {len(raw)}")
+            out += raw
+            pos += BLK_HDR.size + enc_len
+        return bytes(out), nblk, pos
 
     def evidence(self, timeout=45.0):
         rid, begin, end = self._stream_open_op("GET_EVIDENCE",
+                                             args={"v2": True},
                                              timeout=timeout)
         if not begin or not begin.get("ok"):
             return {"begin": begin, "raw": b"", "end": None}
         res = self._stream_collect(rid, end)
+        if (begin.get("result") or {}).get("wire") == 2:
+            self._decode_guarded(res)
+        else:
+            res["raw"], res["blocks"] = res["wire"], {"raw": 0}
+            res["wire_consumed"] = len(res["wire"])
         res["begin"] = begin
         return res
 
     def get_file(self, directory, name, expected_size=None, timeout=120.0):
-        args = {"directory": directory, "name": name}
+        args = {"directory": directory, "name": name, "v2": True}
         if expected_size is not None:
             args["expected_size"] = str(expected_size)
         for attempt in range(3):
@@ -448,8 +598,51 @@ class SomnoBridge:
                     continue
                 return {"begin": begin, "raw": b"", "end": None}
             res = self._stream_collect(rid, end)
+            if res.get("end") is not None:
+                if (begin.get("result") or {}).get("wire") == 2:
+                    self._decode_guarded(res)
+                else:
+                    res["raw"], res["blocks"] = \
+                        res["wire"], {"raw": 0}
+                    res["wire_consumed"] = len(res["wire"])
             res["begin"] = begin
             return res
+
+    def _decode_guarded(self, res):
+        """Decode wire-v2 blocks; a host-side lost notification
+        corrupts the deflate stream — report instead of raising."""
+        try:
+            res["raw"], res["blocks"], res["wire_consumed"] = \
+                self._decode_wire(res["wire"])
+        except (ValueError, zlib.error) as e:
+            res["raw"], res["blocks"], res["wire_consumed"] = \
+                b"", None, 0
+            res["decode_error"] = str(e)
+        return res
+
+    def stream_test(self, nbytes, pattern="ramp", v2=True,
+                    timeout=120.0):
+        """Synthetic bulk stream — codec+wire only, no card access."""
+        rid, begin, end = self._stream_open_op(
+            "STREAM_TEST",
+            args={"bytes": nbytes, "pattern": pattern, "v2": v2},
+            timeout=timeout)
+        if not begin or not begin.get("ok"):
+            return {"begin": begin, "raw": b"", "end": None}
+        res = self._stream_collect(rid, end)
+        if res.get("end") is not None:
+            if (begin.get("result") or {}).get("wire") == 2:
+                self._decode_guarded(res)
+            else:
+                res["raw"], res["blocks"] = res["wire"], {"raw": 0}
+                res["wire_consumed"] = len(res["wire"])
+        res["begin"] = begin
+        return res
+
+    def prepare_days(self, days):
+        """Batch pre-refresh of DATALOG day listings (update7 §10.2)."""
+        return self.request("PREPARE_DAYS", {"days": sorted(set(days))},
+                            timeout=15.0)
 
     def close(self):
         try:
@@ -788,6 +981,12 @@ def print_evidence(r):
 def self_test():
     from unittest.mock import Mock, patch
 
+    def cframe(seq, payload):
+        return bytes([1, K_STREAM_DATA, seq & 0xFF, seq >> 8]) + payload
+
+    def blk(raw):
+        return BLK_HDR.pack(0, 1, 0, len(raw), len(raw)) + raw
+
     def client():
         dev = SomnoBridge.__new__(SomnoBridge)
         dev._next_rid = Mock(return_value=42)
@@ -799,17 +998,19 @@ def self_test():
         dev._rx = {}
         return dev
 
-    begin = {"ok": True, "result": {"truncated": False}}
+    begin = {"ok": True, "result": {"truncated": False, "wire": 2}}
     end = {"ok": True, "result": {"ok": True}}
     dev = client()
+    wire = blk(b"current")
     def pump(seconds):
         if not dev._stream_open:
             dev._done[42] = json.dumps(begin)
         else:
+            # a stale-rid legacy frame must be ignored
             dev._on_value(None, {"Value": frame(K_FILE_BYTES, 41, 0, 0,
                                                 b"stale")}, [])
-            dev._on_value(None, {"Value": frame(K_FILE_BYTES, 42, 0, 0,
-                                                b"current")}, [])
+            dev._on_value(None, {"Value": cframe(0, wire[:9])}, [])
+            dev._on_value(None, {"Value": cframe(1, wire[9:])}, [])
             dev._done[42] = json.dumps(end)
     dev._pump = pump
     with patch(__name__ + ".time.monotonic", return_value=0):
@@ -818,7 +1019,8 @@ def self_test():
     assert dev._write.call_count == 1 and not dev._stream_open
     dev._on_value(None, {"Value": frame(K_FILE_BYTES, 42, 7, 0,
                                         b"late")}, [])
-    assert bytes(dev._stream) == b"current"
+    dev._on_value(None, {"Value": cframe(9, b"late")}, [])
+    assert bytes(dev._stream) == wire
 
     dev = client()
     dev._pump = lambda seconds: dev._done.update({42: json.dumps(begin)})
@@ -839,6 +1041,22 @@ def self_test():
             raise AssertionError("credit failure must propagate")
     assert not dev._stream_open
     assert HDR.unpack(dev._write.call_args.args[2][:HDR_LEN])[1] == K_ABORT
+
+    # block codec: raw + delta16 + deflate round-trip
+    dev = client()
+    e = dev._decode_wire(blk(b"hello"))
+    assert e[0] == b"hello" and e[2] == len(blk(b"hello"))
+    # deflate-only block
+    co = zlib.compressobj(6, zlib.DEFLATED, -15)
+    enc = co.compress(b"aaaabbbb" * 100) + co.flush()
+    e = dev._decode_wire(BLK_HDR.pack(1, 1, 0, 800, len(enc)) + enc)
+    assert e[0] == b"aaaabbbb" * 100
+    # delta16+deflate block
+    raw = b"\x01\x00\x05\x00\x03\x00\x02\x00"
+    co = zlib.compressobj(6, zlib.DEFLATED, -15)
+    enc = co.compress(b"\x01\x00\x04\x00\xfe\xff\xff\xff") + co.flush()
+    e = dev._decode_wire(BLK_HDR.pack(2, 1, 0, 8, len(enc)) + enc)
+    assert e[0] == raw
     print("BLE stream self-tests passed")
 
 
@@ -868,13 +1086,20 @@ def main():
                     help="explicit time-source epoch for §8.1 anchors")
     ap.add_argument("--no-time-commit", action="store_true",
                     help="collect TIME exchanges without committing an anchor")
-    ap.add_argument("--get", metavar="PATH",
-                    help="GET_FILE: download a card file (e.g. "
-                         "'DATALOG/20261005/x.edf'); writes --out")
+    ap.add_argument("--get", metavar="PATH", nargs="+",
+                    help="GET_FILE: download card file(s) (e.g. "
+                         "'DATALOG/20261005/x.edf'); writes --out when a "
+                         "single path is given")
     ap.add_argument("--out", metavar="FILE",
                     help="output path for --get (default: basename in cwd)")
     ap.add_argument("--evidence", action="store_true",
                     help="replay the evidence journal (GET_EVIDENCE)")
+    ap.add_argument("--stream-test", type=int, metavar="BYTES",
+                    help="STREAM_TEST: synthetic bulk stream (no card)")
+    ap.add_argument("--pattern", choices=["ramp", "rand"],
+                    default="ramp", help="STREAM_TEST data pattern")
+    ap.add_argument("--v1", action="store_true",
+                    help="use legacy wire framing (no compact/codec)")
     ap.add_argument("--json", action="store_true", help="print raw JSON")
     ap.add_argument("--timeout", type=float, default=15.0)
     ap.add_argument("--self-test", action="store_true",
@@ -889,7 +1114,7 @@ def main():
         args.drift = True
     if not any([args.status, args.catalog, args.days is not None, args.day,
                 args.drift, args.time_sync is not None,
-                args.evidence]):
+                args.evidence, args.stream_test is not None]):
         args.status = args.catalog = args.drift = True
         args.days = 14
 
@@ -941,37 +1166,95 @@ def main():
             print(json.dumps(r, indent=2, default=str)) if args.json \
                 else print_evidence(r)
 
-        if args.get:
-            parts = re.split(r"[\\/]", args.get)
-            if len(parts) < 2:
-                sys.exit("--get needs DIR/NAME (e.g. A:\\DATALOG\\20261005\\x.edf)")
-            directory, name = "\\".join(parts[:-1]), parts[-1]
+        if args.stream_test is not None:
             t0 = time.monotonic()
-            r = dev.get_file(directory, name, timeout=args.timeout * 6)
-            elapsed = time.monotonic() - t0
-            end = (r.get("end") or {}).get("result") or {}
-            raw = r.get("raw", b"")
-            sha = hashlib.sha256(raw).hexdigest()
-            sha_ok = sha == end.get("sha256")
-            bytes_ok = str(len(raw)) == end.get("actual_bytes")
-            ok = bool(end.get("ok")) and sha_ok and bytes_ok
-            if ok and not args.json:
-                out = args.out or name
-                with open(out, "wb") as f:
-                    f.write(raw)
-            hr("GET_FILE")
+            r = dev.stream_test(args.stream_test, pattern=args.pattern,
+                                v2=not args.v1, timeout=args.timeout * 4)
+            dt = time.monotonic() - t0
             if args.json:
-                print(json.dumps({"begin": r.get("begin"), "end": r.get("end"),
-                                  "bytes": len(raw)}, indent=2))
+                print(json.dumps(r, indent=2, default=str))
             else:
-                print(f"  begin: {json.dumps((r.get('begin') or {}).get('result'))[:220]}")
-                print(f"  end:   {json.dumps(end)[:300]}")
-                print(f"  got {len(raw)} B in {elapsed:.1f}s "
-                      f"({len(raw)/max(elapsed,0.01)/1024:.1f} KiB/s)  "
+                raw = len(r.get("raw", b""))
+                wire = len(r.get("wire", b""))
+                endr = (r.get("end") or {}).get("result", {})
+                print(f"STREAM_TEST {args.pattern} wire{'' if args.v1 else '2'}: "
+                      f"raw={raw}B wire={wire}B in {dt:.1f}s -> "
+                      f"{raw/dt/1024:.1f} KiB/s raw, "
+                      f"{wire/dt/1024:.1f} KiB/s wire")
+                print(f"  blocks={r.get('blocks')} "
+                      f"end_ok={endr.get('ok')} sha256={endr.get('sha256','')[:12]} "
+                      f"seq_errors={r.get('seq_errors')} "
+                      f"decode_error={r.get('decode_error')} "
+                      f"stall_ms={endr.get('stall_ms')} "
+                      f"retry_ms={endr.get('retry_ms')} "
+                      f"encode_ms={endr.get('encode_ms')}")
+
+        if args.get:
+            paths = args.get if isinstance(args.get, list) else [args.get]
+            files = []
+            for p in paths:
+                parts = re.split(r"[\\/]", p)
+                if len(parts) < 2:
+                    sys.exit("--get needs DIR/NAME "
+                             "(e.g. A:\\DATALOG\\20261005\\x.edf)")
+                files.append(("\\".join(parts[:-1]), parts[-1]))
+            # batch pre-refresh: queue rescans for every stale DATALOG
+            # day in one shot instead of a 12 s STALE retry each
+            days = [d.split("\\")[-1] for d, _ in files
+                    if "DATALOG" in d.upper()]
+            if len(paths) > 1 and days:
+                pr = dev.prepare_days(days)
+                pr_res = (pr or {}).get("result") or {}
+                eta = pr_res.get("eta_ms", 0)
+                if eta:
+                    print(f"  PREPARE_DAYS: queued rescans, "
+                          f"waiting {eta} ms", file=sys.stderr)
+                    time.sleep(eta / 1000 + 1)
+            t_all = time.monotonic()
+            tot_raw = tot_wire = 0
+            n_ok = 0
+            for i, (directory, name) in enumerate(files):
+                t0 = time.monotonic()
+                r = dev.get_file(directory, name,
+                                 timeout=max(args.timeout * 6, 120))
+                elapsed = time.monotonic() - t0
+                end = (r.get("end") or {}).get("result") or {}
+                raw = r.get("raw", b"")
+                wire = r.get("wire", b"")
+                sha = hashlib.sha256(raw).hexdigest()
+                sha_ok = sha == end.get("sha256")
+                bytes_ok = str(len(raw)) == end.get("actual_bytes")
+                enc_ok = str(len(wire)) == end.get("encoded_bytes")
+                ok = bool(end.get("ok")) and sha_ok and bytes_ok
+                tot_raw += len(raw)
+                tot_wire += len(wire)
+                n_ok += ok
+                if len(paths) == 1 or not ok:
+                    hr(f"GET_FILE {name}")
+                    print(f"  end:   {json.dumps(end)[:300]}")
+                print(f"  [{i+1}/{len(files)}] {name}: {len(raw)} B in "
+                      f"{elapsed:.1f}s "
+                      f"({len(raw)/max(elapsed,0.01)/1024:.1f} KiB/s raw, "
+                      f"{len(wire)/max(elapsed,0.01)/1024:.1f} KiB/s wire)  "
                       f"sha256={'ok' if sha_ok else 'MISMATCH'} "
-                      f"actual_bytes={'ok' if bytes_ok else 'MISMATCH'}")
-                print("  saved to " + out if ok else
-                      "  NOT saved (transfer incomplete or invalid)")
+                      f"bytes={'ok' if bytes_ok else 'MISMATCH'} "
+                      f"wire_len={'ok' if enc_ok else str(len(wire))} "
+                      f"seq_err={r.get('seq_errors', 0)} "
+                      f"blk={r.get('blocks')}")
+                if not ok:
+                    print("  NOT saved (transfer incomplete or invalid)")
+                elif not args.json:
+                    out = args.out if (args.out and len(files) == 1) \
+                        else name
+                    with open(out, "wb") as f:
+                        f.write(raw)
+            if len(files) > 1:
+                wall = time.monotonic() - t_all
+                hr("SUMMARY")
+                print(f"  {n_ok}/{len(files)} ok, {tot_raw} raw B in "
+                      f"{wall:.1f}s "
+                      f"({tot_raw/max(wall,0.01)/1024:.1f} KiB/s raw, "
+                      f"{tot_wire/max(wall,0.01)/1024:.1f} KiB/s wire)")
     finally:
         dev.close()
 

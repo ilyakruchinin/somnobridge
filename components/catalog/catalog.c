@@ -14,12 +14,24 @@
 #include "catalog.h"
 #include "ezs_parse.h"
 
+/* bounded copy that always NUL-terminates; GCC 14 promotes the
+ * truncating forms (strncpy cap-1 / snprintf %s) to errors            */
+static void copy_bounded(char *dst, size_t cap, const char *src)
+{
+    const char *e = memchr(src, 0, cap - 1);
+    size_t n = e ? (size_t)(e - src) : cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+
 static SemaphoreHandle_t s_lock;
 #define LOCK()    xSemaphoreTake(s_lock, portMAX_DELAY)
 #define UNLOCK()  xSemaphoreGive(s_lock)
@@ -303,16 +315,16 @@ static void diff_emit(cat_diff_t *d, cat_ev_kind_t kind,
     memset(e, 0, sizeof(*e));
     e->kind = kind;
     const cat_file_t *named = newf ? newf : oldf;
-    strncpy(e->name, named->name, CAT_NAME_MAX - 1);
+    copy_bounded(e->name, CAT_NAME_MAX, named->name);
     if (oldf) {
         e->old_size = oldf->size;
         e->old_stamp_ok = oldf->has_timestamp;
-        strncpy(e->old_stamp, oldf->timestamp_raw, CAT_STAMP_MAX - 1);
+        copy_bounded(e->old_stamp, CAT_STAMP_MAX, oldf->timestamp_raw);
     }
     if (newf) {
         e->new_size = newf->size;
         e->new_stamp_ok = newf->has_timestamp;
-        strncpy(e->new_stamp, newf->timestamp_raw, CAT_STAMP_MAX - 1);
+        copy_bounded(e->new_stamp, CAT_STAMP_MAX, newf->timestamp_raw);
     }
 }
 
@@ -523,7 +535,7 @@ int cat_list_days(char (*days)[CAT_DAY_STR], int cap)
     LOCK();
     for (int i = 0; i < s_nfolders && n < cap; i++) {
         if (s_folders[i].state != CAT_FOLDER_GONE) {
-            strncpy(days[n], s_folders[i].day, CAT_DAY_STR);
+            copy_bounded(days[n], CAT_DAY_STR, s_folders[i].day);
             n++;
         }
     }
@@ -540,7 +552,7 @@ bool cat_newest_day(char out[CAT_DAY_STR])
     for (int i = 0; i < s_nfolders; i++) {
         if (s_folders[i].state != CAT_FOLDER_GONE &&
             (!found || strcmp(s_folders[i].day, out) > 0)) {
-            strncpy(out, s_folders[i].day, CAT_DAY_STR - 1);
+            copy_bounded(out, CAT_DAY_STR, s_folders[i].day);
             found = true;
         }
     }
@@ -554,7 +566,7 @@ int cat_hot_days(char (*days)[CAT_DAY_STR], int cap)
     LOCK();
     for (int i = 0; i < s_nfolders && n < cap; i++) {
         if (s_folders[i].hot && s_folders[i].state != CAT_FOLDER_GONE) {
-            strncpy(days[n], s_folders[i].day, CAT_DAY_STR);
+            copy_bounded(days[n], CAT_DAY_STR, s_folders[i].day);
             n++;
         }
     }
@@ -570,7 +582,7 @@ int cat_scan_queue(char (*days)[CAT_DAY_STR], int cap)
     for (int i = 0; i < s_nfolders && n < cap; i++) {
         if (s_folders[i].state == CAT_FOLDER_UNSCANNED ||
             s_folders[i].stale) {
-            strncpy(days[n], s_folders[i].day, CAT_DAY_STR);
+            copy_bounded(days[n], CAT_DAY_STR, s_folders[i].day);
             n++;
         }
     }

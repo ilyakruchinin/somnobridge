@@ -638,3 +638,19 @@ Remaining hardware check: the fix is flashed; repeat portal catalog
 rebuilds while listing/monitoring and confirm stable PSRAM and continued
 catalog reconstruction. Host stress tests do not replace this on-device
 check. No commit or push performed.
+
+## update7 (BLE throughput, pure-BLE option — SomnoBridge side)
+
+Done: ESP-IDF v5.5.5; 240 MHz CPU; WiFi+lwIP tasks on core 1; NimBLE logs
+at WARNING; 16 KiB TCP windows. Wire v2 (compact 4-byte stream frames +
+per-block raw/deflate/delta16 codec in PSRAM + right-edge credits +
+full-frame packing + deadline pacing) is opt-in via `"v2": true` on
+GET_FILE/GET_EVIDENCE — v1 clients get the unchanged legacy stream.
+PREPARE_DAYS pre-warms day listings for batch pulls. Post-download
+recheck is event-driven (JOB_DAY callback), not a 2.5 s sleep. EZShare
+downloads reuse one keep-alive HTTP client. The evidence journal
+self-heals once per boot when the partition reads but cannot write
+(INVALID_STATE → erase+reinit, marked truncated).
+
+Pending: real-file throughput measurement once the therapy gate opens;
+SomnoTrace client side of wire v2 is a separate task.

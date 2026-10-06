@@ -165,6 +165,49 @@ esp_err_t jrn_put(const char *kind, const char *json_body)
     return ESP_OK;
 }
 
+/* A page in the evidence partition can end in a permanently-invalid
+ * state (e.g. power cut mid-erase): reads still scan, but every write
+ * then fails with NVS_INVALID_STATE. The ring is explicitly allowed
+ * to lose history (it self-reports truncation), so on that error we
+ * erase + re-init the partition once per boot rather than stay dead. */
+static bool s_heal_tried;
+
+static esp_err_t heal_partition(void)
+{
+    if (s_heal_tried) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_heal_tried = true;
+    ESP_LOGE(TAG, "evidence NVS inconsistent — erasing partition once");
+    if (s_nvs) {
+        nvs_close(s_nvs);
+        s_nvs = 0;
+    }
+    s_open = false;
+    esp_err_t err = nvs_flash_erase_partition("evidence");
+    if (err != ESP_OK) {
+        return err;
+    }
+    nvs_sec_cfg_t *sec = (nvs_sec_cfg_t *)settings_sec_cfg();
+    err = nvs_flash_secure_init_partition("evidence", sec);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_open_from_partition("evidence", JRN_NS, NVS_READWRITE,
+                                  &s_nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+    s_open = true;
+    s_seq_oldest = 0;
+    s_seq_next = 1;
+    s_next_slot = 0;
+    s_truncated = true;              /* the gap is real: whole ring    */
+    s_health = JRN_TRUNCATED;
+    ESP_LOGW(TAG, "evidence partition healed (history lost)");
+    return ESP_OK;
+}
+
 static esp_err_t write_chunk(const uint8_t *data, size_t len)
 {
     if (len > JRN_PAYLOAD_MAX) return ESP_ERR_INVALID_SIZE;
@@ -181,6 +224,11 @@ static esp_err_t write_chunk(const uint8_t *data, size_t len)
     k[4] = '\0';
     esp_err_t err = nvs_set_blob(s_nvs, k, buf, sizeof(h) + len);
     if (err == ESP_OK) err = nvs_commit(s_nvs);
+    if (err == ESP_ERR_NVS_INVALID_STATE && heal_partition() == ESP_OK) {
+        /* retry once on the fresh partition                          */
+        err = nvs_set_blob(s_nvs, k, buf, sizeof(h) + len);
+        if (err == ESP_OK) err = nvs_commit(s_nvs);
+    }
     if (err == ESP_OK) {
         s_next_slot = (uint8_t)((s_next_slot + 1) % JRN_SLOTS);
         s_seq_next++;

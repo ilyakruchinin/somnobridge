@@ -88,3 +88,20 @@ uint16_t blep_build_frame(uint8_t *out, uint16_t mtu_payload,
     }
     return (uint16_t)(sizeof(h) + plen);
 }
+
+uint16_t blep_build_cframe(uint8_t *out, uint16_t out_cap,
+                           uint16_t seq,
+                           const uint8_t *payload, uint16_t plen)
+{
+    uint16_t room = out_cap > BLEP_CDATA_HDR_LEN
+                        ? (uint16_t)(out_cap - BLEP_CDATA_HDR_LEN) : 0;
+    if (plen > room) plen = room;
+    out[0] = 1;                          /* protocol version         */
+    out[1] = (uint8_t)BLEP_STREAM_DATA;
+    out[2] = (uint8_t)(seq & 0xff);
+    out[3] = (uint8_t)(seq >> 8);
+    if (plen) {
+        memcpy(out + BLEP_CDATA_HDR_LEN, payload, plen);
+    }
+    return (uint16_t)(BLEP_CDATA_HDR_LEN + plen);
+}

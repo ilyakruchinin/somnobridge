@@ -29,6 +29,30 @@ CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
+# 240 MHz: deflate/delta16 encoding, SHA-256 and the NimBLE host share
+# the chip with WiFi+BLE; 160 MHz measured as the baseline is slow enough
+# to matter for the compressed-stream pipeline (speed-optim.md D.3.1).
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=240
+
+# NimBLE logs every notify at INFO ("GATT procedure initiated: notify") —
+# hundreds of log calls per second in the stream hot path.
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+CONFIG_BT_NIMBLE_LOG_LEVEL=2
+
+# Core split (speed-optim.md D.3.1): BT host + controller stay on core 0;
+# WiFi and lwIP move to core 1 with the stream/codec workers.
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY=1
+
+# 4xMSS window throttles EZShare GET throughput; buffers land in PSRAM
+# (SPIRAM_TRY_ALLOCATE_WIFI_LWIP above) so internal RAM is untouched.
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+
 # BLE: NimBLE host, single connection, Secure Connections, persistent bonds
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
@@ -89,3 +113,7 @@ CONFIG_BT_NIMBLE_CRYPTO_STACK_MBEDTLS=y
 CONFIG_NIMBLE_CRYPTO_STACK_MBEDTLS=y
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=12288
 # CONFIG_SOMNOBRIDGE_DIAG_FIXED_PASSKEY is not set
+# NimBLE host allocations in PSRAM — internal RAM stayed <10KB free on
+# v5.5.5 and NimBLE asserts on malloc failure (BLE_INIT: Malloc failed
+# during connect, stream aborts). HCI/DMA transport bufs stay internal.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
