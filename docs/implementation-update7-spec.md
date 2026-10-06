@@ -43,6 +43,15 @@ NUL-terminating, same truncation semantics).
   mid-stream. External mode moves NimBLE dynamic allocations to PSRAM;
   internal free RAM recovered to ~37 KiB. HCI/DMA transport buffers are
   allocated separately and stay internal.
+- `MSYS_1_BLOCK_COUNT` raised 32 → 192 and `MSYS_2_BLOCK_COUNT`
+  12 → 32 (both PSRAM-resident). Every notification pins ~3 pool blocks
+  (data chain + ATT cmd + splits) until the controller drains it, so
+  in-flight frames pin pool blocks; a credit burst bigger than the pool
+  starves *control* indicates — observed as `STREAM_END` being dropped
+  after ~5 s of `no mbuf` retries mid-stream. The stream credit window
+  was also reduced to 48 × 240 B (~11.25 KiB, ~48 frames ≈ ~150 blocks
+  in flight) so the pool always covers a full window plus ctrl
+  headroom.
 
 ## 3. Wire protocol (§10.1 amendment): compact stream frames
 
@@ -57,6 +66,30 @@ u8 ver(=1) | u8 kind(=10) | u16 seq | payload[N]
 notification. There is no per-frame offset or request_id: streams are
 exclusive on the link and bounded by rid-keyed STREAM_BEGIN/STREAM_END
 control indications, so byte offsets are implied by in-order delivery.
+
+Receivers MUST drop frames whose seq is *behind* the next-expected
+counter (backward distance ≥ 0x8000), not just detect gaps forward:
+when a second D-Bus client holds a notify session on the same
+characteristic, BlueZ emits one `PropertiesChanged` per session, so a
+concurrent poller makes the streaming client see every frame twice —
+measured `rx=17480` for `dev=8740` sent, hci dump confirmed each ACL
+packet arrived once. Backward-seq frames are duplicates by
+construction (the sender never reuses `s_seq`); dropping them yields a
+clean stream (`seq_err=0`, SHA-256 verified) even under concurrent
+subscription. The v1 `FILE_BYTES` path is immune by accident — its
+offset-indexed writes make duplicates idempotent. `STREAM_END` gains
+`frames` (device-sent notify count) for sent-vs-received arbitration.
+
+The same double-delivery hits *control* response fragments. A
+duplicated tail fragment arriving after a message completed used to
+reopen a fresh reassembly buffer, see `off > 0`, poison the rid, and
+overwrite the finished response with `fragment_lost`. Receivers MUST
+ignore `K_JSON_RESP` fragments for a rid whose response already
+completed, unless the fragment is a genuine restart (`off==0` with
+`FLAG_START`). Complementing that, the device sends `STREAM_END` twice
+(~300 ms apart): a first copy damaged in flight is healed by the second
+copy's `FLAG_START`, and a clean first copy makes the reassembled
+duplicate harmless (it lands in an unread slot).
 
 The 16-byte `blep_hdr_t` remains unchanged for JSON request/response,
 ACK, ABORT, TIME_*, and the legacy `FILE_BYTES`/`EVIDENCE_BYTES` stream
@@ -193,9 +226,23 @@ truncation; losing its history is the documented degraded mode.
 
   | pattern | wire bytes | time | wire rate | raw-effective |
   |---------|-----------|------|-----------|----------------|
-  | ramp v2 |   448,535 | 8.5 s | 51.5 KiB/s | **237 KiB/s** |
-  | rand v2 | 2,097,548 | 21.6 s | 94.8 KiB/s | 94.8 KiB/s |
-  | rand v1 | 2,097,152 | 19.3 s | 106.2 KiB/s | 106.2 KiB/s |
+  | ramp v2 |   448,535 | 8.4 s | 52.4 KiB/s | **235 KiB/s** |
+  | rand v2 | 2,097,548 | 22.3 s | 91.7 KiB/s | 91.7 KiB/s |
+  | rand v1 | 2,097,152 | 20.8 s | 98.5 KiB/s | 98.5 KiB/s |
+
+- Worst case reproduced and fixed: a second host process holding
+  `StartNotify` on the data characteristic makes BlueZ double-deliver
+  every notification *and* every control-fragment indication. With the
+  session active: rx_frames=17480, dup_frames=8740 dropped by
+  backward-seq dedup, seq_errors=0, SHA-256 matched, STREAM_END
+  delivered, ~92–99 KiB/s wire — identical wire integrity to a clean
+  run. btmon capture proves the adapter received each ACL packet once
+  (8740 notifications at HCI level = dev_frames); the duplicate was
+  purely a host-side delivery artifact, not a device resend. The
+  dup-tail-fragment self-poison on completed rids (see §3) was found
+  and fixed the same way: `fragment_lost` no longer fires under a
+  concurrent subscriber, and the redundant `STREAM_END` resend covers
+  genuine in-flight fragment loss.
 
   The legacy v1 path roughly doubled the pre-change baseline (~20–50
   KiB/s → ~106 KiB/s) purely through packing/credit/pacing fixes; v2 +

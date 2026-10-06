@@ -54,7 +54,7 @@ HDR_LEN = HDR.size
 CHDR_LEN = 4                            # compact data frame header
 BLK_HDR = struct.Struct("<BBHII")       # stream block envelope (12 B)
 
-STREAM_WINDOW = 128 * 240               # credit grant, wire bytes
+STREAM_WINDOW = 48 * 240                # credit grant, wire bytes
 
 DEFAULT_ADDR = "8C:FD:49:93:74:76"
 TIMESTAMP_ALLOWANCE_US = 5000           # §8.1 provisional 5 ms
@@ -88,6 +88,8 @@ class SomnoBridge:
         self._stream_open = False
         self._stream_seq = 0            # next expected compact seq
         self._seq_errors = 0
+        self._stream_frames = 0         # compact frames received
+        self._dup_frames = 0            # duplicate deliveries dropped
         self._last_acked = 0            # last right-edge credit grant
         self._ack_pending = False
         # rotate the request_id base per run so a retry never collides
@@ -206,11 +208,17 @@ class SomnoBridge:
             if not self._stream_open:
                 return
             seq = data[2] | (data[3] << 8)
+            self._stream_frames += 1
             if seq != (self._stream_seq & 0xFFFF):
+                dist = (seq - (self._stream_seq & 0xFFFF)) & 0xFFFF
+                if dist >= 0x8000:
+                    # duplicate delivery (e.g. a second BlueZ notify
+                    # session re-emits every frame): drop, don't append
+                    self._dup_frames += 1
+                    return
                 # missed frame(s): count the gap, then resync so later
                 # frames don't each count as an error
-                self._seq_errors += \
-                    (seq - (self._stream_seq & 0xFFFF)) & 0xFFFF
+                self._seq_errors += dist
                 self._stream_seq = seq
             self._stream_seq += 1
             self._stream += data[CHDR_LEN:]
@@ -225,7 +233,17 @@ class SomnoBridge:
         payload = data[HDR_LEN:]
 
         if kind == K_JSON_RESP:
+            if rid in self._done and not (off == 0 and flags & FLAG_START):
+                # duplicate delivery of a tail fragment after the
+                # message completed — ignore rather than reopen a
+                # buffer and poison the finished response
+                return
             buf = self._rx.setdefault(rid, bytearray())
+            if off == 0 and flags & FLAG_START and rid in self._rx_poisoned:
+                # device retried the whole message (STREAM_END resend):
+                # clear the poison and reassemble fresh
+                self._rx_poisoned.discard(rid)
+                del buf[:]
             if off > len(buf):
                 # a fragment was lost at the host (BlueZ can drop
                 # indications under load) — poison rather than
@@ -441,6 +459,8 @@ class SomnoBridge:
         self._seq_errors = 0
         self._last_acked = 0
         self._ack_pending = False
+        self._stream_frames = 0
+        self._dup_frames = 0
         self._stream_rid = rid
         doc = {"op": op}
         if args:
@@ -512,7 +532,9 @@ class SomnoBridge:
                 except dbus.exceptions.DBusException as error:
                     self.log("stream abort failed:", error)
         return {"wire": bytes(self._stream), "end": self._stream_end,
-                "seq_errors": self._seq_errors}
+                "seq_errors": self._seq_errors,
+                "rx_frames": self._stream_frames,
+                "dup_frames": self._dup_frames}
 
     # ---------- update7 block codec (§10.5) ----------
 

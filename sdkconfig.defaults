@@ -59,13 +59,11 @@ CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
 # MSYS_1 = notify/indicate mbuf pool: file streams burst through notify.
-# 12 default blocks exhaust in ~5 frames at MTU 247; 32×256B covers the
-# 32-frame stream ACK window so pool drain paces sends, not kills them.
-# Larger values exhaust internal RAM (NimBLE uses MEM_ALLOC_MODE_INTERNAL)
-# and silently kill the nimble_host task + SM pairing crypto. MSYS_2
-# halved likewise (24→12).
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=32
-CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+# External alloc mode places these in PSRAM, so they can cover the whole
+# stream credit window (~16 KB ≈ 64 in-flight frames) — a burst that
+# overruns the pool drops ctrl indicates, including STREAM_END.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=192
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=32
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_BT_NIMBLE_SM_SC=y
 

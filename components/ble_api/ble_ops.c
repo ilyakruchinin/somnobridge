@@ -83,6 +83,7 @@ static TaskHandle_t s_ble_task;
 static uint8_t  s_pend[260];
 static size_t   s_pend_len;
 static uint16_t s_seq;             /* compact frame counter          */
+static uint32_t s_frames_sent;     /* device-side notify count       */
 
 /* post-download verification rescan: the JOB_DAY completion callback
  * flips this — no fixed settle delay (update7 §10.3)               */
@@ -163,7 +164,10 @@ static uint16_t send_json_now(uint32_t rid, const char *json, size_t len)
             if (!ble_svc_authorized()) {
                 return off;
             }
-            if (++tries >= 250) {            /* ~5 s */
+            /* stream bursts can pin the whole mbuf pool until the
+             * controller drains them; the END verdict must outlast
+             * that drought (was ~5 s — not enough past the tail)    */
+            if (++tries >= 750) {            /* ~15 s */
                 ESP_LOGW("ble", "indicate stalled at off=%u/%u",
                          (unsigned)off, (unsigned)len);
                 return off;
@@ -260,8 +264,27 @@ static void send_stream_end(uint32_t rid, const char *op,
     msg[total] = '\0';
     /* runs on the stream task, so the synchronous send (with its
      * confirmation wait) is safe here — see send_json_now */
-    if (send_json_now(rid, msg, total) != total) {
+    int attempt;
+    for (attempt = 0; attempt < 3; attempt++) {
+        if (send_json_now(rid, msg, total) == total) {
+            break;
+        }
+        if (!ble_svc_authorized()) {
+            break;
+        }
+        ESP_LOGW("ble", "STREAM_END retry %d", attempt + 1);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (attempt == 3) {
         ESP_LOGW("ble", "STREAM_END indication undelivered");
+    } else if (ble_svc_authorized()) {
+        /* Fragments can be lost in flight even when every indicate
+         * queued cleanly (host-side ACL RX overrun under notify flood).
+         * The receiver drops poisoned state on a fresh FLAG_START, so a
+         * redundant second copy heals that loss; if the first copy
+         * arrived fine the duplicate reassembles into an unread slot. */
+        vTaskDelay(pdMS_TO_TICKS(300));
+        send_json_now(rid, msg, total);
     }
     free(msg);
 }
@@ -708,6 +731,7 @@ static void op_get_file(uint32_t rid, cJSON *args)
     s_stream.stall_ms = s_stream.retry_ms = 0;
     s_pend_len = 0;
     s_seq = 0;
+    s_frames_sent = 0;
     s_stream.is_evidence = false;
     s_stream.is_test = false;
     s_stream.test_bytes = 0;
@@ -798,6 +822,7 @@ static bool wire_tx(const uint8_t *frame, uint16_t flen, size_t charge)
             (uint32_t)((esp_timer_get_time() - w0) / 1000);
     }
     s_stream.sent += charge;
+    s_frames_sent++;
     return true;
 }
 
@@ -929,6 +954,7 @@ static void op_get_evidence(uint32_t rid, cJSON *args)
     s_stream.stall_ms = s_stream.retry_ms = 0;
     s_pend_len = 0;
     s_seq = 0;
+    s_frames_sent = 0;
     s_stream.is_evidence = true;
     s_stream.is_test = false;
     s_stream.test_bytes = 0;
@@ -982,6 +1008,7 @@ static void op_stream_test(uint32_t rid, cJSON *args)
     s_stream.stall_ms = s_stream.retry_ms = 0;
     s_pend_len = 0;
     s_seq = 0;
+    s_frames_sent = 0;
     s_stream.is_evidence = false;
     s_stream.is_test = true;
     s_stream.v2 = v2;
@@ -1014,8 +1041,12 @@ static void ble_stream_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(10));
         }
         if (s_stream.limit == 0) {
+            ESP_LOGW("ble", "stream: no initial credit after 10s");
             goto finish_fail;
         }
+        ESP_LOGI("ble", "stream: start limit=%llu test=%d ev=%d v2=%d",
+                 (unsigned long long)s_stream.limit,
+                 s_stream.is_test, s_stream.is_evidence, s_stream.v2);
 
         mbedtls_sha256_init(&s_stream.sha);
         mbedtls_sha256_starts(&s_stream.sha, 0);
@@ -1066,6 +1097,8 @@ static void ble_stream_task(void *arg)
             }
         } else {
             ezw_obs_t obs;
+            ESP_LOGI("ble", "GET_FILE: fetch start limit=%llu",
+                     (unsigned long long)s_stream.limit);
             esp_err_t err =
                 ezs_download(s_stream.canon_dir, s_stream.name,
                              s_stream.dl_name, s_stream.src_size,
@@ -1073,6 +1106,10 @@ static void ble_stream_task(void *arg)
                              stream_sink, NULL, &obs);
             s_stream.src_clen = obs.content_length;
             transport_ok = err == ESP_OK;
+            ESP_LOGI("ble", "GET_FILE: fetch done err=%d body=%llu "
+                     "status=%d clen=%lld", (int)err,
+                     (unsigned long long)obs.body_bytes,
+                     obs.http_status, (long long)obs.content_length);
         }
         /* flush the codec's trailing partial block and the residue
          * frame so the wire carries every byte the sink accepted     */
@@ -1099,6 +1136,7 @@ static void ble_stream_task(void *arg)
                 "\"encoded_bytes\":\"%llu\",\"sha256\":\"%s\","
                 "\"gaps\":%lu,\"truncated\":%s,"
                 "\"stall_ms\":%lu,\"retry_ms\":%lu,\"encode_ms\":%lu,"
+                "\"frames\":%lu,"
                 "\"blocks\":{\"raw\":%lu,\"def\":%lu,\"d16\":%lu},"
                 "\"completion_allowed\":%s,\"error\":\"%s\"}",
                 transport_ok ? "true" : "false",
@@ -1109,6 +1147,7 @@ static void ble_stream_task(void *arg)
                 (unsigned long)s_stream.stall_ms,
                 (unsigned long)s_stream.retry_ms,
                 (unsigned long)(s_stream.v2 ? stc_encode_ms() : 0),
+                (unsigned long)s_frames_sent,
                 (unsigned long)(s_stream.v2 ? stc_raw_blocks() : 0),
                 (unsigned long)(s_stream.v2 ? stc_def_blocks() : 0),
                 (unsigned long)(s_stream.v2 ? stc_d16_blocks() : 0),

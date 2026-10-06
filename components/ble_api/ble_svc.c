@@ -552,13 +552,29 @@ void ble_svc_resume(void)
 bool ble_svc_control_indicate(const uint8_t *data, uint16_t len)
 {
     if (!ble_svc_authorized() || !s_ctrl_sub) {
+        static int s_sub_log;
+        if (s_sub_log < 3) {
+            s_sub_log++;
+            ESP_LOGW(TAG, "ctrl indicate gated: auth=%d csub=%d",
+                     ble_svc_authorized(), s_ctrl_sub);
+        }
         return false;
     }
     struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
     if (!om) {
+        ESP_LOGW(TAG, "ctrl indicate: no mbuf");
         return false;
     }
-    return ble_gatts_indicate_custom(s_conn, s_ctrl_handle, om) == 0;
+    int rc = ble_gatts_indicate_custom(s_conn, s_ctrl_handle, om);
+    if (rc != 0) {
+        static int s_rc_log;
+        if (s_rc_log < 5) {
+            s_rc_log++;
+            ESP_LOGW(TAG, "ctrl indicate rc=%d", rc);
+        }
+        return false;
+    }
+    return true;
 }
 
 bool ble_svc_send_bytes(const uint8_t *data, uint16_t len)
