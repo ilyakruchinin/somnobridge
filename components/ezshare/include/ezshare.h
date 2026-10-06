@@ -50,11 +50,11 @@ esp_err_t ezs_client_version(char *buf, size_t cap, ezw_obs_t *obs);
  * GET /download — streams the body through `sink`.
  * sink is called with response chunks; return false from sink to abort.
  *
- * Addressing: `dl_name` (the 8.3 basename captured from the listing's
- * own ?file= link) is preferred — the card canonicalizes long display
- * names to 8.3 and only that form is guaranteed to resolve. With
- * dl_name the request is `download?file=<dir>\<dl_name>`; when empty
- * it falls back to `download?fname=<name>&fdir=<dir>` (U8).
+ * Addressing: the card emits 8.3-style abbreviations in its ?file=
+ * listing hrefs (e.g. 202610~1.EDF) but those tokens do not resolve —
+ * `dl_name` is retained for diagnostics only. The request always uses
+ * the long name: `download?file=<dir>\<name>` first, then
+ * `download?fname=<name>&fdir=<dir>` as fallback (U8).
  *
  * Size gate: `listed_size` is the listing's display-rounded size and
  * `size_unit_shift` its unit (ezs_entry_t). The exact Content-Length

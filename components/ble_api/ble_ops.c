@@ -656,7 +656,22 @@ static bool stream_sink(const uint8_t *d, size_t n, void *ctx)
             frame, budget, BLEP_FILE_BYTES, s_stream.request_id,
             s_stream.sent, d + off, take,
             s_stream.sent == 0, last);
-        if (!ble_svc_send_bytes(frame, fl)) {
+        /* ble_svc_send_bytes fails transiently when the NimBLE mbuf
+         * pool drains (mbufs free each connection interval). Pace and
+         * retry briefly instead of killing the stream — a sustained
+         * outage (>~2 s) or lost authorization still aborts.        */
+        bool sent = false;
+        for (int tries = 0; tries < 200; tries++) {
+            if (ble_svc_send_bytes(frame, fl)) {
+                sent = true;
+                break;
+            }
+            if (!s_stream.active || !ble_svc_authorized()) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (!sent) {
             return false;
         }
         mbedtls_sha256_update(&s_stream.sha, d + off, take);
@@ -866,6 +881,9 @@ static void ble_stream_task(void *arg)
                 completion ? "true" : "false", reason);
             send_stream_end(s_stream.request_id, "STREAM_END", end);
         }
+        ESP_LOGI("ble", "stream done sent=%llu stack_hwm=%u",
+                 (unsigned long long)s_stream.sent,
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
         s_stream.active = false;
         continue;
 
@@ -1165,7 +1183,11 @@ esp_err_t ble_ops_init(void)
         return ESP_ERR_NO_MEM;
     }
     xTaskCreate(ble_tx_task, "ble_tx", 4096, NULL, 6, &s_tx_task);
-    xTaskCreate(ble_stream_task, "ble_stream", 6144, NULL, 8,
+    /* ble_stream_task runs ezs_download -> esp_http_client (stack-hungry)
+     * plus journal NVS reads on the evidence path. 6 KiB overflowed and
+     * corrupted the heap (crash in esp_http_client_init's calloc under a
+     * second download). Match card_task's proven size.                */
+    xTaskCreate(ble_stream_task, "ble_stream", 16384, NULL, 8,
                 &s_ble_task);
     return ESP_OK;
 }

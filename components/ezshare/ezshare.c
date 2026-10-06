@@ -88,6 +88,7 @@ static esp_http_client_handle_t open_get(const char *url, bool is_file,
     ESP_LOGI("ezs", "init ok c=%p", (void *)c);
 #endif
     if (!c) {
+        ESP_LOGW(TAG, "init failed url=%.96s", url);
         obs->transport = ESP_FAIL;
         return NULL;
     }
@@ -95,6 +96,7 @@ static esp_http_client_handle_t open_get(const char *url, bool is_file,
     esp_http_client_set_header(c, "Cache-Control", "no-cache");
     esp_http_client_set_header(c, "Pragma", "no-cache");
     if (esp_http_client_open(c, 0) != ESP_OK) {
+        ESP_LOGW(TAG, "open failed url=%.96s", url);
         esp_http_client_cleanup(c);
         obs->transport = ESP_FAIL;
         return NULL;
@@ -108,6 +110,8 @@ static esp_http_client_handle_t open_get(const char *url, bool is_file,
     int64_t hdr = esp_http_client_fetch_headers(c);
     obs->http_status = esp_http_client_get_status_code(c);
     if (hdr < 0 || obs->http_status <= 0) {
+        ESP_LOGW(TAG, "hdr fail hdr=%lld status=%d url=%.96s",
+                 (long long)hdr, obs->http_status, url);
         obs->transport = hdr < 0 ? ESP_FAIL : ESP_OK;
         esp_http_client_cleanup(c);
         return NULL;
@@ -244,6 +248,7 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
 {
     memset(obs, 0, sizeof(*obs));
     obs->content_length = -1;
+    /* dl_name (the listing's own ?file= token) is the last-resort form */
     if (!sink || !name) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -251,38 +256,55 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* The card abbreviates long names in its ?file= listing hrefs
+     * (e.g. 202610~1.EDF) but that token does NOT resolve — dl_name is
+     * retained only as a diagnostic. Address by the long name: first
+     * the card's own ?file=<dir>\<name> form, then the documented
+     * ?fname=<name>&fdir=<dir> fallback.                            */
     char url[1152];
-    if (dl_name && dl_name[0]) {
-        /* listing-derived 8.3 addressing: download?file=<dir>\<dl> —
-         * the card canonicalizes long display names to 8.3 and only
-         * this form resolves for them (U8)                         */
-        if (ezp_validate_name(dl_name) != EZP_OK) {
-            return ESP_ERR_INVALID_ARG;
-        }
-        char fpath[336];
-        snprintf(fpath, sizeof(fpath), "%.320s\\%s",
-                 canon_dir + 2, dl_name);      /* strip "A:\"         */
-        build_url(url, sizeof(url), "download", "file", fpath,
-                  NULL, NULL);
-    } else {
-        char fdir[320];
-        canon_to_fdir(canon_dir, fdir, sizeof(fdir));
-        build_url(url, sizeof(url), "download",
-                  "fname", name, "fdir", fdir);
-    }
-
+    esp_http_client_handle_t c = NULL;
     obs->req_start_us = esp_timer_get_time();
-    esp_http_client_handle_t c = open_get(url, true, obs);
+    for (int form = 0; form < 3 && !c; form++) {
+        if (form == 2) {
+            /* card's own listing href verbatim: file=<dir>\<dl_name> —
+             * kept as last resort; EZShare may only accept the alias
+             * it issued even though the long name is canonical       */
+            if (!dl_name || !dl_name[0]) {
+                continue;
+            }
+            char fpath[368];
+            snprintf(fpath, sizeof(fpath), "%.320s\\%s",
+                     canon_dir + 3, dl_name);
+            build_url(url, sizeof(url), "download", "file", fpath,
+                      NULL, NULL);
+        } else if (form == 0) {
+            char fpath[368];
+            /* card expects a root-relative path: DATALOG\...\name
+             * (canon_dir is "A:\DATALOG\..." — skip "A:\", 3 chars)   */
+            snprintf(fpath, sizeof(fpath), "%.320s\\%s",
+                     canon_dir + 3, name);
+            build_url(url, sizeof(url), "download", "file", fpath,
+                      NULL, NULL);
+        } else {
+            char fdir[320];
+            canon_to_fdir(canon_dir, fdir, sizeof(fdir));
+            build_url(url, sizeof(url), "download",
+                      "fname", name, "fdir", fdir);
+        }
+        c = open_get(url, true, obs);
+        if (c && esp_http_client_get_status_code(c) != 200) {
+            ESP_LOGW(TAG, "form %d status=%d url=%.96s", form,
+                     esp_http_client_get_status_code(c), url);
+            esp_http_client_cleanup(c);
+            c = NULL;
+        }
+    }
     if (!c) {
         obs->resp_end_us = esp_timer_get_time();
-        return ESP_FAIL;
+        return obs->http_status > 0
+                   ? ESP_ERR_HTTP_BASE + obs->http_status : ESP_FAIL;
     }
     obs->http_status = esp_http_client_get_status_code(c);
-    if (obs->http_status != 200) {
-        obs->resp_end_us = esp_timer_get_time();
-        esp_http_client_cleanup(c);
-        return ESP_ERR_HTTP_BASE + obs->http_status;
-    }
     int64_t clen = esp_http_client_get_content_length(c);
     obs->content_length = clen;
     if (listed_size && clen >= 0 &&

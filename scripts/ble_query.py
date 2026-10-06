@@ -19,8 +19,10 @@
 #   ./scripts/ble_query.py --json                # raw JSON instead of tables
 
 import argparse
+import hashlib
 import json
 import math
+import re
 import struct
 import sys
 import time
@@ -226,7 +228,7 @@ class SomnoBridge:
         mtu = int(self._get(self.ctrl_path, "org.bluez.GattCharacteristic1",
                             "MTU", 247) or 247)
         pay = max(mtu - 3 - HDR_LEN, 20)
-        window = window_bytes if window_bytes is not None else 8 * pay
+        window = window_bytes if window_bytes is not None else 32 * pay
         blob = frame(K_ACK, rid, offset, 0, struct.pack("<I", window))
         self._write(self.ctrl_path, self._ctrl, blob)
 
@@ -347,9 +349,10 @@ class SomnoBridge:
         response.update({"committed": best, "ack": ack})
         return response
 
-    # ---------- evidence stream ----------
+    # ---------- shared stream machinery (§10.2/§10.3) ----------
 
-    def evidence(self, timeout=45.0):
+    def _stream_open_op(self, op, args=None, timeout=45.0):
+        """Send a streaming op and wait for its STREAM_BEGIN response."""
         rid = self._next_rid()
         self._stream = bytearray()
         self._stream_bytes = 0
@@ -357,9 +360,12 @@ class SomnoBridge:
         self._stream_open = False
         self._ack_pending = False
         self._stream_rid = rid
+        doc = {"op": op}
+        if args:
+            doc["args"] = args
         self._write(self.ctrl_path, self._ctrl,
                     frame(K_JSON_REQ, rid, 0, FLAG_START | FLAG_END,
-                          json.dumps({"op": "GET_EVIDENCE"}).encode()))
+                          json.dumps(doc).encode()))
         # STREAM_BEGIN arrives as a JSON response; credit must follow or
         # the device's streamer waits forever (§10.3).
         begin = None
@@ -369,12 +375,28 @@ class SomnoBridge:
             if rid in self._done:
                 begin = json.loads(self._done.pop(rid))
                 break
-        if not begin or not begin.get("ok"):
-            return {"begin": begin, "raw": b"", "end": None}
+        return rid, begin, end
+
+    def _stream_collect(self, rid, end=None, idle=30.0):
+        """Drive the credit/byte/end flow after a successful STREAM_BEGIN.
+        The deadline is rolling: it expires only after `idle` seconds
+        without stream progress, so arbitrarily large transfers work.
+        `end` (absolute, from _stream_open_op) still bounds the initial
+        credit wait."""
         self._stream_open = True
+        last_progress = time.monotonic()
+        last_bytes = -1
         try:
             self._ack(rid, 0)
-            while time.monotonic() < end:
+            while True:
+                now = time.monotonic()
+                if self._stream_bytes != last_bytes:
+                    last_bytes = self._stream_bytes
+                    last_progress = now
+                elif now - last_progress > idle:
+                    break                       # stalled: abort
+                if end is not None and now > end and last_bytes <= 0:
+                    break                       # never started
                 self._pump(0.02)
                 if self._ack_pending:
                     self._ack_pending = False
@@ -389,9 +411,29 @@ class SomnoBridge:
                     self._write(self.ctrl_path, self._ctrl,
                                 frame(K_ABORT, rid, 0, FLAG_START | FLAG_END))
                 except dbus.exceptions.DBusException as error:
-                    self.log("evidence abort failed:", error)
-        return {"begin": begin, "raw": bytes(self._stream),
-                "end": self._stream_end}
+                    self.log("stream abort failed:", error)
+        return {"raw": bytes(self._stream), "end": self._stream_end}
+
+    def evidence(self, timeout=45.0):
+        rid, begin, end = self._stream_open_op("GET_EVIDENCE",
+                                             timeout=timeout)
+        if not begin or not begin.get("ok"):
+            return {"begin": begin, "raw": b"", "end": None}
+        res = self._stream_collect(rid, end)
+        res["begin"] = begin
+        return res
+
+    def get_file(self, directory, name, expected_size=None, timeout=120.0):
+        args = {"directory": directory, "name": name}
+        if expected_size is not None:
+            args["expected_size"] = str(expected_size)
+        rid, begin, end = self._stream_open_op("GET_FILE", args,
+                                             timeout=timeout)
+        if not begin or not begin.get("ok"):
+            return {"begin": begin, "raw": b"", "end": None}
+        res = self._stream_collect(rid, end)
+        res["begin"] = begin
+        return res
 
     def close(self):
         try:
@@ -764,7 +806,7 @@ def self_test():
 
     dev = client()
     dev._pump = lambda seconds: dev._done.update({42: json.dumps(begin)})
-    with patch(__name__ + ".time.monotonic", side_effect=[0, 0, 2]):
+    with patch(__name__ + ".time.monotonic", side_effect=[0, 0, 2, 2]):
         replay = dev.evidence(timeout=1)
     assert replay["end"] is None and not dev._stream_open
     assert HDR.unpack(dev._write.call_args.args[2][:HDR_LEN])[1] == K_ABORT
@@ -810,6 +852,11 @@ def main():
                     help="explicit time-source epoch for §8.1 anchors")
     ap.add_argument("--no-time-commit", action="store_true",
                     help="collect TIME exchanges without committing an anchor")
+    ap.add_argument("--get", metavar="PATH",
+                    help="GET_FILE: download a card file (e.g. "
+                         "'DATALOG/20261005/x.edf'); writes --out")
+    ap.add_argument("--out", metavar="FILE",
+                    help="output path for --get (default: basename in cwd)")
     ap.add_argument("--evidence", action="store_true",
                     help="replay the evidence journal (GET_EVIDENCE)")
     ap.add_argument("--json", action="store_true", help="print raw JSON")
@@ -877,6 +924,38 @@ def main():
             r = dev.evidence(timeout=args.timeout * 3)
             print(json.dumps(r, indent=2, default=str)) if args.json \
                 else print_evidence(r)
+
+        if args.get:
+            parts = re.split(r"[\\/]", args.get)
+            if len(parts) < 2:
+                sys.exit("--get needs DIR/NAME (e.g. A:\\DATALOG\\20261005\\x.edf)")
+            directory, name = "\\".join(parts[:-1]), parts[-1]
+            t0 = time.monotonic()
+            r = dev.get_file(directory, name, timeout=args.timeout * 6)
+            elapsed = time.monotonic() - t0
+            end = (r.get("end") or {}).get("result") or {}
+            raw = r.get("raw", b"")
+            sha = hashlib.sha256(raw).hexdigest()
+            sha_ok = sha == end.get("sha256")
+            bytes_ok = str(len(raw)) == end.get("actual_bytes")
+            ok = bool(end.get("ok")) and sha_ok and bytes_ok
+            if ok and not args.json:
+                out = args.out or name
+                with open(out, "wb") as f:
+                    f.write(raw)
+            hr("GET_FILE")
+            if args.json:
+                print(json.dumps({"begin": r.get("begin"), "end": r.get("end"),
+                                  "bytes": len(raw)}, indent=2))
+            else:
+                print(f"  begin: {json.dumps((r.get('begin') or {}).get('result'))[:220]}")
+                print(f"  end:   {json.dumps(end)[:300]}")
+                print(f"  got {len(raw)} B in {elapsed:.1f}s "
+                      f"({len(raw)/max(elapsed,0.01)/1024:.1f} KiB/s)  "
+                      f"sha256={'ok' if sha_ok else 'MISMATCH'} "
+                      f"actual_bytes={'ok' if bytes_ok else 'MISMATCH'}")
+                print("  saved to " + out if ok else
+                      "  NOT saved (transfer incomplete or invalid)")
     finally:
         dev.close()
 

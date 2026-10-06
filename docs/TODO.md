@@ -60,17 +60,25 @@ suspend observation.
 - `python3 scripts/ble_query.py --self-test`: passes; no device connection.
 - `./scripts/idf.sh build`: clean, app size `0x12fe90`, 70% partition free.
 - **Overnight hardware evidence collected** (2026-10-04 70-min +
-  2026-10-05 6.5-h captures): sustained REFINE2 with graceful
-  reacquisition, rolling evidence to 360 events, fallback commit +
+  2026-10-05 6.5-h + 2026-10-06 6.3-h captures): sustained REFINE2 with
+  graceful reacquisition, rolling evidence to 360 events, fallback commit +
   post-OUT selection, and 1163/1164 interval containment vs AS11
-  `GetDateTime`. Final HTTP counters reported 16,947 samples and zero
-  failures; median service was 204 ms and observed backoff was zero.
-  These are since-boot counters, not a capture-only request rate.
+  `GetDateTime` on night 2; night 3 contained all 341 delay intervals and
+  all 20 estimate/reference pairs (100%). Night-3 HTTP counters reported
+  3,204 capture-window samples, zero failures, median service 200 ms, one
+  observer-side BLE reconnect.
+- **Night 3 verified live:** committed fallback record (seq 1) survived the
+  rename flash + reboot and was served as `previous_session_fallback` from
+  boot through the first session start; two further commits landed
+  (seq 2, seq 3); `reacq_reason` cleared on every recovery; the 240 s
+  finalize gate saved two session ends and correctly declined one at
+  244.6 s evidence age; journal replays now report honest transport
+  failures (see the new journal-transport follow-up).
 - **Decision:** best-effort/provisional accuracy is accepted for this
   deployment. Qualified-tier accuracy is not a release requirement; quality
   labels and qualification thresholds remain truthful and unchanged.
-- **Still open:** hardware verification of the strengthened fixes below,
-  next-session fallback use, and restore across a reboot. Ten-minute
+- **Still open:** the BLE journal-replay transport failure rate (new
+  follow-up below) and continued midpoint-skew watching. Ten-minute
   host-anchor cadence remains client-supplied (`--anchor-interval 600`).
 
 # NEXT
@@ -120,7 +128,7 @@ Regression test in `scripts/host_test.c`: empty-probe does not
 invalidate; single differing probe does not invalidate; N consecutive
 differing probes do.
 
-## VERIFY: session-end finalize + next-day fallback path — PARTLY VERIFIED
+## VERIFY: session-end finalize + next-day fallback path — VERIFIED
 
 Originally flagged because the 70-minute capture ended while therapy
 was still IN. Confirmed live in the 6.5-hour overnight capture
@@ -136,10 +144,19 @@ was still IN. Confirmed live in the 6.5-hour overnight capture
   `reason:"no_current_candidate"`, `adjusted_half_ms:2504` — the
   completed-session correction is being served as designed.
 
-The confirmed result is save plus post-OUT fallback selection, not yet use
-in the next therapy session. Remaining for full closure: observe early
-fallback use in a resumed/new session and restore across a reboot. Neither
-has been established by the overnight capture alone.
+The confirmed result is save plus post-OUT fallback selection. Night 3
+(`/tmp/somnobridge-observe-20261005-2301.jsonl`) closed the remaining items:
+
+- **Restore across reboot + reflash:** the seq 1 record committed on
+  night 2 survived the SomnoBridge rename flash and reboot, and was served
+  as `best_available.selected_view:"previous_session_fallback"`
+  (`no_current_candidate`) from capture start through the first session
+  IN — the first real next-day fallback use.
+- **Subsequent commits:** seq 2 at session-B end (~01:17, drift −509633,
+  half 1405) and seq 3 at session-C end (~05:14, drift −508728, half 1373).
+- **Session-A end declined honestly** at `ref_stale age_us=244637819` —
+  beyond the new 240 s finalize gate after a pre-OUT miss; evidence that
+  old is genuinely stale, so the gate worked as designed.
 
 ## VERIFY: evidence accumulation past the old 96-event cap — VERIFIED
 
@@ -157,24 +174,31 @@ report `provisional`/`approximate`, not claim qualified accuracy. The fixed
 fallback allowance and expiry remain operating assumptions, not certified
 RTC bounds. Qualified-tier characterization is optional future work.
 
-## WATCH: estimate midpoint skew — recurred, worth one more night
+## WATCH: estimate midpoint skew — recurred, still under observation
 
 - Night 1 (70 min): median residual −148 ms vs AS11 `GetDateTime`.
 - Night 2 (6.5 h): median residual **+5 ms**, σ=186 ms, but a
   systematic −200…−330 ms bias developed after the ~04:22 file
-  rotation (beacon swap to a different data file). Hypothesis: per-file
-  write→visible latency differences shift the bracket mid.
+  rotation (beacon swap to a different data file).
+- Night 3 (6.3 h): median residual **+251 ms**, σ=66 ms — a persistent
+  positive mid bias across all 20 estimate/reference pairs (containment
+  still 100%; SomnoTrace `measured_stop` deltas 250–395 ms inside width).
+  The sign flipped between nights, so the night-2 "per-file write
+  latency" hypothesis is not confirmed — the bias may instead track
+  phase of the write comb relative to poll timing.
   Recommendation: keep watching; if the bias tracks specific beacon
   files, consider per-beacon bracket calibration or documenting the
   bias bound. No code change yet.
 
-## NIT: `phase.reacq_reason` label — FIXED
+## NIT: `phase.reacq_reason` label — VERIFIED
 
 `"day_change"` persisted as the reason string for the entire session
 after the initial acquisition — the last reason was never cleared on
 successful transitions. Fixed in `phase_obs` (clears on an accepted
-bracket); see "NIT: `phase.reacq_reason` label — IMPLEMENTED / HOST-VERIFIED"
-below for semantics and regression coverage.
+bracket); night 3 confirmed `day_change`/`miss`/`beacon_swap`/
+`session_edge` all clear to `none` on the next accepted bracket.
+See "NIT: `phase.reacq_reason` label — IMPLEMENTED" below for semantics
+and regression coverage.
 
 ## Appendix — revised recommendation: ignore EZShare version for timing validity
 
@@ -296,24 +320,25 @@ replacement rather than inventing a new automatic identity heuristic.
   regression establish removal of version-based invalidation; an eligible
   fallback surviving into the following session remains a hardware check.
 
-## Accuracy outcomes (both captures)
+## Accuracy outcomes (three captures)
 
-| Metric | Night 1 (70 min) | Night 2 (6.5 h) |
-|---|---|---|
-| Interval containment vs AS11 `GetDateTime` | 171/171 (100%) | 1163/1164 (99.9%) |
-| Midpoint residual | median −148 ms | median +5 ms, σ=186 ms |
-| SomnoTrace `measured_stop` agreement | ~21 ms | ~0.2–0.3 s across 3 sessions |
-| Stated half-width (conservative) | ±1.36 s | ±1.27…1.74 s |
-| AS11 RTC drift measured | +3 ms (flat) | **−76 ms / 6.5 h ≈ 3 ppm** |
-| Tier | provisional / best-effort | provisional / best-effort |
+| Metric | Night 1 (70 min) | Night 2 (6.5 h) | Night 3 (6.3 h) |
+|---|---|---|---|
+| Interval containment vs AS11 `GetDateTime` | 171/171 (100%) | 1163/1164 (99.9%) | 341/341 delay + 20/20 estimate pairs (100%) |
+| Midpoint residual | median −148 ms | median +5 ms, σ=186 ms | median +251 ms, σ=66 ms |
+| SomnoTrace `measured_stop` agreement | ~21 ms | ~0.2–0.3 s across 3 sessions | 250–395 ms, all 3 contained |
+| Stated half-width (conservative) | ±1.36 s | ±1.27…1.74 s | ±1.37…1.45 s |
+| AS11 RTC drift measured | +3 ms (flat) | **−76 ms / 6.5 h ≈ 3 ppm** | ~−145 ms / 5.5 h ≈ 7 ppm window |
+| Anchors accepted | — | 40/40 | 38/38 |
+| Tier | provisional / best-effort | provisional / best-effort | provisional / best-effort |
 
-Note: the single non-containment was an 84 ms lower-bound shortfall with
-partial interval overlap. It was not full containment and must not be
-counted as such; the capture does not establish absolute clock accuracy.
+Note: the single night-2 non-containment was an 84 ms lower-bound shortfall
+with partial interval overlap. It was not full containment and must not be
+counted as such; the captures do not establish absolute clock accuracy.
 A side-effect of the +508 s offset: filenames rolled into "tomorrow" (`20261005_000019_BRP.edf` created at
 23:51 UTC Oct 4) — exactly why the correction matters.
 
-## FOLLOW-UP: session-end save freshness margin — IMPLEMENTED / HOST-VERIFIED
+## FOLLOW-UP: session-end save freshness margin — VERIFIED ON HARDWARE
 
 Live selection remains limited to 180 s. Confirmed-OUT finalization uses
 its own inclusive 240 s limit, allowing more decision latency without
@@ -330,7 +355,14 @@ all similarly aged evidence is safe under every circumstance.
 Host regressions cover exactly 180/240 s and 1 µs beyond, future references,
 original reference preservation, unchanged record/dirty state on age
 rejection, and exactly 2000 ms effective width versus 2001 ms after elapsed
-widening. A new real session-end capture is still needed.
+widening.
+
+Hardware verification (night 3, `/tmp/somnobridge-observe-20261005-2301.jsonl`):
+three real session ends exercised the gate both ways — sessions B and C
+committed (`fallback/save` + `commit seq 2`, `seq 3`), while session A
+declined at `ref_stale age_us=244637819` (genuinely stale after a pre-OUT
+miss; over the new gate). The widened margin prevented false declines
+without admitting stale evidence.
 
 ## FIX: journal replay integrity — IMPLEMENTED / HOST-VERIFIED
 
@@ -373,7 +405,14 @@ written after replay indexing may be absent. `persisted_seq` plus dirty
 state remains the evidence for a durable fallback commit. The fixes do
 not establish the exact cause of every missing event in the old capture.
 
-## NIT: `phase.reacq_reason` label — IMPLEMENTED / HOST-VERIFIED
+Hardware verification (night 3): honest failure reporting immediately
+surfaced a real problem — 21 of 37 replays ended with device-reported
+`journal_error` (see the journal-replay transport follow-up below). The
+18 complete replays passed byte-count + SHA-256 validation and, merged,
+covered every key event including both `ref_stale`/`save`/`commit`
+transitions — coverage is adequate despite the aborts.
+
+## NIT: `phase.reacq_reason` label — VERIFIED
 
 The reason now denotes recovery pending until an enabled model accepts a
 bracket, not the historical last reason and not completion of the entire
@@ -382,28 +421,127 @@ observations do not. A disabled model keeps its `disabled` reason even if
 it accepts a bracket; recovery after re-enabling clears it normally.
 
 Direct regressions cover miss, beacon/day changes, unchanged observations,
-wide brackets, disabled-model visibility, and re-enabled recovery. No
+wide brackets, disabled-model visibility, and re-enabled recovery. Night 3
+confirmed the live behavior across five misses and two beacon swaps. No
 polling schedule or estimate-validity gate is changed by this field.
 
-## NEXT: hardware verification of strengthened follow-ups
+## FOLLOW-UP: journal replay BLE transport aborts — MITIGATED, VERIFY ON HW
 
-1. Flash the new build when requested; these changes are built but have
-   not been flashed or tested live in this follow-up.
-2. Capture therapy OUT and a resumed/new session: verify final save,
-   unchanged true reference age, early fallback use, then preference for
-   fresh current evidence. Also verify restored fallback after reboot and
-   an authenticated anchor.
-3. Exercise journal replay success and timeout/link loss: verify truthful
-   completion, observer rejection of invalid payloads, and successful
-   later requests after abort. Measure replay elapsed time and snapshot
-   gaps before deciding whether 600 s should change.
-4. Continue observing midpoint skew; no per-file calibration from one
-   night's bias. Keep best-effort labels and do not require qualified-tier
-   accuracy for this deployment.
+Night 3 (first capture with honest failure reporting): **21 of 37** journal
+replays ended with device-reported `journal_error` — `stream_sink` aborted
+when `ble_svc_send_bytes` failed transiently (NimBLE notify mbuf pool
+empty) — not timeouts, not journal corruption (`gaps:0` everywhere).
+
+Fix applied (2026-10-06): `stream_sink` now retries a failed send for up to
+~2 s (10 ms cadence) before declaring failure — transient pool drains now
+pace the stream instead of killing it. Stream state only advances on a
+confirmed send, so retries cannot duplicate or drop bytes. Additionally
+`CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT` raised 12→64 (~16 KiB) — the default
+pool only held ~5 in-flight MTU-247 frames, which is why every ~17–45 KB
+stream eventually hit the wall.
+
+Deferred: `from_seq` resume parameter for `GET_EVIDENCE` — only if the
+pacing fix proves insufficient on hardware.
+
+Night-3 replay facts for whoever picks this up: replays every 600 s,
+~15–45 KB payloads, ~6–9 s elapsed, journal ring ~256 slots.
+
+## BLE file downloads — three bugs found and fixed (2026-10-06)
+
+Live download testing surfaced three independent defects, all fixed and
+flashed:
+
+1. **`ble_stream_task` stack overflow → heap corruption crash.** The task
+   ran `ezs_download` → `esp_http_client` on 6144 B while `card_task` runs
+   the same path on 16384 B. Overflow corrupted adjacent heap; a later
+   `calloc` inside `esp_http_client_init` then panicked with "Cache
+   error" / later `InstrFetchProhibited PC=0`. Fixed: stack 6144→16384 B
+   plus a permanent `stack_hwm` log after every stream end.
+
+2. **`download?file=` URL had a leading backslash — every GET_FILE 404'd.**
+   `canon_dir + 2` strips `"A:"` but leaves `"\DATALOG\..."`. The card's
+   own listing hrefs use root-relative `DATALOG\...\name`. Fixed to
+   `canon_dir + 3`. Also: the card's `?file=` href token (e.g.
+   `202610~1.EDF`) is an abbreviation, not a required alias — addressing
+   is now by long name first, with `fname`+`fdir` and the listing token
+   as fallbacks. `open_get` failure stages now log (init/open/status).
+
+3. **Transient NimBLE mbuf exhaustion killed streams at ~17 KB.** See the
+   journal-transport entry above — same root cause, same fix. Verified
+   live: small file (`CSL.edf`, 832 B) downloaded end-to-end with
+   host-side SHA-256 match; 1.24 MB `BRP.edf` streamed correctly until
+   the host-side test harness timed out at 90 s.
+
+Host-side (`ble_query.py`): added `--get PATH --out FILE` with SHA-256 +
+byte-count verification; the stream deadline is now a rolling 30 s idle
+timer (was a fixed absolute timeout that killed >90 s transfers); ACK
+credit window raised 8→32 ATT payloads (~7.3 KB) per grant.
+
+## FOLLOW-UP: mid-stream link drop wedges BLE security until reboot — OPEN
+
+Twice observed: a file stream aborts mid-flight (client timeout / link
+drop), then all subsequent GATT writes fail "insufficient auth" even
+though BlueZ reports Connected+Paired, until the device reboots. Suspect
+the `BLE_GAP_EVENT_REPEAT_PAIRING` handler (`ble_svc.c:315`) — it deletes
+the stored bond and returns RETRY; if the retry never completes (link
+died mid-procedure), the device is left bondless while the host still
+thinks it is paired. A bondless device-side + paired host-side = exactly
+this wedge. Serial capture had a ~100 s gap during the failure window
+(USB-serial-jtag drops bursts when the host reader stalls), so the actual
+SM event was not captured. Investigate: does enc re-establishment on
+reconnect fail because the bond was deleted? If so the delete-then-retry
+needs to also clear/recheck `s_have_peer` so a subsequent fresh pair can
+recover without the physical pairing window.
+
+Recovery note: re-pairing requires the physical short-press pairing
+window plus the LCD passkey. `CONFIG_SOMNOBRIDGE_DIAG_FIXED_PASSKEY=y`
+was enabled in the **local** sdkconfig only (passkey 424242) so an
+automated agent can re-pair without reading the LCD — never ship it.
+
+## FOLLOW-UP: host BT adapter (Intel AX200) wedged during BLE stress — HOST ISSUE
+
+During download stress testing the host's AX200 Bluetooth stopped
+scanning entirely (raw `hcitool lescan` → `Set scan parameters failed:
+Input/output error`). Not firmware-caused — survived unbind/rebind,
+`authorized` toggle, `btusb`/`btintel` module reload, PCIe FLR of
+`0000:01:00.0`, and `USBDEVFS_RESET`. Only a host reboot recovers it.
+Worth noting because BLE-indication storms appear able to wedge this
+adapter; consider documenting for SomnoTrace operators.
+
+Also discovered: on this GEEK board, `esptool --after hard_reset` *sometimes*
+boots the app and sometimes leaves the chip in `waiting for download`.
+`esptool.py --after watchdog_reset <any-op>` reliably resamples straps and
+boots the app — use it when the device doesn't come up after flash. The
+port also re-enumerates between `/dev/ttyACM0` and `/dev/ttyACM1` on every
+reset — serial tails must follow the live node.
+
+## NEXT: remaining verification
+
+1. ~~Flash the new build~~ — flashed 2026-10-05 (`somnobridge.bin`,
+   0x12ff90); BLE advertises `SomnoBridge`, bond + NVS settings survived,
+   EZShare link up on first status poll.
+2. ~~Capture therapy OUT and a resumed/new session~~ — done night 3:
+   final save + commit on two session ends, honest decline on one, fb
+   record restored across reboot and served from capture start.
+3. ~~Exercise journal replay completion/integrity~~ — done night 3:
+   honest abort reporting verified; see the transport follow-up above.
+   `complete` replays validated byte count + SHA-256 end-to-end.
+4. Continue observing midpoint skew (night 3: +251 ms median, positive
+   bias all night — the sign flipped vs night 2's post-rotation negative
+   bias; no per-file calibration yet).
+5. Optional live check: portal catalog rebuild while listing/monitoring —
+   confirm stable PSRAM over repeated rebuilds (host-verified only so far).
+6. **BLE file downloads end-to-end** — needs the host BT adapter back
+   (reboot host): pull a full night's file set (~15 EDFs, ~2 MB) then a
+   larger multi-day batch; confirm zero reboots, zero wedge, sched 5 s
+   polls keep running throughout, and per-file SHA-256 verifies.
+   A multi-file smoke script could loop `--get` over `LIST_DAY` output.
+7. Journal replay replay-rate check — the pacing fix should lift the
+   ~57% abort rate seen night 3; rerun a few `--evidence` pulls.
 
 Verification: host tests, timing self-test, BLE stream self-test, and
-ESP-IDF build pass; `git diff --check` is clean. App size is `0x12fe90`
-with 70% partition free. No commit, push, or flash performed.
+ESP-IDF build pass; `git diff --check` is clean. Flashed and live-verified
+across a 6.3 h capture.
 
 ## FOLLOW-UP: catalog reinitialization leak — FIXED / HOST-VERIFIED
 
@@ -446,7 +584,7 @@ Regression and verification:
 - Standard host tests, timing self-test, BLE stream self-test, ESP-IDF build,
   and `git diff --check` pass. Latest app size is `0x12ff80`, 70% free.
 
-Remaining hardware check: after flashing when requested, repeat portal
-catalog rebuilds while listing/monitoring and confirm stable PSRAM and
-continued catalog reconstruction. Host stress tests do not replace this
-on-device check. No flash, commit, or push performed.
+Remaining hardware check: the fix is flashed; repeat portal catalog
+rebuilds while listing/monitoring and confirm stable PSRAM and continued
+catalog reconstruction. Host stress tests do not replace this on-device
+check. No commit or push performed.

@@ -38,6 +38,19 @@ dies mid-stream with `Serial data stream stopped` / `Packet content transfer
 stopped` — easy to misdiagnose as a bad cable or crash loop. Use bounded reads
 (`timeout N cat ...`) and make sure nothing holds the port before `flash`.
 
+**Board may stay in download mode after `flash`.** If the app doesn't come
+up (no advertisement, serial prints `waiting for download`), run any esptool
+op with `--after watchdog_reset`, e.g.
+`esptool.py --chip esp32s3 -p PORT --before default_reset --after watchdog_reset chip_id`
+— the watchdog reset resamples strap pins and boots the app. The port also
+re-enumerates between `/dev/ttyACM0` and `/dev/ttyACM1` on every reset, so
+tail whichever node is live (`/dev/serial/by-id/` is stable).
+
+**The host's Intel AX200 can hard-wedge under sustained BLE notify load**
+(stops scanning entirely; raw `hcitool lescan` → I/O error). Module reload,
+USB rebind, `authorized` toggle, and PCIe FLR do not recover it — only a
+host reboot. Have a fallback plan before running long download loops.
+
 ## BLE pairing / GATT testing (host side)
 
 `bluetoothctl` is unreliable for exercising the control characteristic — do
