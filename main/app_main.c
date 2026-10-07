@@ -372,6 +372,17 @@ void app_main(void)
                              MALLOC_CAP_INTERNAL),
                          xTaskGetHandle("ble_stream") != NULL,
                          itvl, tph, rph);
+                static const char *const tasks[] = {
+                    "main", "card", "nimble_host", "ble_tx",
+                    "ble_stream", "netw_reconn"
+                };
+                for (size_t i = 0; i < sizeof(tasks) / sizeof(tasks[0]); i++) {
+                    TaskHandle_t task = xTaskGetHandle(tasks[i]);
+                    if (task) {
+                        ESP_LOGI(TAG, "stack task=%s free_min=%u", tasks[i],
+                                 (unsigned)uxTaskGetStackHighWaterMark(task));
+                    }
+                }
                 if (!adv && !susp && ch == 0xFFFF) {
                     ESP_LOGI(TAG, "diag: re-arming advertising");
                     ble_svc_advertise();

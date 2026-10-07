@@ -412,6 +412,27 @@ static void test_paths(void)
           && !strcmp(out, "/"), "canon root -> /");
     CHECK(ezp_canon_to_logical("C:\\x", out, sizeof(out)) == 0,
           "non-canonical input -> empty");
+    char url[1152];
+    CHECK(ezp_build_card_url(url, sizeof(url), UINT32_C(0xc0a80401),
+          "download", "fname", "test.edf", "fdir", "..\\DATALOG") > 0,
+          "download URL built");
+    CHECK(!strcmp(url,
+          "http://192.168.4.1/download?fname=test.edf&fdir=..%5CDATALOG"),
+          "download URL includes equals for both query parameters");
+    CHECK(ezp_build_card_url(url, sizeof(url), UINT32_C(0xc0a80401),
+          "dir", "dir", "A:", NULL, NULL) > 0 &&
+          !strcmp(url, "http://192.168.4.1/dir?dir=A%3A"),
+          "single-query root URL");
+    CHECK(ezp_build_card_url(url, 24, UINT32_C(0xc0a80401),
+          "download", "fname", "test.edf", "fdir", "..\\DATALOG") < 0,
+          "URL truncation fails closed");
+    char long_query[220];
+    memset(long_query, ' ', sizeof(long_query) - 2);
+    long_query[sizeof(long_query) - 2] = 'x';
+    long_query[sizeof(long_query) - 1] = '\0';
+    CHECK(ezp_build_card_url(url, sizeof(url), UINT32_C(0xc0a80401),
+          "dir", "dir", long_query, NULL, NULL) > 600 &&
+          url[strlen(url) - 1] == 'x', "long encoded query is not clipped");
 }
 
 /* ---------------- catalog ---------------- */
@@ -650,6 +671,10 @@ static void test_therapy(void)
     therapy_on_quiet_round(131000000);
     CHECK(therapy_status()->state == THERAPY_OUT, "two rounds -> OUT");
     CHECK(therapy_status()->transfer_allowed, "OUT allows transfers");
+    therapy_tick(222000000);
+    CHECK(therapy_status()->state == THERAPY_UNKNOWN,
+          "stale OUT monitoring returns to UNKNOWN");
+    CHECK(!therapy_status()->transfer_allowed, "stale OUT blocks transfers");
 
     therapy_on_gap();
     CHECK(therapy_status()->state == THERAPY_UNKNOWN, "gap -> UNKNOWN");

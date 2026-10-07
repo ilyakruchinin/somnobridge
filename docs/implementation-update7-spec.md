@@ -300,6 +300,73 @@ defects:
   notification under sustained load (HCI RX overrun — documented
   AX200 hazard in AGENTS.md); `seq` counters make the loss visible and
   the host tool now reports it instead of silently corrupting decode.
-- File-transfer measurements are pending a `THERAPY_OUT` window (the
-  gate is holding because the card is actively logging — correct); a
-  background watcher runs the first real GET_FILE when it opens.
+- The initial week run collected 218 files / 16.48 MiB, but mixed builds
+  and reused verified downloads across reflashes. Only its final 72 files
+  were fetched on the final build from that run. Its driver checked SHA
+  but did not enforce all completion/length checks; this is not a clean
+  full-week certification of the subsequent audit fixes.
+
+## 16. Follow-up stack, lifecycle and throughput audit
+
+The audit retained internal EZShare paths and the POSIX wire surface.
+Additional fixes include owned/serialized deferred-indication buffers,
+retaining stream ownership until cancellation cleanup completes, bounded
+credit waits and ACK validation, explicit initial-credit errors with buffer
+cleanup, checked task creation, successful-generation-specific post-check
+callbacks, preserved callbacks during scheduler merges, and serialized queue
+snapshot/requeue operations. Monitoring freshness now ages OUT back to UNKNOWN.
+
+The 4 KiB HTTP chunk moved to PSRAM: GCC's download frame fell from 5,360
+bytes to 1,648 bytes before later instrumentation. Keep the 16 KiB task
+allocation; local frame sizes are not complete call-chain bounds. Inbound
+cJSON nesting is capped at 16, outbound ATT payload sizing at MTU 247.
+Observed compressed real-file stream high-water headroom improved to about
+5.8 KiB; these measurements do not prove every task/path cannot overflow.
+
+Empty cached days now return an empty list rather than relying on malloc(0).
+Live root listing uses EZShare's native `dir=A:` spelling while echoing `/`;
+`dir=A:\\` returned malformed HTML on this card. Both root listing and an
+empty-day response passed live checks. The generic URL formatter also lacked
+`=` before its second query value, producing `&fdir..…` and a 404 for the
+native download fallback. Formatting now has host regression coverage,
+complete percent-encoding buffers, and explicit truncation failure. The
+corrected native download form still needs a quiet-card live comparison.
+
+The host retains completed-response state after consuming a result, filters
+D-Bus signals by characteristic path, unregisters its receiver on close,
+waits for a redundant END after fragment poisoning, and ignores duplicate
+BEGIN messages during collection. Legacy holes are rejected rather than
+zero-filled; odd delta16 tails work in the optional NumPy path. Files are
+saved only after transport, source/activity, decoded/encoded counts, exact
+Content-Length where available, and SHA checks all pass. Legacy evidence
+uses kind 9; file END flags mark EOF rather than every HTTP chunk.
+
+Measured on the same 607,226-byte file (252,008 encoded bytes):
+
+| condition | HTTP read waiting | downstream sink | device SHA updates | host SHA |
+|-----------|-------------------|-----------------|--------------------|----------|
+| compressed real GET_FILE | 43.327 s | 6.650 s | 0.164 s | 0.0013 s |
+| modem sleep disabled | 40.920 s | 7.111 s | 0.152 s | 0.0012 s |
+| read/discard, BLE connected | 45.005 s | 0.176 s | 0.169 s | n/a |
+| read/discard, BLE disconnected | 40.001 s | 0.170 s | 0.161 s | n/a |
+
+SHA is included in sink time; compression and BLE pacing are also included
+for a real transfer. Modem-sleep disabling did not demonstrate a material
+improvement and was reverted. All isolated reads matched the real-transfer
+SHA. Slow reception persists without BLE streaming or a connected BLE peer;
+this localizes the problem to the card/WiFi/TCP/HTTP receive path, not SHA
+or simply notification backpressure. It does not establish the card's
+maximum capability or explain the underlying TCP/server behavior.
+
+`SOMNOBRIDGE_HTTP_AUDIT=ON` enables a temporary authenticated read/discard
+`HTTP_TEST` diagnostic. It deliberately denies file-completion permission,
+can finish a diagnostic read after the test client disconnects, and must be
+OFF in the final image. Normal firmware exposes no such operation.
+
+Live checks passed deep-JSON rejection, duplicate-day preparation, three
+abort/recovery cycles and explicit no-credit timeout, with no recorded panic
+or stack overflow. Repeated-file validation stopped when actual therapy
+began: transport returned bytes but completion permission was correctly
+denied, and subsequent GET_FILE was gated. Remaining final-build retrieval,
+throughput and soak checks require THERAPY_OUT; do not bypass it or describe
+this partial run as a complete certification.

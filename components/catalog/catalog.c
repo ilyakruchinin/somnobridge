@@ -601,7 +601,9 @@ int cat_day_entries(const char day[CAT_DAY_STR],
         n = f->n_files;
         if (out) {
             int cp = n < cap ? n : cap;
-            memcpy(out, f->files, cp * sizeof(cat_file_t));
+            if (cp > 0) {
+                memcpy(out, f->files, cp * sizeof(cat_file_t));
+            }
         }
     } else if (f) {
         n = -(int)f->state - 1;   /* negative encodes unavailability  */

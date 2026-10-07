@@ -142,7 +142,10 @@ One stream at a time (`BUSY` otherwise). Lifecycle:
    while `sent < offset + window`; stale ACKs only widen the edge, so
    send them freely (write-without-response is accepted and preferred).
    Grant the first credit immediately after `STREAM_BEGIN` — the
-   sender waits for it.
+   sender waits for it. Windows above 65,536 bytes and offsets beyond
+   bytes sent are ignored; the effective outstanding window is capped
+   at 11,520 bytes to preserve control-buffer headroom. A credit stall
+   is bounded to 10 seconds.
 4. Payload arrives on Data as notifications.
 5. Device indicates `STREAM_END` (a `JSON_RESPONSE`): `ok`,
    `actual_bytes` (raw), `encoded_bytes`/`listed_size`/`content_length`,
@@ -150,9 +153,27 @@ One stream at a time (`BUSY` otherwise). Lifecycle:
    `blocks{raw,def,d16}`, `stall_ms`, `retry_ms`, `encode_ms`, file-only
    `source_unchanged`/`therapy_status`/`completion_allowed`, `error`.
    **`STREAM_END` is emitted twice ~300 ms apart** — see §8.
+   File diagnostics additionally report `sha_us`, `http_header_us`,
+   `http_read_us`, `http_sink_us`, and `http_reads`. HTTP read time excludes
+   the sink callback; sink time includes SHA, encoding and BLE pacing.
+   `encode_ms` also includes the final partial-block flush, so the timing
+   counters are not independent quantities to sum indiscriminately.
+
+A file may be published only if both response/transport `ok` and
+`completion_allowed` are true, `source_unchanged` and `monitoring_checked`
+are true, decoded raw and encoded byte counts match the verdict, the exact
+Content-Length matches when available, and SHA-256 matches with no sequence
+or decode errors. The listed size may be rounded: use `size_unit_shift`,
+not exact equality to `listed_size`. A matching hash alone does not prove
+source immutability or successful post-checks.
 
 `ABORT` (kind 5) with the stream's `request_id` cancels mid-flight.
-Disconnect aborts the stream.
+Disconnect aborts the stream. Aborting requests cancellation; the stream
+remains `BUSY` until its worker releases the old buffers/state. An initial
+credit timeout is an explicit `STREAM_END` error, not a silent idle transition.
+
+Inbound JSON parsing is limited to 16 nesting levels to bound parser stack
+use. Outbound ATT payloads use at most MTU 247 even if a larger MTU is negotiated.
 
 ### Wire 1 (legacy, default)
 
@@ -204,7 +225,10 @@ epoch:u32`). Device answers `{"accepted":bool,"reason","uncertainty_us",
   `off==0 && FLAG_START` — a duplicated tail fragment must not reopen
   reassembly. Conversely, a fresh `FLAG_START` on a poisoned/lost
   rid clears the poison: treat it as a device resend (this is how the
-  duplicated `STREAM_END` heals a damaged first copy).
+  duplicated `STREAM_END` heals a damaged first copy). Retain completed-id
+  state after consuming a response, not only while it is queued. Ignore
+  duplicate `STREAM_BEGIN` messages during collection, and allow the
+  redundant `STREAM_END` to repair a poisoned first copy before aborting.
 - Verify `sha256` over raw bytes; compare `frames` vs unique-seq count
   to detect in-flight loss.
 - Expect JSON numbers-as-strings for ≥32-bit quantities.

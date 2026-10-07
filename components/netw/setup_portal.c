@@ -89,9 +89,13 @@ static esp_err_t read_body(httpd_req_t *r, char *buf, size_t cap)
         send_json(r, 400, "{\"ok\":false,\"error\":\"body_size\"}");
         return ESP_FAIL;
     }
-    int got = httpd_req_recv(r, buf, r->content_len);
-    if (got <= 0) {
-        return ESP_FAIL;
+    size_t got = 0;
+    while (got < r->content_len) {
+        int n = httpd_req_recv(r, buf + got, r->content_len - got);
+        if (n <= 0) {
+            return ESP_FAIL;
+        }
+        got += (size_t)n;
     }
     buf[got] = '\0';
     return ESP_OK;

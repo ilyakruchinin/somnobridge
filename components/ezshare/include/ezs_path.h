@@ -69,6 +69,11 @@ bool ezp_datalog_day(const char *canon_dir, char day[9]);
 /** Percent-encode one query value, once (everything but unreserved). */
 size_t ezp_urlencode(const char *in, char *out, size_t cap);
 
+int ezp_build_card_url(char *out, size_t cap, uint32_t card_ip,
+                       const char *endpoint,
+                       const char *q1_name, const char *q1_val,
+                       const char *q2_name, const char *q2_val);
+
 #ifdef __cplusplus
 }
 #endif

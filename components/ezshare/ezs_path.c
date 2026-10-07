@@ -9,6 +9,7 @@
  */
 #include <ctype.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "ezs_path.h"
 
@@ -265,4 +266,36 @@ size_t ezp_urlencode(const char *in, char *out, size_t cap)
         out[w] = '\0';
     }
     return w;
+}
+
+int ezp_build_card_url(char *out, size_t cap, uint32_t card_ip,
+                       const char *endpoint,
+                       const char *q1_name, const char *q1_val,
+                       const char *q2_name, const char *q2_val)
+{
+    char e1[1024], e2[1024];
+    if (!out || !cap || !endpoint || !q1_name || !q1_val ||
+        (q2_val && !q2_name) ||
+        strlen(q1_val) > (sizeof(e1) - 1) / 3 ||
+        (q2_val && strlen(q2_val) > (sizeof(e2) - 1) / 3)) {
+        return -1;
+    }
+    ezp_urlencode(q1_val, e1, sizeof(e1));
+    if (q2_val) {
+        ezp_urlencode(q2_val, e2, sizeof(e2));
+    }
+    int n = snprintf(out, cap,
+                    "http://%lu.%lu.%lu.%lu/%.16s?%.16s=%s%s%.16s%s%s",
+                    (unsigned long)(card_ip >> 24),
+                    (unsigned long)(card_ip >> 16) & 255,
+                    (unsigned long)(card_ip >> 8) & 255,
+                    (unsigned long)card_ip & 255,
+                    endpoint, q1_name, e1,
+                    q2_val ? "&" : "", q2_val ? q2_name : "",
+                    q2_val ? "=" : "", q2_val ? e2 : "");
+    if (n < 0 || (size_t)n >= cap) {
+        out[0] = '\0';
+        return -1;
+    }
+    return n;
 }

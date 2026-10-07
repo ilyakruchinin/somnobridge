@@ -60,6 +60,7 @@ bool      ble_svc_pin_take_request(char *code, size_t len);
 void      ble_svc_stream_abort(uint32_t request_id, const char *why);
 bool      ble_svc_send_bytes(const uint8_t *data, uint16_t len);
 bool      ble_svc_control_indicate(const uint8_t *data, uint16_t len);
+bool      ble_svc_control_subscribed(void);
 
 /* connection props for the streaming sender */
 uint16_t  ble_svc_att_mtu(void);

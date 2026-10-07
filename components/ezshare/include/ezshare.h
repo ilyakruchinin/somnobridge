@@ -29,6 +29,11 @@ typedef struct {
     ezs_err_t parse;         /* parser result for listings         */
     uint32_t body_bytes;     /* bytes received                     */
     int64_t  content_length; /* exact announced length, -1 unknown  */
+    int64_t  header_us;
+    int64_t  read_us;
+    int64_t  sink_us;
+    uint32_t read_calls;
+    uint8_t  download_form;
 } ezw_obs_t;
 
 /** Configure the card host once per association (host-order IPv4). */
@@ -67,7 +72,7 @@ esp_err_t ezs_client_version(char *buf, size_t cap, ezw_obs_t *obs);
 typedef bool (*ezs_sink_t)(const uint8_t *data, size_t len, void *ctx);
 esp_err_t ezs_download(const char *canon_dir, const char *name,
                        const char *dl_name, uint64_t listed_size,
-                       uint8_t size_unit_shift,
+                       uint8_t size_unit_shift, uint8_t first_form,
                        ezs_sink_t sink, void *ctx, ezw_obs_t *obs);
 
 #ifdef __cplusplus

@@ -34,20 +34,8 @@ static int build_url(char *out, size_t cap, const char *endpoint,
                      const char *q1_name, const char *q1_val,
                      const char *q2_name, const char *q2_val)
 {
-    char e1[512], e2[512];
-    ezp_urlencode(q1_val, e1, sizeof(e1));
-    if (q2_val) {
-        ezp_urlencode(q2_val, e2, sizeof(e2));
-    }
-    return snprintf(out, cap,
-                    "http://%lu.%lu.%lu.%lu/%.16s?%.16s=%.500s%s%.16s%s",
-                    (unsigned long)(s_card_ip >> 24),
-                    (unsigned long)(s_card_ip >> 16) & 255,
-                    (unsigned long)(s_card_ip >> 8) & 255,
-                    (unsigned long)s_card_ip & 255,
-                    endpoint, q1_name, e1,
-                    q2_val ? "&" : "", q2_val ? q2_name : "",
-                    q2_val ? e2 : "");
+    return ezp_build_card_url(out, cap, s_card_ip, endpoint,
+                              q1_name, q1_val, q2_name, q2_val);
 }
 
 /* Map the canonical dir to the card's fdir spelling (spec §11.1):
@@ -132,7 +120,12 @@ esp_err_t ezs_list_dir(const char *canon_dir,
     }
 
     char url[1152];
-    build_url(url, sizeof(url), "dir", "dir", canon_dir, NULL, NULL);
+    if (build_url(url, sizeof(url), "dir", "dir",
+                  !strcmp(canon_dir, "A:\\") ? "A:" : canon_dir,
+                  NULL, NULL) < 0) {
+        obs->transport = ESP_ERR_INVALID_ARG;
+        return ESP_ERR_INVALID_ARG;
+    }
 
     obs->req_start_us = esp_timer_get_time();
     esp_http_client_handle_t c = open_get(url, false, obs);
@@ -277,13 +270,13 @@ static esp_http_client_handle_t dl_get(const char *url, ezw_obs_t *obs)
 
 esp_err_t ezs_download(const char *canon_dir, const char *name,
                        const char *dl_name, uint64_t listed_size,
-                       uint8_t size_unit_shift,
+                       uint8_t size_unit_shift, uint8_t first_form,
                        ezs_sink_t sink, void *ctx, ezw_obs_t *obs)
 {
     memset(obs, 0, sizeof(*obs));
     obs->content_length = -1;
     /* dl_name (the listing's own ?file= token) is the last-resort form */
-    if (!sink || !name) {
+    if (!sink || !name || first_form > 1) {
         return ESP_ERR_INVALID_ARG;
     }
     if (ezp_validate_name(name) != EZP_OK) {
@@ -298,7 +291,8 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
     char url[1152];
     esp_http_client_handle_t c = NULL;
     obs->req_start_us = esp_timer_get_time();
-    for (int form = 0; form < 3 && !c; form++) {
+    for (int attempt = 0; attempt < 3 && !c; attempt++) {
+        int form = attempt < 2 ? (attempt ^ first_form) : 2;
         if (form == 2) {
             /* card's own listing href verbatim: file=<dir>\<dl_name> —
              * kept as last resort; EZShare may only accept the alias
@@ -309,22 +303,29 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
             char fpath[368];
             snprintf(fpath, sizeof(fpath), "%.320s\\%s",
                      canon_dir + 3, dl_name);
-            build_url(url, sizeof(url), "download", "file", fpath,
-                      NULL, NULL);
+            if (build_url(url, sizeof(url), "download", "file", fpath,
+                          NULL, NULL) < 0) {
+                return ESP_ERR_INVALID_ARG;
+            }
         } else if (form == 0) {
             char fpath[368];
             /* card expects a root-relative path: DATALOG\...\name
              * (canon_dir is "A:\DATALOG\..." — skip "A:\", 3 chars)   */
             snprintf(fpath, sizeof(fpath), "%.320s\\%s",
                      canon_dir + 3, name);
-            build_url(url, sizeof(url), "download", "file", fpath,
-                      NULL, NULL);
+            if (build_url(url, sizeof(url), "download", "file", fpath,
+                          NULL, NULL) < 0) {
+                return ESP_ERR_INVALID_ARG;
+            }
         } else {
             char fdir[320];
             canon_to_fdir(canon_dir, fdir, sizeof(fdir));
-            build_url(url, sizeof(url), "download",
-                      "fname", name, "fdir", fdir);
+            if (build_url(url, sizeof(url), "download",
+                          "fname", name, "fdir", fdir) < 0) {
+                return ESP_ERR_INVALID_ARG;
+            }
         }
+        obs->download_form = (uint8_t)form;
         c = dl_get(url, obs);
         if (c && esp_http_client_get_status_code(c) != 200) {
             ESP_LOGW(TAG, "form %d status=%d url=%.96s", form,
@@ -340,6 +341,7 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
         return obs->http_status > 0
                    ? ESP_ERR_HTTP_BASE + obs->http_status : ESP_FAIL;
     }
+    obs->header_us = esp_timer_get_time() - obs->req_start_us;
     obs->http_status = esp_http_client_get_status_code(c);
     int64_t clen = esp_http_client_get_content_length(c);
     obs->content_length = clen;
@@ -355,12 +357,21 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    uint8_t chunk[BODY_CHUNK_CAP];
+    uint8_t *chunk = heap_caps_malloc(BODY_CHUNK_CAP, MALLOC_CAP_SPIRAM);
+    if (!chunk) {
+        esp_http_client_cleanup(c);
+        s_dl_client = NULL;
+        obs->resp_end_us = esp_timer_get_time();
+        return ESP_ERR_NO_MEM;
+    }
     uint64_t sent = 0;
     uint64_t bound = clen >= 0 ? (uint64_t)clen : listed_size;
     bool ok = true;
     for (;;) {
-        int r = esp_http_client_read(c, (char *)chunk, sizeof(chunk));
+        int64_t t0 = esp_timer_get_time();
+        int r = esp_http_client_read(c, (char *)chunk, BODY_CHUNK_CAP);
+        obs->read_us += esp_timer_get_time() - t0;
+        obs->read_calls++;
         if (r < 0) {
             ok = false;
             break;
@@ -375,7 +386,10 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
             ok = false;               /* grew mid-transfer           */
             break;
         }
-        if (!sink(chunk, r, ctx)) {
+        t0 = esp_timer_get_time();
+        bool accepted = sink(chunk, r, ctx);
+        obs->sink_us += esp_timer_get_time() - t0;
+        if (!accepted) {
             ok = false;
             break;                    /* client aborted              */
         }
@@ -383,6 +397,7 @@ esp_err_t ezs_download(const char *canon_dir, const char *name,
     }
     obs->resp_end_us = esp_timer_get_time();
     obs->body_bytes = sent;
+    heap_caps_free(chunk);
     if (ok) {
         /* fully consumed response: keep the handle for keep-alive
          * reuse by the next ezs_download()                          */

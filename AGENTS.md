@@ -173,6 +173,15 @@ completion, byte-count/SHA-256 validation, and malformed-record rejection.
 and stale-frame handling without connecting to a device; it needs the same
 `python3-dbus` and `python3-gi` imports as the query tool.
 
+Target stack audit: `./scripts/idf.sh -D SOMNOBRIDGE_STACK_AUDIT=ON build`
+produces GCC `.su` files alongside component objects. These report local
+frames, not complete task call chains; ROM/newlib frames and callback
+nesting still need live high-water measurements. The 10-second diagnostics
+now include `stack task=... free_min=...` in ESP-IDF byte units. Exercise
+real HTTP transfers, compressed streams, evidence, drift/status requests,
+and abort/reconnect paths; synthetic streams alone do not cover HTTP.
+Disable the audit flag with `-D SOMNOBRIDGE_STACK_AUDIT=OFF` if desired.
+
 The host suite does not compile `components/scheduler/sched.c`. For queue
 changes, also check target stack frames: the card task has a 16 KiB stack,
 and nested planner/submit frames count together. Keep queue snapshots off

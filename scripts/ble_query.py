@@ -78,6 +78,7 @@ class SomnoBridge:
         self.ctrl_path = self.data_path = None
         self._ctrl = self._data = None
         self._rx = {}                   # rid -> bytearray (JSON reassembly)
+        self._rx_completed = {}
         self._rx_poisoned = set()       # rids with a lost fragment
         self._done = {}                 # rid -> decoded JSON string
         self._time_reply = {}           # rid -> raw TIME_REPLY payload
@@ -179,7 +180,7 @@ class SomnoBridge:
 
         self.bus.add_signal_receiver(
             self._on_value, signal_name="PropertiesChanged",
-            dbus_interface="org.freedesktop.DBus.Properties")
+            dbus_interface="org.freedesktop.DBus.Properties", path_keyword="path")
         self._ctrl = dbus.Interface(self.bus.get_object("org.bluez",
                                                         self.ctrl_path),
                                     "org.bluez.GattCharacteristic1")
@@ -197,7 +198,9 @@ class SomnoBridge:
 
     # ---------- inbound ----------
 
-    def _on_value(self, interface, changed, invalidated):
+    def _on_value(self, interface, changed, invalidated, path=None):
+        if path is not None and path not in (self.ctrl_path, self.data_path):
+            return
         if "Value" not in changed:
             return
         data = bytes(bytearray(changed["Value"]))
@@ -205,7 +208,7 @@ class SomnoBridge:
             return
         # compact stream-data frame: [ver][kind=10][seq:u16][payload]
         if data[0] == 1 and data[1] == K_STREAM_DATA:
-            if not self._stream_open:
+            if not self._stream_open or len(data) < CHDR_LEN:
                 return
             seq = data[2] | (data[3] << 8)
             self._stream_frames += 1
@@ -233,11 +236,14 @@ class SomnoBridge:
         payload = data[HDR_LEN:]
 
         if kind == K_JSON_RESP:
-            if rid in self._done and not (off == 0 and flags & FLAG_START):
+            if rid in self._rx_completed and not (off == 0 and flags & FLAG_START):
                 # duplicate delivery of a tail fragment after the
                 # message completed — ignore rather than reopen a
                 # buffer and poison the finished response
                 return
+            if off == 0 and flags & FLAG_START:
+                self._rx_completed.pop(rid, None)
+                self._rx[rid] = bytearray()
             buf = self._rx.setdefault(rid, bytearray())
             if off == 0 and flags & FLAG_START and rid in self._rx_poisoned:
                 # device retried the whole message (STREAM_END resend):
@@ -259,6 +265,9 @@ class SomnoBridge:
                     self._done[rid] = \
                         bytes(buf).decode("utf-8", "replace")
                 self._rx.pop(rid, None)
+                self._rx_completed[rid] = True
+                if len(self._rx_completed) > 256:
+                    self._rx_completed.pop(next(iter(self._rx_completed)))
         elif kind == K_TIME_REPLY:
             # t4 = receipt of the *complete* reply (§8.1) — stamp UTC and
             # monotonic together here, not after the pump loop.
@@ -267,10 +276,16 @@ class SomnoBridge:
         elif kind in (K_FILE_BYTES, K_EV_BYTES):
             if not self._stream_open or rid != self._stream_rid:
                 return
-            if off > len(self._stream):
-                self._stream.extend(b"\x00" * (off - len(self._stream)))
-            self._stream[off:off + len(payload)] = payload
-            self._stream_bytes = max(self._stream_bytes, off + len(payload))
+            if off != len(self._stream):
+                if off + len(payload) <= len(self._stream) and \
+                        self._stream[off:off + len(payload)] == payload:
+                    self._dup_frames += 1
+                else:
+                    self._seq_errors += 1
+                return
+            self._stream += payload
+            self._stream_frames += 1
+            self._stream_bytes = len(self._stream)
             # Do NOT write from inside the signal handler: a blocking
             # D-Bus call here stalls dispatch and loses signals. Flag it
             # and let the stream loop send the credit update instead.
@@ -513,11 +528,13 @@ class SomnoBridge:
                 if rid in self._done:          # STREAM_END
                     raw_end = self._done.pop(rid)
                     if raw_end is None:
-                        self._stream_end = {"ok": False,
-                                            "error": "fragment_lost"}
+                        continue
                     else:
                         try:
-                            self._stream_end = json.loads(raw_end)
+                            parsed = json.loads(raw_end)
+                            if parsed.get("op") == "STREAM_BEGIN":
+                                continue
+                            self._stream_end = parsed
                         except ValueError:
                             self._stream_end = {"ok": False,
                                                 "error": "bad_end",
@@ -542,7 +559,7 @@ class SomnoBridge:
     def _inv_delta16(b):
         """LE u16 running-sum reconstruction of a delta16 block."""
         if _np is not None:
-            a = _np.frombuffer(b, dtype="<u2").copy()
+            a = _np.frombuffer(b[:len(b) & ~1], dtype="<u2").copy()
             _np.cumsum(a, dtype=_np.uint16, out=a)
             out = a.tobytes()
             if len(b) & 1:
@@ -604,8 +621,9 @@ class SomnoBridge:
         res["begin"] = begin
         return res
 
-    def get_file(self, directory, name, expected_size=None, timeout=120.0):
-        args = {"directory": directory, "name": name, "v2": True}
+    def get_file(self, directory, name, expected_size=None, timeout=120.0,
+                 v2=True):
+        args = {"directory": directory, "name": name, "v2": v2}
         if expected_size is not None:
             args["expected_size"] = str(expected_size)
         for attempt in range(3):
@@ -633,7 +651,36 @@ class SomnoBridge:
                         res["wire"], {"raw": 0}
                     res["wire_consumed"] = len(res["wire"])
             res["begin"] = begin
+            res.setdefault("raw", b"")
+            res["verified"] = self._file_verified(res)
             return res
+
+    @staticmethod
+    def _file_verified(res):
+        begin = (res.get("begin") or {}).get("result") or {}
+        end = (res.get("end") or {}).get("result") or {}
+        raw, wire = res.get("raw", b""), res.get("wire", b"")
+        try:
+            actual = int(end.get("actual_bytes", -1))
+            encoded = int(end.get("encoded_bytes", -1))
+            clen = int(end.get("content_length", -1))
+            listed = int(begin.get("listed_size", -1))
+            shift = int(begin.get("size_unit_shift", -1))
+        except (ValueError, TypeError):
+            return False
+        return bool((res.get("end") or {}).get("ok") and
+                    end.get("ok") is True and
+                    end.get("completion_allowed") is True and
+                    end.get("source_unchanged") is True and
+                    end.get("monitoring_checked") is True and
+                    len(raw) == actual and len(wire) == encoded and
+                    (clen < 0 or clen == len(raw)) and
+                    0 <= shift <= 30 and
+                    len(raw) <= listed < len(raw) + (1 << shift) and
+                    res.get("wire_consumed") == len(wire) and
+                    res.get("seq_errors", 0) == 0 and
+                    not res.get("decode_error") and
+                    hashlib.sha256(raw).hexdigest() == end.get("sha256"))
 
     def _decode_guarded(self, res):
         """Decode wire-v2 blocks; a host-side lost notification
@@ -679,6 +726,10 @@ class SomnoBridge:
                 self._data.StopNotify()
         except dbus.exceptions.DBusException:
             pass
+        finally:
+            self.bus.remove_signal_receiver(
+                self._on_value, signal_name="PropertiesChanged",
+                dbus_interface="org.freedesktop.DBus.Properties")
 
 
 # ---------- formatting ----------
@@ -1023,6 +1074,8 @@ def self_test():
         dev.ctrl_path = dev._ctrl = None
         dev._done = {}
         dev._rx = {}
+        dev._rx_poisoned = set()
+        dev._rx_completed = {}
         return dev
 
     begin = {"ok": True, "result": {"truncated": False, "wire": 2}}
@@ -1084,6 +1137,67 @@ def self_test():
     enc = co.compress(b"\x01\x00\x04\x00\xfe\xff\xff\xff") + co.flush()
     e = dev._decode_wire(BLK_HDR.pack(2, 1, 0, 8, len(enc)) + enc)
     assert e[0] == raw
+    odd = b"\x01\x00\x05\x00\x7f"
+    assert dev._inv_delta16(odd) == b"\x01\x00\x06\x00\x7f"
+    dev = client()
+    dev._stream_open_op = Mock(side_effect=[
+        (40, {"ok": False, "error": {"code": "BUSY"}}, 10),
+        (41, {"ok": False, "error": {"code": "STALE"}}, 10),
+        (42, begin, 10)])
+    dev._stream_collect = Mock(return_value={"wire": blk(b"current"),
+                                             "end": end})
+    with patch(__name__ + ".time.sleep") as sleep:
+        downloaded = dev.get_file("/DATALOG/20240101", "test.edf")
+    assert downloaded["raw"] == b"current"
+    assert sleep.call_args_list[0].args == (1.5,)
+    assert sleep.call_args_list[1].args == (12,)
+    assert dev._stream_open_op.call_count == 3
+    dev = client()
+    first = frame(K_JSON_RESP, 42, 0, FLAG_START, b'{"ok":')
+    tail = frame(K_JSON_RESP, 42, 6, FLAG_END, b'true}')
+    dev._on_value(None, {"Value": first}, [])
+    dev._on_value(None, {"Value": tail}, [])
+    assert json.loads(dev._done.pop(42))["ok"]
+    dev._on_value(None, {"Value": tail}, [])
+    assert 42 not in dev._done and 42 not in dev._rx
+    verified = {
+        "begin": {"result": {"listed_size": "7", "size_unit_shift": 0}},
+        "end": {"ok": True, "result": {
+            "ok": True, "completion_allowed": True,
+            "source_unchanged": True, "monitoring_checked": True,
+            "actual_bytes": "7", "encoded_bytes": "7", "content_length": "7",
+            "sha256": hashlib.sha256(b"current").hexdigest()}},
+        "raw": b"current", "wire": b"current", "wire_consumed": 7,
+        "seq_errors": 0}
+    assert dev._file_verified(verified)
+    for flag in ("ok", "completion_allowed", "source_unchanged", "monitoring_checked"):
+        verified["end"]["result"][flag] = False
+        assert not dev._file_verified(verified)
+        verified["end"]["result"][flag] = True
+    verified["seq_errors"] = 1
+    assert not dev._file_verified(verified)
+    verified["seq_errors"] = 0
+    verified["end"]["result"]["encoded_bytes"] = "8"
+    assert not dev._file_verified(verified)
+    dev = client()
+    calls = 0
+    def retry_pump(seconds):
+        nonlocal calls
+        if not dev._stream_open:
+            dev._done[42] = json.dumps(begin)
+        else:
+            if calls == 0:
+                dev._on_value(None, {"Value": cframe(0, blk(b"current"))}, [])
+                dev._done[42] = json.dumps({"op": "STREAM_BEGIN", **begin})
+            elif calls == 1:
+                dev._done[42] = None
+            else:
+                dev._done[42] = json.dumps(end)
+            calls += 1
+    dev._pump = retry_pump
+    with patch(__name__ + ".time.monotonic", return_value=0):
+        replay = dev.evidence()
+    assert calls == 3 and replay["raw"] == b"current" and replay["end"] == end
     print("BLE stream self-tests passed")
 
 
@@ -1221,10 +1335,10 @@ def main():
             files = []
             for p in paths:
                 parts = [c for c in re.split(r"[\\/]", p) if c]
-                if len(parts) < 2:
+                if not parts:
                     sys.exit("--get needs DIR/NAME "
                              "(e.g. /DATALOG/20261005/x.edf)")
-                files.append(("\\".join(parts[:-1]), parts[-1]))
+                files.append(("\\".join(parts[:-1]) or "/", parts[-1]))
             # batch pre-refresh: queue rescans for every stale DATALOG
             # day in one shot instead of a 12 s STALE retry each
             days = [d.split("\\")[-1] for d, _ in files
@@ -1242,7 +1356,7 @@ def main():
             n_ok = 0
             for i, (directory, name) in enumerate(files):
                 t0 = time.monotonic()
-                r = dev.get_file(directory, name,
+                r = dev.get_file(directory, name, v2=not args.v1,
                                  timeout=max(args.timeout * 6, 120))
                 elapsed = time.monotonic() - t0
                 end = (r.get("end") or {}).get("result") or {}
@@ -1252,7 +1366,7 @@ def main():
                 sha_ok = sha == end.get("sha256")
                 bytes_ok = str(len(raw)) == end.get("actual_bytes")
                 enc_ok = str(len(wire)) == end.get("encoded_bytes")
-                ok = bool(end.get("ok")) and sha_ok and bytes_ok
+                ok = r.get("verified", False)
                 tot_raw += len(raw)
                 tot_wire += len(wire)
                 n_ok += ok

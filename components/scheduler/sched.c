@@ -22,6 +22,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 /* bounded copy that always NUL-terminates; GCC 14 promotes the
  * truncating forms (strncpy cap-1 / snprintf %s) to errors            */
@@ -63,6 +64,8 @@ typedef struct {
 
 static QueueHandle_t s_q;
 static qjob_t *s_jobs;
+static StaticSemaphore_t s_q_mutex_buf;
+static SemaphoreHandle_t s_q_mutex;
 static volatile bool s_link_up;
 static int64_t  s_last_req_us;
 static int64_t  s_next_cover_us;
@@ -815,6 +818,7 @@ static void plan_cold(int64_t now)
 
 esp_err_t sched_init(void)
 {
+    s_q_mutex = xSemaphoreCreateMutexStatic(&s_q_mutex_buf);
     s_q = xQueueCreate(Q_LEN, sizeof(qjob_t));
     if (!s_q) {
         return ESP_ERR_NO_MEM;
@@ -881,7 +885,7 @@ static void q_drop(qjob_t *j, esp_err_t err)
  * unrelated work fails honestly and its owner is notified.           */
 esp_err_t sched_submit(const sched_job_t *job)
 {
-    if (!job) return ESP_ERR_INVALID_ARG;
+    if (!job || !s_q) return ESP_ERR_INVALID_ARG;
     qjob_t q = {
         .kind = job->kind, .prio = job->prio, .ctx = job->ctx,
         .done = job->done, .min_gap_us = job->min_gap_us,
@@ -903,8 +907,15 @@ esp_err_t sched_submit(const sched_job_t *job)
     int n = 0;
     bool merged = false;
     qjob_t old;
+    xSemaphoreTake(s_q_mutex, portMAX_DELAY);
     while (n < Q_LEN && xQueueReceive(s_q, &old, 0) == pdTRUE) {
-        if (!merged && q_same_target(&old, &q)) {
+        if (!merged && q_same_target(&old, &q) &&
+            (!old.done || !q.done ||
+             (old.done == q.done && old.ctx == q.ctx))) {
+            if (q.done) {
+                old.done = q.done;
+                old.ctx = q.ctx;
+            }
             if (q.prio < old.prio) old.prio = q.prio;
             if (q.min_gap_us && (!old.min_gap_us ||
                                  q.min_gap_us < old.min_gap_us)) {
@@ -935,6 +946,7 @@ esp_err_t sched_submit(const sched_job_t *job)
             err = ESP_ERR_NO_MEM;
         }
     }
+    xSemaphoreGive(s_q_mutex);
     free(held);
 #if !defined(CONFIG_HEAP_POISONING_DISABLED)
     ESP_LOGI(TAG, "heap_ck submit k=%d: %s", (int)job->kind,
@@ -1091,12 +1103,16 @@ void sched_run_forever(void)
 
         qjob_t *jobs = s_jobs;
         qjob_t first;
-        bool have = xQueueReceive(s_q, &first, pdMS_TO_TICKS(50)) == pdTRUE;
+        xSemaphoreTake(s_q_mutex, portMAX_DELAY);
+        bool have = xQueueReceive(s_q, &first, 0) == pdTRUE;
         s_diag_stage = 4;
         int njobs = 0;
         if (have) {
             jobs[njobs++] = first;
             njobs += q_drain(jobs + njobs, Q_LEN - njobs);
+        } else {
+            xSemaphoreGive(s_q_mutex);
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
 
         if (!have && now >= s_next_plan_us) {
@@ -1126,6 +1142,7 @@ void sched_run_forever(void)
         int pick = q_pick(jobs, njobs, now, &next_when);
         if (pick < 0) {
             q_requeue(jobs, njobs, -1);
+            xSemaphoreGive(s_q_mutex);
             int64_t wait = next_when > now ? next_when - now : 1000;
             if (wait > 500000) wait = 500000;
             vTaskDelay(pdMS_TO_TICKS(wait / 1000 + 1));
@@ -1135,6 +1152,7 @@ void sched_run_forever(void)
         s_diag_stage = 6;
         s_diag_picked_kind = (int)j.kind;
         q_requeue(jobs, njobs, pick);
+        xSemaphoreGive(s_q_mutex);
 
         /* update6: no cumulative request budget gates card I/O — the
          * per-request spacing, service-time, backoff, and one-in-

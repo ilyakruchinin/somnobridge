@@ -5,6 +5,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #include "ble_proto.h"
 #include "ble_svc.h"
@@ -47,7 +48,10 @@ static uint32_t     s_resp_id;
 
 /* outbound stream state (one at a time) */
 static struct {
-    bool        active;
+    atomic_bool active;
+    atomic_bool cancelled;
+    bool        http_only;
+    uint8_t     http_first_form;
     uint32_t    request_id;
     char        canon_dir[280];
     char        name[EZS_NAME_MAX];
@@ -60,6 +64,8 @@ static struct {
     uint64_t    limit;         /* right-edge credit: contig+window  */
     uint32_t    stall_ms;      /* diag: ms spent waiting for credit */
     uint32_t    retry_ms;      /* diag: ms spent in send retries    */
+    int64_t     sha_us;
+    ezw_obs_t   fetch_obs;
     char        src_stamp[EZS_STAMP_MAX];
     bool        has_src_stamp;
     char        day[CAT_DAY_STR];
@@ -76,6 +82,15 @@ static struct {
 } s_stream;
 
 static TaskHandle_t s_ble_task;
+static portMUX_TYPE s_stream_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint64_t stream_limit(void)
+{
+    portENTER_CRITICAL(&s_stream_mux);
+    uint64_t limit = s_stream.limit;
+    portEXIT_CRITICAL(&s_stream_mux);
+    return limit;
+}
 
 /* Wire bytes accumulate into s_pend until a full notification is
  * ready — the receiver never sees a short frame in the middle of a
@@ -87,14 +102,15 @@ static uint32_t s_frames_sent;     /* device-side notify count       */
 
 /* post-download verification rescan: the JOB_DAY completion callback
  * flips this — no fixed settle delay (update7 §10.3)               */
-static volatile bool s_scan_done;
+static atomic_bool s_scan_done;
+static atomic_bool s_scan_ok;
+static atomic_uint s_scan_epoch;
 
 static void scan_done_cb(const sched_result_t *r, void *ctx)
 {
-    (void)r; (void)ctx;
-    s_scan_done = true;
-    if (s_ble_task) {
-        xTaskNotifyGive(s_ble_task);
+    if ((uint32_t)(uintptr_t)ctx == s_scan_epoch) {
+        s_scan_ok = r->err == ESP_OK;
+        s_scan_done = true;
     }
 }
 
@@ -135,7 +151,7 @@ static QueueHandle_t s_txq;
 static TaskHandle_t  s_tx_task;
 
 /* Fragment + send one JSON message. Safe only off the host task. */
-static uint16_t send_json_now(uint32_t rid, const char *json, size_t len)
+static size_t send_json_now(uint32_t rid, const char *json, size_t len)
 {
     uint16_t mtu = ble_svc_att_mtu();
     /* blep_build_frame takes the whole ATT payload budget (header +
@@ -146,7 +162,7 @@ static uint16_t send_json_now(uint32_t rid, const char *json, size_t len)
     uint16_t budget = mtu > 3 ? (uint16_t)(mtu - 3) : 0;
     uint16_t room = budget > sizeof(blep_hdr_t)
                       ? (uint16_t)(budget - sizeof(blep_hdr_t)) : 0;
-    if (!room) {
+    if (!room || !len) {
         return 0;
     }
     size_t off = 0;
@@ -159,15 +175,15 @@ static uint16_t send_json_now(uint32_t rid, const char *json, size_t len)
                                        rid, off,
                                        (const uint8_t *)json + off, n,
                                        first, last);
-        int tries = 0;
+        int64_t giveup = esp_timer_get_time() + 15LL * 1000 * 1000;
         while (!ble_svc_control_indicate(frame, fl)) {
-            if (!ble_svc_authorized()) {
+            if (!ble_svc_authorized() || !ble_svc_control_subscribed()) {
                 return off;
             }
             /* stream bursts can pin the whole mbuf pool until the
              * controller drains them; the END verdict must outlast
              * that drought (was ~5 s — not enough past the tail)    */
-            if (++tries >= 750) {            /* ~15 s */
+            if (esp_timer_get_time() >= giveup) {            /* ~15 s */
                 ESP_LOGW("ble", "indicate stalled at off=%u/%u",
                          (unsigned)off, (unsigned)len);
                 return off;
@@ -269,7 +285,7 @@ static void send_stream_end(uint32_t rid, const char *op,
         if (send_json_now(rid, msg, total) == total) {
             break;
         }
-        if (!ble_svc_authorized()) {
+        if (!ble_svc_authorized() || !ble_svc_control_subscribed()) {
             break;
         }
         ESP_LOGW("ble", "STREAM_END retry %d", attempt + 1);
@@ -277,7 +293,7 @@ static void send_stream_end(uint32_t rid, const char *op,
     }
     if (attempt == 3) {
         ESP_LOGW("ble", "STREAM_END indication undelivered");
-    } else if (ble_svc_authorized()) {
+    } else if (ble_svc_authorized() && ble_svc_control_subscribed()) {
         /* Fragments can be lost in flight even when every indicate
          * queued cleanly (host-side ACL RX overrun under notify flood).
          * The receiver drops poisoned state on a fresh FLAG_START, so a
@@ -410,7 +426,7 @@ static void op_list_recent(uint32_t rid, cJSON *args)
 static void op_list_day(uint32_t rid, cJSON *args)
 {
     cJSON *v = cJSON_GetObjectItem(args, "day");
-    if (!v || !cJSON_IsString(v) || strlen(v->valuestring) != 8) {
+    if (!v || !cJSON_IsString(v) || !ezs_is_valid_day(v->valuestring)) {
         send_error(rid, OP_LIST_DAY, EC_BAD_REQUEST);
         return;
     }
@@ -426,12 +442,22 @@ static void op_list_day(uint32_t rid, cJSON *args)
     }
 
     int n = cat_day_entries(day, NULL, 0);
+    if (n < 0) {
+        send_error(rid, OP_LIST_DAY, EC_NOT_SCANNED);
+        return;
+    }
     /* serialize under a response view (bounded) */
-    cat_file_t *files = malloc(n * sizeof(cat_file_t));
+    cat_file_t *files = malloc((n ? n : 1) * sizeof(cat_file_t));
     if (!files) { send_error(rid, OP_LIST_DAY, EC_RESOURCE_LIMIT); return; }
-    cat_day_entries(day, files, n);
+    int copied = cat_day_entries(day, files, n);
+    if (copied < 0 || copied > n) {
+        free(files);
+        send_error(rid, OP_LIST_DAY, EC_SCANNING);
+        return;
+    }
+    n = copied;
 
-    size_t cap = 96 + (size_t)n * 160;
+    size_t cap = 1024 + (size_t)n * 256;
     char *buf = malloc(cap);
     if (!buf) { free(files); send_error(rid, OP_LIST_DAY, EC_RESOURCE_LIMIT); return; }
     int o = snprintf(buf, cap, "{\"day\":\"%s\",\"folder_stale\":false,"
@@ -484,10 +510,11 @@ static void op_list_dir(uint32_t rid, cJSON *args)
     if (err != ESP_OK) {
         free(ents);
         send_error(rid, OP_LIST_DIRECTORY,
-                   obs.http_status >= 400 ? EC_HTTP_ERROR : EC_TIMEOUT);
+                   obs.http_status >= 400 ? EC_HTTP_ERROR :
+                   obs.parse != EZS_OK ? EC_PARSE_ERROR : EC_TIMEOUT);
         return;
     }
-    size_t cap = 96 + (size_t)n * 160;
+    size_t cap = 1024 + (size_t)n * 256;
     char *buf = malloc(cap);
     if (!buf) { free(ents); send_error(rid, OP_LIST_DIRECTORY, EC_RESOURCE_LIMIT); return; }
     size_t o = (size_t)snprintf(buf, cap, "{\"directory\":\"");
@@ -495,7 +522,7 @@ static void op_list_dir(uint32_t rid, cJSON *args)
     ezp_canon_to_logical(canon, ldir, sizeof(ldir));
     json_append_escaped(buf, cap, &o, ldir);
     o += (size_t)snprintf(buf + o, cap - o, "\",\"files\":[");
-    for (int i = 0; i < n && o < cap - 200; i++) {
+    for (int i = 0; i < n && o + 256 < cap; i++) {
         if (ents[i].is_dir) continue;
         o += (size_t)snprintf(buf + o, cap - o, "{\"name\":\"");
         json_append_escaped(buf, cap, &o, ents[i].name);
@@ -545,7 +572,7 @@ static void op_prepare_days(uint32_t rid, cJSON *args)
     cJSON *d;
     cJSON_ArrayForEach(d, days) {
         if (!cJSON_IsString(d) || !d->valuestring ||
-            strlen(d->valuestring) != 8 || cnt >= 16) {
+            !ezs_is_valid_day(d->valuestring) || cnt >= 16) {
             continue;
         }
         const char *day = d->valuestring;
@@ -556,7 +583,7 @@ static void op_prepare_days(uint32_t rid, cJSON *args)
         if (dup) {
             continue;
         }
-        strncpy(seen[cnt], day, CAT_DAY_STR - 1);
+        memcpy(seen[cnt], day, CAT_DAY_STR);
         cnt++;
         int64_t last = cat_day_last_scan(day);
         bool fresh = last &&
@@ -734,7 +761,9 @@ static void op_get_file(uint32_t rid, cJSON *args)
         s_stream.has_src_stamp ? "\"" : "",
         s_stream.has_src_stamp ? s_stream.src_stamp : "null",
         s_stream.has_src_stamp ? "\"" : "");
-    s_stream.active = true;
+    s_stream.cancelled = false;
+    s_stream.http_only = false;
+    s_stream.http_first_form = 0;
     s_stream.request_id = rid;
     s_stream.sent = s_stream.raw_bytes = 0;
     s_stream.limit = 0;
@@ -756,6 +785,7 @@ static void op_get_file(uint32_t rid, cJSON *args)
     if (in_datalog && strstr(nv->valuestring, ".edf")) {
         s_stream.hdr_cap = malloc(16 * 1024);
     }
+    s_stream.active = true;
     send_ok(rid, "STREAM_BEGIN", begin);   /* piggybacks rid          */
     free(begin);
 
@@ -772,7 +802,7 @@ static void op_get_file(uint32_t rid, cJSON *args)
  * (or the stream torn down) for ~500 ms continuously. */
 static bool stream_gate_broken(int *miss_ms)
 {
-    if (!s_stream.active) {
+    if (!s_stream.active || s_stream.cancelled) {
         *miss_ms += 1000;
         return true;
     }
@@ -801,11 +831,16 @@ static uint16_t wire_room(void)
 static bool wire_tx(const uint8_t *frame, uint16_t flen, size_t charge)
 {
     int miss_ms = 0;
+    if (stream_gate_broken(&miss_ms)) {
+        return false;
+    }
+    int64_t credit_deadline = esp_timer_get_time() + 10LL * 1000 * 1000;
     /* right-edge credit: send only while sent+charge <= limit        */
-    while (s_stream.sent + charge > s_stream.limit) {
+    while (s_stream.sent + charge > stream_limit()) {
         vTaskDelay(pdMS_TO_TICKS(2));
         s_stream.stall_ms += 2;
-        if (stream_gate_broken(&miss_ms)) {
+        if (stream_gate_broken(&miss_ms) ||
+            esp_timer_get_time() >= credit_deadline) {
             ESP_LOGW("ble", "wire: credit wait aborted, sent=%llu",
                      (unsigned long long)s_stream.sent);
             return false;
@@ -828,7 +863,9 @@ static bool wire_tx(const uint8_t *frame, uint16_t flen, size_t charge)
         s_stream.retry_ms +=
             (uint32_t)((esp_timer_get_time() - w0) / 1000);
     }
+    portENTER_CRITICAL(&s_stream_mux);
     s_stream.sent += charge;
+    portEXIT_CRITICAL(&s_stream_mux);
     s_frames_sent++;
     return true;
 }
@@ -859,9 +896,12 @@ static bool legacy_emit(const uint8_t *d, size_t n)
     while (off < n) {
         size_t take = n - off;
         if (take > room) take = room;
-        bool last = off + take >= n;
+        bool last = s_stream.src_clen >= 0 &&
+            s_stream.sent + take == (uint64_t)s_stream.src_clen;
         uint16_t fl = blep_build_frame(
-            frame, budget, BLEP_FILE_BYTES, s_stream.request_id,
+            frame, budget,
+            s_stream.is_evidence ? BLEP_EVIDENCE_BYTES : BLEP_FILE_BYTES,
+            s_stream.request_id,
             s_stream.sent, d + off, (uint16_t)take,
             s_stream.sent == 0, last);
         if (!wire_tx(frame, fl, take)) {
@@ -914,9 +954,20 @@ static bool stream_sink(const uint8_t *d, size_t n, void *ctx)
         memcpy(s_stream.hdr_cap + s_stream.hdr_got, d, take);
         s_stream.hdr_got += take;
     }
+    if (ctx) {
+        s_stream.src_clen = ((ezw_obs_t *)ctx)->content_length;
+    }
     /* SHA-256 stays over the raw file bytes (§10.2 verdict)          */
-    mbedtls_sha256_update(&s_stream.sha, d, n);
+    int64_t t0 = esp_timer_get_time();
+    int rc = mbedtls_sha256_update(&s_stream.sha, d, n);
+    s_stream.sha_us += esp_timer_get_time() - t0;
+    if (rc != 0 || (s_stream.cancelled && !s_stream.http_only)) {
+        return false;
+    }
     s_stream.raw_bytes += n;
+    if (s_stream.http_only) {
+        return true;
+    }
     /* v2 peers get the block codec over compact frames; v1 peers get
      * the classic 16-byte FILE_BYTES stream unchanged                */
     if (s_stream.v2) {
@@ -954,7 +1005,9 @@ static void op_get_evidence(uint32_t rid, cJSON *args)
         "\"oldest_seq\":\"%lu\",\"truncated\":%s,\"wire\":%d}",
         (unsigned long)jrn_seq(), (unsigned long)jrn_oldest_seq(),
         jrn_truncated() ? "true" : "false", v2 ? 2 : 1);
-    s_stream.active = true;
+    s_stream.cancelled = false;
+    s_stream.http_only = false;
+    s_stream.http_first_form = 0;
     s_stream.request_id = rid;
     s_stream.sent = s_stream.raw_bytes = 0;
     s_stream.limit = 0;
@@ -967,7 +1020,11 @@ static void op_get_evidence(uint32_t rid, cJSON *args)
     s_stream.test_bytes = 0;
     s_stream.v2 = v2;
     s_stream.ev_gaps = 0;
+    s_stream.src_clen = -1;
+    s_stream.hdr_cap = NULL;
+    s_stream.hdr_got = 0;
     s_stream.day[0] = '\0';
+    s_stream.active = true;
     send_ok(rid, "STREAM_BEGIN", begin);
     xTaskNotifyGive(s_ble_task);
 }
@@ -990,7 +1047,16 @@ static void op_stream_test(uint32_t rid, cJSON *args)
     if (args) {
         cJSON *b = cJSON_GetObjectItem(args, "bytes");
         if (cJSON_IsNumber(b)) {
+            if (!(b->valuedouble > 0 &&
+                  b->valuedouble <= 32ULL * 1024 * 1024)) {
+                send_error(rid, OP_STREAM_TEST, EC_BAD_REQUEST);
+                return;
+            }
             want = (uint64_t)b->valuedouble;
+            if ((double)want != b->valuedouble) {
+                send_error(rid, OP_STREAM_TEST, EC_BAD_REQUEST);
+                return;
+            }
         } else if (cJSON_IsString(b) && b->valuestring) {
             want = strtoull(b->valuestring, NULL, 10);
         }
@@ -999,7 +1065,8 @@ static void op_stream_test(uint32_t rid, cJSON *args)
             pat = p->valuestring;
         }
     }
-    if (!want || want > 32ULL * 1024 * 1024) {
+    if (!want || want > 32ULL * 1024 * 1024 ||
+        (strcmp(pat, "ramp") && strcmp(pat, "rand"))) {
         send_error(rid, OP_STREAM_TEST, EC_BAD_REQUEST);
         return;
     }
@@ -1008,7 +1075,9 @@ static void op_stream_test(uint32_t rid, cJSON *args)
     snprintf(begin, sizeof(begin),
              "{\"stream_type\":\"test\",\"bytes\":\"%llu\",\"wire\":%d}",
              (unsigned long long)want, v2 ? 2 : 1);
-    s_stream.active = true;
+    s_stream.cancelled = false;
+    s_stream.http_only = false;
+    s_stream.http_first_form = 0;
     s_stream.request_id = rid;
     s_stream.sent = s_stream.raw_bytes = 0;
     s_stream.limit = 0;
@@ -1024,10 +1093,11 @@ static void op_stream_test(uint32_t rid, cJSON *args)
     s_stream.test_idx = 0;
     s_stream.ev_gaps = 0;
     s_stream.src_size = want;
-    s_stream.src_clen = -1;
+    s_stream.src_clen = (int64_t)want;
     s_stream.hdr_cap = NULL;
     s_stream.hdr_got = 0;
     s_stream.day[0] = '\0';
+    s_stream.active = true;
     send_ok(rid, "STREAM_BEGIN", begin);
     xTaskNotifyGive(s_ble_task);
 }
@@ -1043,20 +1113,28 @@ static void ble_stream_task(void *arg)
 
         /* wait for initial credit (ACK with window>0) */
         int64_t deadline = esp_timer_get_time() + 10LL * 1000 * 1000;
-        while (s_stream.limit == 0 &&
+        while (stream_limit() == 0 && !s_stream.cancelled &&
                esp_timer_get_time() < deadline) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-        if (s_stream.limit == 0) {
+        if (stream_limit() == 0 || (s_stream.cancelled && !s_stream.http_only)) {
             ESP_LOGW("ble", "stream: no initial credit after 10s");
+            send_error(s_stream.request_id, "STREAM_END",
+                       s_stream.cancelled ? EC_ABORTED : EC_TIMEOUT);
             goto finish_fail;
         }
         ESP_LOGI("ble", "stream: start limit=%llu test=%d ev=%d v2=%d",
                  (unsigned long long)s_stream.limit,
                  s_stream.is_test, s_stream.is_evidence, s_stream.v2);
 
+        s_stream.sha_us = 0;
+        memset(&s_stream.fetch_obs, 0, sizeof(s_stream.fetch_obs));
         mbedtls_sha256_init(&s_stream.sha);
-        mbedtls_sha256_starts(&s_stream.sha, 0);
+        if (mbedtls_sha256_starts(&s_stream.sha, 0) != 0) {
+            mbedtls_sha256_free(&s_stream.sha);
+            send_error(s_stream.request_id, "STREAM_END", EC_RESOURCE_LIMIT);
+            goto finish_fail;
+        }
         if (s_stream.v2) {
             stc_begin();             /* codec staging (PSRAM); raw
                                         passthrough if unavailable    */
@@ -1104,13 +1182,17 @@ static void ble_stream_task(void *arg)
             }
         } else {
             ezw_obs_t obs;
+            if (s_stream.http_only) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
             ESP_LOGI("ble", "GET_FILE: fetch start limit=%llu",
                      (unsigned long long)s_stream.limit);
             esp_err_t err =
                 ezs_download(s_stream.canon_dir, s_stream.name,
                              s_stream.dl_name, s_stream.src_size,
-                             s_stream.src_unit_shift,
-                             stream_sink, NULL, &obs);
+                             s_stream.src_unit_shift, s_stream.http_first_form,
+                             stream_sink, &obs, &obs);
+            s_stream.fetch_obs = obs;
             s_stream.src_clen = obs.content_length;
             transport_ok = err == ESP_OK;
             ESP_LOGI("ble", "GET_FILE: fetch done err=%d body=%llu "
@@ -1126,15 +1208,34 @@ static void ble_stream_task(void *arg)
         }
         if (s_stream.v2) {
             stc_end();
+        } else if (transport_ok &&
+                   (s_stream.src_clen < 0 || !s_stream.raw_bytes)) {
+            uint8_t frame[sizeof(blep_hdr_t)];
+            uint16_t fl = blep_build_frame(frame, sizeof(frame),
+                s_stream.is_evidence ? BLEP_EVIDENCE_BYTES : BLEP_FILE_BYTES,
+                s_stream.request_id, s_stream.sent, NULL, 0,
+                s_stream.sent == 0, true);
+            transport_ok = wire_tx(frame, fl, 0);
         }
         uint8_t hash[32] = {0};
         char hex[65];
         if (transport_ok) {
-            mbedtls_sha256_finish(&s_stream.sha, hash);
+            transport_ok = mbedtls_sha256_finish(&s_stream.sha, hash) == 0;
         }
         mbedtls_sha256_free(&s_stream.sha);
         for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", hash[i]);
         hex[64] = '\0';
+        if (s_stream.http_only) {
+            ESP_LOGI("ble", "HTTP_TEST ok=%d connected=%d form=%u raw=%llu sha=%s "
+                     "header_us=%lld read_us=%lld sink_us=%lld sha_us=%lld",
+                     transport_ok, ble_svc_connected(),
+                     (unsigned)s_stream.fetch_obs.download_form,
+                     (unsigned long long)s_stream.raw_bytes, hex,
+                     (long long)s_stream.fetch_obs.header_us,
+                     (long long)s_stream.fetch_obs.read_us,
+                     (long long)s_stream.fetch_obs.sink_us,
+                     (long long)s_stream.sha_us);
+        }
 
         if (s_stream.is_test || s_stream.is_evidence) {
             char end[512];
@@ -1161,46 +1262,56 @@ static void ble_stream_task(void *arg)
                 transport_ok ? "true" : "false",
                 transport_ok ? "ok" : "journal_error");
             send_stream_end(s_stream.request_id, "STREAM_END", end);
-            s_stream.active = false;
             s_stream.is_evidence = false;
             s_stream.is_test = false;
+            s_stream.active = false;
             continue;
         }
 
         /* post-check: therapy + source tuple refresh (§12.1 step 6-7) */
         bool completion = false;
+        bool post_verified = false;
         char reason[40] = "ok";
         if (transport_ok && s_stream.day[0]) {
             /* refresh the source folder, woken by its completion
              * callback — the old fixed 2.5 s settle added ~4 min to a
              * month-scale batch                                       */
             s_scan_done = false;
+            s_scan_ok = false;
+            uint32_t scan_epoch = ++s_scan_epoch;
             sched_job_t j = { .kind = JOB_DAY, .prio = 0,
                               .deadline_us = esp_timer_get_time() +
                                             5LL * 1000 * 1000,
                               .required = true,
-                              .done = scan_done_cb };
+                              .done = scan_done_cb,
+                              .ctx = (void *)(uintptr_t)scan_epoch };
             strncpy(j.dir, s_stream.day, CAT_DAY_STR);
-            sched_submit(&j);
+            bool submitted = sched_submit(&j) == ESP_OK;
             /* bounded wait: proceed on timeout and let the tuple
              * check judge whatever the catalog holds                */
             int64_t dl = esp_timer_get_time() + 10LL * 1000 * 1000;
-            while (!s_scan_done &&
+            while (submitted && !s_scan_done && !s_stream.cancelled &&
                    esp_timer_get_time() < dl) {
                 vTaskDelay(pdMS_TO_TICKS(20));
             }
+            post_verified = submitted && s_scan_done && s_scan_ok;
         }
-        if (transport_ok) {
+        if (transport_ok && !s_stream.cancelled) {
             const therapy_status_t *t = therapy_status();
-            if (t->state == THERAPY_IN) {
+            if (s_stream.day[0] && !post_verified) {
+                strncpy(reason, "source_unverified", sizeof(reason));
+            } else if (t->state == THERAPY_IN) {
                 strncpy(reason, "therapy_active", sizeof(reason));
-            } else if (t->state != THERAPY_OUT) {
+            } else if (t->state != THERAPY_OUT || t->therapy_stale ||
+                       !t->transfer_allowed) {
                 strncpy(reason, "therapy_unknown", sizeof(reason));
             } else if (s_stream.day[0]) {
                 cat_file_t after;
                 if (!cat_find_file(s_stream.day, s_stream.name, &after) ||
                     after.size != s_stream.src_size ||
-                    (s_stream.has_src_stamp && after.has_timestamp &&
+                    after.size_unit_shift != s_stream.src_unit_shift ||
+                    after.has_timestamp != s_stream.has_src_stamp ||
+                    (s_stream.has_src_stamp &&
                      strcmp(after.timestamp_raw,
                             s_stream.src_stamp))) {
                     /* tuple moved under us — size *or* stamp (U3)  */
@@ -1221,20 +1332,31 @@ static void ble_stream_task(void *arg)
                     for (int i = 0; i < n; i++) {
                         if (!ents[i].is_dir &&
                             !strcmp(ents[i].name, s_stream.name) &&
-                            ents[i].size == s_stream.src_size) {
+                            ents[i].size == s_stream.src_size &&
+                            ents[i].size_unit_shift == s_stream.src_unit_shift &&
+                            ents[i].has_timestamp == s_stream.has_src_stamp &&
+                            (!s_stream.has_src_stamp ||
+                             !strcmp(ents[i].timestamp_raw,
+                                     s_stream.src_stamp))) {
                             match = true;
                         }
                     }
                 }
                 free(ents);
+                post_verified = ok2;
                 completion = match;
                 if (!match) strncpy(reason, "source_unverified",
                                     sizeof(reason));
             }
         } else {
-            strncpy(reason, "http_error", sizeof(reason));
+            strncpy(reason, s_stream.cancelled ? "aborted" : "http_error",
+                    sizeof(reason));
         }
 
+        if (s_stream.http_only) {
+            completion = false;
+            copy_bounded(reason, sizeof(reason), "http_test_only");
+        }
         /* opportunistic EDF-header diagnostic — parse the captured
          * prefix; never gates completion (U2)                        */
         if (s_stream.hdr_cap) {
@@ -1247,9 +1369,9 @@ static void ble_stream_task(void *arg)
                                       h.record_duration_s,
                                       h.start_local_s);
                     if (h.record_bytes &&
-                        s_stream.sent > h.header_bytes) {
+                        s_stream.raw_bytes > h.header_bytes) {
                         ls->complete_records =
-                            (int64_t)((s_stream.sent - h.header_bytes) /
+                            (int64_t)((s_stream.raw_bytes - h.header_bytes) /
                                       h.record_bytes);
                     }
                 }
@@ -1259,15 +1381,18 @@ static void ble_stream_task(void *arg)
         }
 
         {
-            char end[640];
+            char end[1024];
             snprintf(end, sizeof(end),
                 "{\"ok\":%s,\"actual_bytes\":\"%llu\","
                 "\"encoded_bytes\":\"%llu\",\"listed_size\":\"%llu\","
                 "\"content_length\":\"%lld\","
                 "\"sha256\":\"%s\","
                 "\"source_unchanged\":%s,"
-                "\"therapy_status\":%d,\"monitoring_checked\":true,"
+                "\"therapy_status\":%d,\"monitoring_checked\":%s,"
                 "\"stall_ms\":%lu,\"retry_ms\":%lu,\"encode_ms\":%lu,"
+                "\"sha_us\":%lld,\"http_header_us\":%lld,"
+                "\"http_read_us\":%lld,\"http_sink_us\":%lld,"
+                "\"http_reads\":%lu,\"http_form\":%u,"
                 "\"blocks\":{\"raw\":%lu,\"def\":%lu,\"d16\":%lu},"
                 "\"completion_allowed\":%s,\"error\":\"%s\"}",
                 transport_ok ? "true" : "false",
@@ -1277,9 +1402,16 @@ static void ble_stream_task(void *arg)
                 (long long)s_stream.src_clen, hex,
                 completion ? "true" : "false",
                 (int)therapy_status()->state,
+                post_verified ? "true" : "false",
                 (unsigned long)s_stream.stall_ms,
                 (unsigned long)s_stream.retry_ms,
                 (unsigned long)(s_stream.v2 ? stc_encode_ms() : 0),
+                (long long)s_stream.sha_us,
+                (long long)s_stream.fetch_obs.header_us,
+                (long long)s_stream.fetch_obs.read_us,
+                (long long)s_stream.fetch_obs.sink_us,
+                (unsigned long)s_stream.fetch_obs.read_calls,
+                (unsigned)s_stream.fetch_obs.download_form,
                 (unsigned long)(s_stream.v2 ? stc_raw_blocks() : 0),
                 (unsigned long)(s_stream.v2 ? stc_def_blocks() : 0),
                 (unsigned long)(s_stream.v2 ? stc_d16_blocks() : 0),
@@ -1302,6 +1434,8 @@ static void ble_stream_task(void *arg)
         continue;
 
 finish_fail:
+        free(s_stream.hdr_cap);
+        s_stream.hdr_cap = NULL;
         s_stream.active = false;
     }
 }
@@ -1310,9 +1444,7 @@ finish_fail:
 void ble_svc_stream_abort(uint32_t request_id, const char *why)
 {
     if (s_stream.active) {
-        s_stream.active = false;
-        s_stream.limit = 0;
-        send_error(s_stream.request_id, "STREAM_END", EC_LINK_LOST);
+        s_stream.cancelled = true;
     }
 }
 
@@ -1522,6 +1654,10 @@ int ble_ops_on_write(uint16_t conn, const uint8_t *data, uint16_t len)
     }
     blep_hdr_t h;
     memcpy(&h, data, sizeof(h));
+    if (h.version != 1 || h.request_id == 0 ||
+        (h.flags & ~(BLEP_FLAG_START | BLEP_FLAG_END))) {
+        return BLE_ATT_ERR_INVALID_PDU;
+    }
 
     switch (h.kind) {
     case BLEP_JSON_REQUEST: {
@@ -1549,11 +1685,24 @@ int ble_ops_on_write(uint16_t conn, const uint8_t *data, uint16_t len)
         else if (!strcmp(opn, OP_LIST_DAY)) op_list_day(rid, args);
         else if (!strcmp(opn, OP_LIST_DIRECTORY)) op_list_dir(rid, args);
         else if (!strcmp(opn, OP_GET_FILE)) op_get_file(rid, args);
+#if defined(SOMNOBRIDGE_HTTP_AUDIT)
+        else if (!strcmp(opn, "HTTP_TEST")) {
+            bool idle = !s_stream.active;
+            op_get_file(rid, args);
+            if (idle && s_stream.active && s_stream.request_id == rid) {
+                s_stream.http_only = true;
+                cJSON *form = cJSON_GetObjectItem(args, "form");
+                s_stream.http_first_form = cJSON_IsNumber(form) &&
+                    form->valueint == 1 ? 1 : 0;
+                s_stream.v2 = false;
+            }
+        }
+#endif
         else if (!strcmp(opn, OP_PREPARE_DAYS)) op_prepare_days(rid, args);
         else if (!strcmp(opn, OP_GET_DRIFT)) op_get_drift(rid, args);
         else if (!strcmp(opn, OP_GET_EVIDENCE)) op_get_evidence(rid, args);
         else if (!strcmp(opn, OP_STREAM_TEST)) op_stream_test(rid, args);
-        else send_error(rid, opn, EC_UNSUPPORTED_OP);
+        else send_error(rid, "?", EC_UNSUPPORTED_OP);
         cJSON_Delete(j);
         return 0;
     }
@@ -1568,16 +1717,21 @@ int ble_ops_on_write(uint16_t conn, const uint8_t *data, uint16_t len)
              * shrink it — so a max() update is race-free.            */
             uint32_t w;
             memcpy(&w, pl, 4);
-            uint64_t edge = h.offset + w;
-            if (edge > s_stream.limit) {
-                s_stream.limit = edge;
+            portENTER_CRITICAL(&s_stream_mux);
+            if (h.offset <= s_stream.sent && w <= 65536 &&
+                h.offset <= UINT64_MAX - w) {
+                uint64_t edge = h.offset + (w > 11520 ? 11520 : w);
+                if (edge > s_stream.limit) {
+                    s_stream.limit = edge;
+                }
             }
+            portEXIT_CRITICAL(&s_stream_mux);
         }
         return 0;
     }
     case BLEP_ABORT:
         if (s_stream.active && h.request_id == s_stream.request_id) {
-            s_stream.active = false;
+            s_stream.cancelled = true;
         }
         return 0;
     case BLEP_TIME_REQUEST:
@@ -1605,8 +1759,12 @@ esp_err_t ble_ops_init(void)
     if (!s_txq) {
         return ESP_ERR_NO_MEM;
     }
-    xTaskCreatePinnedToCore(ble_tx_task, "ble_tx", 4096, NULL, 6,
-                            &s_tx_task, 1);
+    if (xTaskCreatePinnedToCore(ble_tx_task, "ble_tx", 4096, NULL, 6,
+                               &s_tx_task, 1) != pdPASS) {
+        vQueueDelete(s_txq);
+        s_txq = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     /* ble_stream_task runs ezs_download -> esp_http_client (stack-hungry)
      * plus journal NVS reads on the evidence path and, on wire v2, the
      * ROM tdefl compressor — all in one task frame chain. 6 KiB
@@ -1616,7 +1774,13 @@ esp_err_t ble_ops_init(void)
      * enter the HTTP client). 16 KiB is the validated size.
      * Core 1: NimBLE host + controller live on core 0; HTTP/compression
      * work must not compete with them (update7 §3).                  */
-    xTaskCreatePinnedToCore(ble_stream_task, "ble_stream", 16384, NULL, 8,
-                            &s_ble_task, 1);
+    if (xTaskCreatePinnedToCore(ble_stream_task, "ble_stream", 16384,
+                               NULL, 8, &s_ble_task, 1) != pdPASS) {
+        vTaskDelete(s_tx_task);
+        s_tx_task = NULL;
+        vQueueDelete(s_txq);
+        s_txq = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     return ESP_OK;
 }

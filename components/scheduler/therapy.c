@@ -128,6 +128,11 @@ void therapy_tick(int64_t now_us)
         enter(THERAPY_UNKNOWN, "liveness_stale", now_us);
         s_th.therapy_stale = true;
     }
+    if (s_th.state == THERAPY_OUT && (!s_last_ok_us ||
+        now_us - s_last_ok_us > (int64_t)OUT_FRESH_MS * 1000)) {
+        enter(THERAPY_UNKNOWN, "monitor_stale", now_us);
+        s_th.therapy_stale = true;
+    }
     /* quiet_since for API consumers */
     s_th.quiet_since_ms = s_quiet_since_us
         ? (uint32_t)((now_us - s_quiet_since_us) / 1000) : 0;

@@ -174,7 +174,7 @@ void ble_svc_diag_state(bool *adv_active, bool *suspended,
         if (rx_phy) *rx_phy = r;
     }
 }
-uint16_t ble_svc_att_mtu(void) { return s_mtu; }
+uint16_t ble_svc_att_mtu(void) { return s_mtu < 247 ? s_mtu : 247; }
 uint16_t ble_svc_conn_handle(void) { return s_conn; }
 
 /* ---------------- GATT access gate ---------------- */
@@ -568,36 +568,56 @@ static struct ble_npl_eventq *s_hs_evq;
 
 typedef struct {
     struct ble_npl_event ev;
-    const uint8_t *data;
+    uint8_t data[256];
     uint16_t len;
-    volatile bool ok;
+    uint16_t conn;
+    bool ok;
+    bool pending;
     SemaphoreHandle_t done;
 } ctrl_ind_req_t;
 
 static ctrl_ind_req_t s_creq;
-static StaticSemaphore_t s_creq_sem;
+static StaticSemaphore_t s_creq_sem, s_creq_mutex_buf;
+static SemaphoreHandle_t s_creq_mutex;
 
 static void ctrl_ind_cb(struct ble_npl_event *ev)
 {
     ctrl_ind_req_t *r = ble_npl_event_get_arg(ev);
-    r->ok = ble_svc_control_indicate(r->data, r->len);
+    r->ok = r->conn == s_conn &&
+        ble_svc_control_indicate(r->data, r->len);
     xSemaphoreGive(r->done);
 }
 
 static bool ctrl_indicate_deferred(const uint8_t *data, uint16_t len)
 {
-    if (!s_hs_evq) {
+    if (!s_hs_evq || !data || len > sizeof(s_creq.data) ||
+        xSemaphoreTake(s_creq_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
         return false;
     }
-    s_creq.data = data;
+    bool ok = false;
+    if (s_creq.pending) {
+        if (xSemaphoreTake(s_creq.done, pdMS_TO_TICKS(3000)) != pdTRUE) {
+            goto out;
+        }
+        s_creq.pending = false;
+    }
+    memcpy(s_creq.data, data, len);
     s_creq.len = len;
+    s_creq.conn = s_conn;
     s_creq.ok = false;
+    s_creq.pending = true;
     ble_npl_eventq_put(s_hs_evq, &s_creq.ev);
     if (xSemaphoreTake(s_creq.done, pdMS_TO_TICKS(3000)) != pdTRUE) {
-        return false;               /* host queue wedged — retry later */
+        goto out;               /* host queue wedged — retry later */
     }
-    return s_creq.ok;
+    s_creq.pending = false;
+    ok = s_creq.ok;
+out:
+    xSemaphoreGive(s_creq_mutex);
+    return ok;
 }
+
+bool ble_svc_control_subscribed(void) { return s_ctrl_sub; }
 
 bool ble_svc_control_indicate(const uint8_t *data, uint16_t len)
 {
@@ -726,11 +746,14 @@ esp_err_t ble_svc_init(void)
         /* persistent bond storage — ble_store_config uses NVS when
      * CONFIG_BT_NIMBLE_NVS_PERSIST=y (spec §3.1)                   */
     ble_store_config_init();
-    ble_ops_init();
-
     s_hs_evq = nimble_port_get_dflt_eventq();
     s_creq.done = xSemaphoreCreateBinaryStatic(&s_creq_sem);
+    s_creq_mutex = xSemaphoreCreateMutexStatic(&s_creq_mutex_buf);
     ble_npl_event_init(&s_creq.ev, ctrl_ind_cb, &s_creq);
+    err = ble_ops_init();
+    if (err != ESP_OK) {
+        return err;
+    }
 
     nimble_port_freertos_init(host_task);
     s_init_stage = 4;
