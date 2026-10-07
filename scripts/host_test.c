@@ -383,6 +383,35 @@ static void test_paths(void)
     CHECK(ezp_datalog_day("A:\\DATALOG\\20240101", day) &&
           !strcmp(day, "20240101"), "day extracted");
     CHECK(!ezp_datalog_day("A:\\DATALOG", day), "plain datalog has no day");
+
+    /* logical (card-root-relative) API paths -> canonical A:\ */
+    CHECK(ezp_logical_to_canon("/DATALOG/20240101", out, sizeof(out))
+          == EZP_OK && !strcmp(out, "A:\\DATALOG\\20240101"),
+          "posix path canonicalized");
+    CHECK(ezp_logical_to_canon("DATALOG\\20240101", out, sizeof(out))
+          == EZP_OK && !strcmp(out, "A:\\DATALOG\\20240101"),
+          "bare relative canonicalized");
+    CHECK(ezp_logical_to_canon("/", out, sizeof(out)) == EZP_OK &&
+          !strcmp(out, "A:\\"), "bare root maps to A:\\");
+    CHECK(ezp_logical_to_canon("A:\\DATALOG", out, sizeof(out))
+          == EZP_OK && !strcmp(out, "A:\\DATALOG"),
+          "drived input unchanged");
+    CHECK(ezp_logical_to_canon("B:\\DATALOG", out, sizeof(out))
+          != EZP_OK, "logical: other drive still rejected");
+    CHECK(ezp_logical_to_canon("/../x", out, sizeof(out))
+          != EZP_OK, "logical: traversal still rejected");
+    CHECK(ezp_logical_to_canon("/a%2fb", out, sizeof(out))
+          != EZP_OK, "logical: encoded input still rejected");
+    CHECK(ezp_logical_to_canon("DATALOG//20240101", out, sizeof(out))
+          != EZP_OK, "logical: empty component rejected");
+    CHECK(ezp_logical_to_canon("", out, sizeof(out))
+          != EZP_OK, "logical: empty rejected");
+    CHECK(ezp_canon_to_logical("A:\\DATALOG\\20240101", out, sizeof(out))
+          && !strcmp(out, "/DATALOG/20240101"), "canon -> logical");
+    CHECK(ezp_canon_to_logical("A:\\", out, sizeof(out))
+          && !strcmp(out, "/"), "canon root -> /");
+    CHECK(ezp_canon_to_logical("C:\\x", out, sizeof(out)) == 0,
+          "non-canonical input -> empty");
 }
 
 /* ---------------- catalog ---------------- */

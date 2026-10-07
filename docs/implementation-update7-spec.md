@@ -185,7 +185,25 @@ no card access, no therapy gate interaction, safe during active therapy.
 deflate backoff). Exists purely for transport measurement — SomnoTrace
 does not need to implement it.
 
-## 10. EZShare HTTP keep-alive
+## 10. Card-agnostic path surface (§10.2 amendment)
+
+Client-supplied `directory` arguments in `GET_FILE` and
+`LIST_DIRECTORY` are interpreted as **card-root-relative logical
+paths**: `/DATALOG/20261005`, `\DATALOG\20261005` and
+`DATALOG/20261005` all resolve identically; `/` is the card root. An
+explicit drive prefix is still honoured but only `A:`/`a:` passes
+validation. Normalization happens once at the op boundary
+(`ezp_logical_to_canon` → unchanged `ezp_canon_dir`); the canonical
+`A:\…` form remains internal and feeds the card-facing URL builders
+(`dir=A%3A%5C…`, `fdir=..\X\Y`) unchanged.
+
+Response `directory` echoes (`LIST_DIRECTORY`, `STREAM_BEGIN`) emit the
+logical `/…` form via `ezp_canon_to_logical`. Catalog-originated
+responses never carried paths: `LIST_DAY`/`LIST_RECENT_DAYS` return
+`day` + `name` tuples only. The rule exists so a future non-EZShare
+card adapter changes the driver layer, not the wire contract.
+
+## 11. EZShare HTTP keep-alive
 
 `ezs_download` reuses a single `esp_http_client` handle across files:
 the card honours keep-alive, so per-file TCP+request setup (~0.2–0.4 s
@@ -193,7 +211,7 @@ each) drops out of batch pulls. The handle is torn down on any error or
 non-200 response, after 60 s idle, and is never reused while a response
 body is undrained. All other EZShare paths (listings) are unchanged.
 
-## 11. Journal self-heal (robustness fix)
+## 12. Journal self-heal (robustness fix)
 
 On this unit the encrypted `evidence` NVS partition reached a state
 where reads scanned fine but every `nvs_set_blob` failed with
@@ -203,7 +221,7 @@ partition, re-init, reopen, mark `truncated`, and retry the chunk once.
 The journal is a bounded forensic ring that already self-documents
 truncation; losing its history is the documented degraded mode.
 
-## 12. What is NOT in this update
+## 13. What is NOT in this update
 
 - No ESP-NOW, no channel switching, no card config writes (Option 2
   from Appendix D is untouched).
@@ -212,7 +230,7 @@ truncation; losing its history is the documented degraded mode.
 - No PHY/interval parameter changes on the peripheral side beyond what
   already shipped (the central, not us, controls conn params).
 
-## 13. Verification
+## 14. Verification
 
 - Host suite: `scripts/run_host_tests.sh` passes (framing, codec
   round-trips, journal self-heal stubs added).

@@ -109,6 +109,44 @@ ezp_err_t ezp_canon_dir(const char *in, char *out, size_t cap)
     return EZP_OK;
 }
 
+ezp_err_t ezp_logical_to_canon(const char *in, char *out, size_t cap)
+{
+    if (!in || in[0] == '\0') {
+        return EZP_ERR_EMPTY;
+    }
+    /* An explicit drive prefix ("X:...") is validated as usual —
+     * only A:/a: will pass. Anything else is root-relative.      */
+    if (isalpha((unsigned char)in[0]) && in[1] == ':') {
+        return ezp_canon_dir(in, out, cap);
+    }
+    size_t n = strlen(in);
+    if (n + 2 > EZP_DIR_MAX) {
+        return EZP_ERR_LEN;
+    }
+    char tmp[2 + EZP_DIR_MAX + 1];
+    tmp[0] = 'A';
+    tmp[1] = ':';
+    memcpy(tmp + 2, in, n + 1);         /* e.g. "A:/DATALOG/x"   */
+    return ezp_canon_dir(tmp, out, cap);
+}
+
+size_t ezp_canon_to_logical(const char *canon, char *out, size_t cap)
+{
+    if (!canon || !out || cap < 2 ||
+        strncmp(canon, "A:\\", 3) != 0) {
+        if (out && cap) {
+            out[0] = '\0';
+        }
+        return 0;
+    }
+    size_t w = 0;
+    for (const char *p = canon + 2; *p && w + 1 < cap; p++) {
+        out[w++] = (*p == '\\' || *p == '/') ? '/' : *p;
+    }
+    out[w] = '\0';
+    return w;
+}
+
 ezp_err_t ezp_validate_name(const char *name)
 {
     if (!name) {

@@ -468,7 +468,8 @@ static void op_list_dir(uint32_t rid, cJSON *args)
         return;
     }
     char canon[260];
-    if (ezp_canon_dir(v->valuestring, canon, sizeof(canon)) != EZP_OK) {
+    if (ezp_logical_to_canon(v->valuestring, canon, sizeof(canon))
+            != EZP_OK) {
         send_error(rid, OP_LIST_DIRECTORY, EC_PATH_INVALID);
         return;
     }
@@ -490,7 +491,9 @@ static void op_list_dir(uint32_t rid, cJSON *args)
     char *buf = malloc(cap);
     if (!buf) { free(ents); send_error(rid, OP_LIST_DIRECTORY, EC_RESOURCE_LIMIT); return; }
     size_t o = (size_t)snprintf(buf, cap, "{\"directory\":\"");
-    json_append_escaped(buf, cap, &o, canon);
+    char ldir[280];
+    ezp_canon_to_logical(canon, ldir, sizeof(ldir));
+    json_append_escaped(buf, cap, &o, ldir);
     o += (size_t)snprintf(buf + o, cap - o, "\",\"files\":[");
     for (int i = 0; i < n && o < cap - 200; i++) {
         if (ents[i].is_dir) continue;
@@ -608,7 +611,8 @@ static void op_get_file(uint32_t rid, cJSON *args)
     }
 
     char canon[280];
-    if (ezp_canon_dir(dv->valuestring, canon, sizeof(canon)) != EZP_OK ||
+    if (ezp_logical_to_canon(dv->valuestring, canon, sizeof(canon))
+            != EZP_OK ||
         ezp_validate_name(nv->valuestring) != EZP_OK) {
         send_error(rid, OP_GET_FILE, EC_PATH_INVALID);
         return;
@@ -698,6 +702,10 @@ static void op_get_file(uint32_t rid, cJSON *args)
 
     /* STREAM_BEGIN (heap: this runs on the NimBLE host task, whose
      * stack must stay small) */
+    /* wire v2 (compact frames + block codec) only when the requester
+     * opts in — an unmodified v1 client keeps the legacy stream.
+     * Must precede the STREAM_BEGIN payload below, which reports it. */
+    s_stream.v2 = cJSON_IsTrue(cJSON_GetObjectItem(args, "v2"));
     char *begin = malloc(640);
     if (!begin) {
         send_error(rid, OP_GET_FILE, EC_RESOURCE_LIMIT);
@@ -705,7 +713,9 @@ static void op_get_file(uint32_t rid, cJSON *args)
     }
     size_t bo = (size_t)snprintf(begin, 640,
         "{\"stream_type\":\"file\",\"directory\":\"");
-    json_append_escaped(begin, 640, &bo, canon);
+    char ldir[280];
+    ezp_canon_to_logical(canon, ldir, sizeof(ldir));
+    json_append_escaped(begin, 640, &bo, ldir);
     bo += (size_t)snprintf(begin + bo, 640 - bo, "\",\"name\":\"");
     json_append_escaped(begin, 640, &bo, nv->valuestring);
     bo += (size_t)snprintf(begin + bo, 640 - bo,
@@ -735,9 +745,6 @@ static void op_get_file(uint32_t rid, cJSON *args)
     s_stream.is_evidence = false;
     s_stream.is_test = false;
     s_stream.test_bytes = 0;
-    /* wire v2 (compact frames + block codec) only when the requester
-     * opts in — an unmodified v1 client keeps the legacy stream     */
-    s_stream.v2 = cJSON_IsTrue(cJSON_GetObjectItem(args, "v2"));
     s_stream.src_clen = -1;
     copy_bounded(s_stream.canon_dir, sizeof(s_stream.canon_dir), canon);
     copy_bounded(s_stream.name, sizeof(s_stream.name), nv->valuestring);

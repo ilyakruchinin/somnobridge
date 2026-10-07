@@ -1215,10 +1215,10 @@ def main():
             paths = args.get if isinstance(args.get, list) else [args.get]
             files = []
             for p in paths:
-                parts = re.split(r"[\\/]", p)
+                parts = [c for c in re.split(r"[\\/]", p) if c]
                 if len(parts) < 2:
                     sys.exit("--get needs DIR/NAME "
-                             "(e.g. A:\\DATALOG\\20261005\\x.edf)")
+                             "(e.g. /DATALOG/20261005/x.edf)")
                 files.append(("\\".join(parts[:-1]), parts[-1]))
             # batch pre-refresh: queue rescans for every stale DATALOG
             # day in one shot instead of a 12 s STALE retry each

@@ -35,6 +35,22 @@ typedef enum {
  */
 ezp_err_t ezp_canon_dir(const char *in, char *out, size_t cap);
 
+/**
+ * Canonicalize a client-supplied (API) directory path. Everything
+ * ezp_canon_dir accepts PLUS root-relative forms — "/DATALOG/20240101",
+ * "\DATALOG", "DATALOG/20240101" — which all mean the card root (= A:\).
+ * An explicit drive letter is still validated (only A:/a: passes).
+ * The card-agnostic wire form is "/"; the canonical A:\ spelling stays
+ * an internal detail of the EZShare adapter.
+ */
+ezp_err_t ezp_logical_to_canon(const char *in, char *out, size_t cap);
+
+/**
+ * Render a canonical dir for API output: "A:\X\Y" -> "/X/Y",
+ * "A:\" -> "/". Returns bytes written, 0 on non-canonical input.
+ */
+size_t ezp_canon_to_logical(const char *canon, char *out, size_t cap);
+
 /** Validate a single filename component (8.3 alias or LFN). */
 ezp_err_t ezp_validate_name(const char *name);
 

@@ -82,7 +82,7 @@ Response envelope: `{"op":"<OP>","ok":true,"result":{…}}` or
 | `GET_CATALOG_STATUS` | — | `state`(SCANNING/READY/INCOMPLETE/ERROR), `folders_total`, `catalog_complete`, `hot_ready`, `incomplete_count`, `hot_days[]` | catalog is volatile |
 | `LIST_RECENT_DAYS` | `days:int` (≤36600, default 14) | `days[]` (YYYYMMDD, newest first), `catalog_complete`, `hot_ready` | catalog view, no card hit |
 | `LIST_DAY` | `day:"YYYYMMDD"` | `day`, `folder_stale`, `scan_age_us`, `files[]{name,size,ts}` | `scan_age_us` is actually the scan-start monotonic timestamp (legacy) |
-| `LIST_DIRECTORY` | `directory:"A:\\…"` | `directory`, `files[]{name,size,ts}` | live card read; therapy-gated |
+| `LIST_DIRECTORY` | `directory:"/…"` | `directory`, `files[]{name,size,ts}` | live card read; therapy-gated; refuses `DATALOG` (use catalog ops) |
 | `GET_FILE` | `directory`, `name`, `expected_size`, `v2:bool`? | stream — see §5 | therapy-gated; begins a stream |
 | `PREPARE_DAYS` | `days:["YYYYMMDD",…]` | `days[]{day,status:"fresh"/"queued"}`, `eta_ms`, `transfer_allowed` | pre-warms stale listings before a download batch |
 | `GET_DRIFT` | `best_available`/`include_provisional:bool`? | `schema`, `estimate`, `source_of_truth`, `qualified_source_of_truth`, `provisional_source_of_truth`, `completed_session_fallback`, `best_available_offset` (opt-in only) | `source_of_truth` is only a fresh qualified live candidate; persisted records are `historical, applicable:false` |
@@ -101,6 +101,26 @@ Error codes: `BAD_REQUEST`, `UNSUPPORTED_OP`, `BUSY`, `NOT_FOUND`,
 `THERAPY_UNKNOWN` while the card may be appending — poll
 `therapy.transfer_allowed` in `GET_STATUS`; `PREPARE_DAYS` +
 a retry after `eta_ms` smooths the ~90 s listing-freshness guard.
+
+### Path syntax
+
+`directory` arguments are card-agnostic, card-root-relative:
+
+- `/DATALOG/20261005`, `\DATALOG\20261005`, `DATALOG/20261005`, `/` —
+  all resolve to the card root namespace (canonical `A:\…` internally).
+- Explicit drive letters are still accepted but only `A:`/`a:` pass;
+  `B:\…` → `PATH_INVALID`. Prefer the bare `/` form.
+- Both `/` and `\` separators work; `.`, `..`, empty components
+  (`//`), `%`, control/FAT-invalid characters and `:` inside
+  components are rejected with `PATH_INVALID`.
+- Responses echo directories in the logical `/` form
+  (`LIST_DIRECTORY.directory`, `STREAM_BEGIN.directory`). The `A:\`
+  spelling is an EZShare-adapter detail that never crosses the wire in
+  file listings — `LIST_DAY`/`LIST_RECENT_DAYS` carry only `day` +
+  `name` tuples anyway.
+- `name` is a single filename component (LFN or 8.3 alias); the device
+  resolves the card's actual download name itself and reports it back
+  in `STREAM_BEGIN.download_name`.
 
 ## 5. Streams
 
