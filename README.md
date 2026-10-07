@@ -92,7 +92,7 @@ Docker is the only host dependency; ESP-IDF is pinned to `v5.5.5`:
 ./scripts/ble_query.py --status --catalog
 ./scripts/ble_query.py --days 14 --day 20261005
 ./scripts/ble_query.py --ls 'A:\DATALOG'     # live card listing
-./scripts/ble_query.py --get 'DATALOG/20261005/20261006_002312_BRP.edf'
+./scripts/ble_query.py --get 'A:\DATALOG\20261005\20261006_002312_BRP.edf'
 ./scripts/ble_query.py --evidence            # evidence journal replay
 ./scripts/ble_query.py --time-sync 5         # NTP-style anchor exchange
 ./scripts/ble_query.py --stream-test 2097152 --pattern ramp   # add --v1 for legacy wire
