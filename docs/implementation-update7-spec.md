@@ -353,20 +353,39 @@ Measured on the same 607,226-byte file (252,008 encoded bytes):
 SHA is included in sink time; compression and BLE pacing are also included
 for a real transfer. Modem-sleep disabling did not demonstrate a material
 improvement and was reverted. All isolated reads matched the real-transfer
-SHA. Slow reception persists without BLE streaming or a connected BLE peer;
-this localizes the problem to the card/WiFi/TCP/HTTP receive path, not SHA
-or simply notification backpressure. It does not establish the card's
-maximum capability or explain the underlying TCP/server behavior.
+SHA.
+
+**Root cause resolved.** The slow reads were caused by
+`CONFIG_LWIP_TCP_RECVMBOX_SIZE=6` against a 16,384-byte TCP receive window
+and 1,440-byte MSS: the mailbox could hold ~6 in-flight segments while the
+window advertised ~11, so the connection spent most of its time recovering
+from mailbox overflow. Espressif recommends roughly `TCP_WND / MSS + 2`
+entries. Raising the mailbox to 16 produced, on the same file:
+
+| condition | HTTP read waiting | total |
+|-----------|-------------------|-------|
+| recvmbox=6, form 0/1 | 43.5 s / 41.8 s | 45.4 s / 43.4 s |
+| recvmbox=16, form 0/1, BLE connected | 2.42 s / 1.84 s | 4.0 s / 3.5 s |
+| recvmbox=16, BLE disconnected | 1.29 s | n/a |
+| recvmbox=16, real v2 GET_FILE | 1.03 s | 7.3 s end-to-end |
+
+The residual connected-versus-disconnected gap is WiFi/BLE radio
+coexistence, not a further defect. With the card path fixed, BLE credit
+pacing is the remaining limiter (~80–90 KiB/s raw for compressible data,
+~25 KiB/s for incompressible v1 streams). SHA-256 was never a factor
+(~0.13–0.16 s device, ~1.5 ms host for 607 KiB).
 
 `SOMNOBRIDGE_HTTP_AUDIT=ON` enables a temporary authenticated read/discard
 `HTTP_TEST` diagnostic. It deliberately denies file-completion permission,
 can finish a diagnostic read after the test client disconnects, and must be
 OFF in the final image. Normal firmware exposes no such operation.
 
-Live checks passed deep-JSON rejection, duplicate-day preparation, three
-abort/recovery cycles and explicit no-credit timeout, with no recorded panic
-or stack overflow. Repeated-file validation stopped when actual therapy
-began: transport returned bytes but completion permission was correctly
-denied, and subsequent GET_FILE was gated. Remaining final-build retrieval,
-throughput and soak checks require THERAPY_OUT; do not bypass it or describe
-this partial run as a complete certification.
+Final-image validation (audit OFF, recvmbox=16) passed: deep-JSON
+rejection, duplicate-day preparation, POSIX root listing, three
+abort/recovery cycles, explicit no-credit timeout, 20 back-to-back
+verified transfers, an odd-length 262,145-byte stream, and concurrent
+GET_STATUS during a 607 KiB transfer. A fresh seven-day download verified
+218/218 listed files (16.48 MiB raw, 6.36 MiB wire, ~44 KiB/s raw
+aggregate including per-file overheads, ~8.3 min wall) with zero
+sequence/decode errors, zero panics or stack overflows, and continuous
+5-second card polling (462 HTTP service calls, zero failures).
