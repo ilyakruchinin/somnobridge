@@ -618,6 +618,11 @@ class SomnoBridge:
                     # rescan (~10 s) and answered honestly — wait it out
                     time.sleep(12)
                     continue
+                if code == "BUSY" and attempt < 2:
+                    # previous stream's task is still in teardown
+                    # (redundant STREAM_END resend) — brief pause
+                    time.sleep(1.5)
+                    continue
                 return {"begin": begin, "raw": b"", "end": None}
             res = self._stream_collect(rid, end)
             if res.get("end") is not None:

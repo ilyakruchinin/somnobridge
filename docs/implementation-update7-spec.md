@@ -221,7 +221,38 @@ partition, re-init, reopen, mark `truncated`, and retry the chunk once.
 The journal is a bounded forensic ring that already self-documents
 truncation; losing its history is the documented degraded mode.
 
-## 13. What is NOT in this update
+## 13. Live-download fixes (real `GET_FILE`)
+
+Synthetic `STREAM_TEST` validated the transport but never exercised the
+EZShare fetch path. The first real-file week batch found two more
+defects:
+
+1. **`ble_stream` stack overflow.** Real `GET_FILE` runs
+   `ezs_download()` + `esp_http_client` + the codec on the stream task;
+   the 12 KiB stack (sized by the synthetic path, ~8.9 KiB peak)
+   overflowed at `fetch start` and panicked. The task is back to 16 KiB
+   as originally documented.
+2. **NimBLE `npl_freertos_eventq_remove` assert** (`ret == pdPASS`,
+   `npl_os_freertos.c:460`) — panic after ~20 min of real streaming.
+   `ble_tx_task` called `ble_gatts_indicate_custom()` on a foreign task;
+   the indicate path reschedules the HS callout, whose
+   `callout_reset → eventq_remove` remove-and-requeue loop races the
+   host task's blocking `xQueueReceive` on `ble_hs_evq` — the local
+   `portMUX` provides no cross-core exclusion, so the
+   `uxQueueMessagesWaiting` count can go stale mid-loop.
+   `ble_svc_control_indicate()` now detects non-host-task callers
+   (`s_host_task` captured in `host_task`) and defers through
+   `nimble_port_get_dflt_eventq()` + `ble_npl_eventq_put`, running the
+   indicate on the host task itself with a bounded synchronous wait.
+   GAP/access-callback callers already on the host task keep the direct
+   path. Data `notify` carries no ATT proc and stays direct.
+3. **`BUSY` is a normal inter-stream state.** The stream task stays
+   `active` through teardown (~300 ms redundant-END flush), so a
+   back-to-back `GET_FILE` can see `BUSY`; clients retry it like
+   `STALE` (~1.5 s). Documented in `ble-api.md`; `ble_query.py` retries
+   it.
+
+## 14. What is NOT in this update
 
 - No ESP-NOW, no channel switching, no card config writes (Option 2
   from Appendix D is untouched).
@@ -230,7 +261,7 @@ truncation; losing its history is the documented degraded mode.
 - No PHY/interval parameter changes on the peripheral side beyond what
   already shipped (the central, not us, controls conn params).
 
-## 14. Verification
+## 15. Verification
 
 - Host suite: `scripts/run_host_tests.sh` passes (framing, codec
   round-trips, journal self-heal stubs added).

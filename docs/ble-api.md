@@ -102,6 +102,11 @@ Error codes: `BAD_REQUEST`, `UNSUPPORTED_OP`, `BUSY`, `NOT_FOUND`,
 `therapy.transfer_allowed` in `GET_STATUS`; `PREPARE_DAYS` +
 a retry after `eta_ms` smooths the ~90 s listing-freshness guard.
 
+`BUSY` is transient: the previous stream's task stays `active` for
+a few hundred ms after `STREAM_END` (redundant-END flush + teardown).
+Clients issuing back-to-back files MUST retry `BUSY` after a short
+pause (~1.5 s), the same contract as `STALE`.
+
 ### Path syntax
 
 `directory` arguments are card-agnostic, card-root-relative:

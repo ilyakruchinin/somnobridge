@@ -1608,14 +1608,15 @@ esp_err_t ble_ops_init(void)
     xTaskCreatePinnedToCore(ble_tx_task, "ble_tx", 4096, NULL, 6,
                             &s_tx_task, 1);
     /* ble_stream_task runs ezs_download -> esp_http_client (stack-hungry)
-     * plus journal NVS reads on the evidence path. 6 KiB overflowed and
-     * corrupted the heap (crash in esp_http_client_init's calloc under a
-     * second download). Peak observed 8.9 KiB (hwm 7448 on 16 KiB) —
-     * 12 KiB keeps margin while sparing contiguous internal RAM that
-     * the nimble_host task and SM pairing crypto must have.
+     * plus journal NVS reads on the evidence path and, on wire v2, the
+     * ROM tdefl compressor — all in one task frame chain. 6 KiB
+     * overflowed and corrupted the heap; 12 KiB overflowed inside
+     * esp_http_client_open on the real-file path (the earlier 8.9 KiB
+     * "peak" was measured on the synthetic/evidence paths that never
+     * enter the HTTP client). 16 KiB is the validated size.
      * Core 1: NimBLE host + controller live on core 0; HTTP/compression
      * work must not compete with them (update7 §3).                  */
-    xTaskCreatePinnedToCore(ble_stream_task, "ble_stream", 12288, NULL, 8,
+    xTaskCreatePinnedToCore(ble_stream_task, "ble_stream", 16384, NULL, 8,
                             &s_ble_task, 1);
     return ESP_OK;
 }

@@ -9,6 +9,10 @@
  */
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
 #include "ble_svc.h"
 #include "ble_proto.h"
 #include "board.h"
@@ -549,8 +553,57 @@ void ble_svc_resume(void)
 
 /* ---------------- notifications / streaming ---------------- */
 
+/* Calling ble_gatts_indicate_custom() from a non-host task races the
+ * NimBLE host queue: the indicate path reschedules the HS callout timer,
+ * and npl_freertos_eventq_remove() asserts when the host task's blocking
+ * xQueueReceive drains an entry between the removal loop's
+ * uxQueueMessagesWaiting() count and its own receives (observed panic:
+ * "assertion: ret == pdPASS ... npl_os_freertos.c"). The port gives no
+ * cross-core exclusion for that window, so control indications issued
+ * off-task are deferred onto the default event queue and run on the
+ * NimBLE host task itself. Notifications carry no ATT proc bookkeeping
+ * and stay direct. */
+static TaskHandle_t s_host_task;
+static struct ble_npl_eventq *s_hs_evq;
+
+typedef struct {
+    struct ble_npl_event ev;
+    const uint8_t *data;
+    uint16_t len;
+    volatile bool ok;
+    SemaphoreHandle_t done;
+} ctrl_ind_req_t;
+
+static ctrl_ind_req_t s_creq;
+static StaticSemaphore_t s_creq_sem;
+
+static void ctrl_ind_cb(struct ble_npl_event *ev)
+{
+    ctrl_ind_req_t *r = ble_npl_event_get_arg(ev);
+    r->ok = ble_svc_control_indicate(r->data, r->len);
+    xSemaphoreGive(r->done);
+}
+
+static bool ctrl_indicate_deferred(const uint8_t *data, uint16_t len)
+{
+    if (!s_hs_evq) {
+        return false;
+    }
+    s_creq.data = data;
+    s_creq.len = len;
+    s_creq.ok = false;
+    ble_npl_eventq_put(s_hs_evq, &s_creq.ev);
+    if (xSemaphoreTake(s_creq.done, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        return false;               /* host queue wedged — retry later */
+    }
+    return s_creq.ok;
+}
+
 bool ble_svc_control_indicate(const uint8_t *data, uint16_t len)
 {
+    if (s_host_task && xTaskGetCurrentTaskHandle() != s_host_task) {
+        return ctrl_indicate_deferred(data, len);
+    }
     if (!ble_svc_authorized() || !s_ctrl_sub) {
         static int s_sub_log;
         if (s_sub_log < 3) {
@@ -632,7 +685,11 @@ static void on_reset(int reason)
 {
     ESP_LOGE(TAG, "nimble reset: %d", reason);
 }
-static void host_task(void *p) { nimble_port_run(); }
+static void host_task(void *p)
+{
+    s_host_task = xTaskGetCurrentTaskHandle();
+    nimble_port_run();
+}
 
 esp_err_t ble_svc_init(void)
 {
@@ -670,6 +727,10 @@ esp_err_t ble_svc_init(void)
      * CONFIG_BT_NIMBLE_NVS_PERSIST=y (spec §3.1)                   */
     ble_store_config_init();
     ble_ops_init();
+
+    s_hs_evq = nimble_port_get_dflt_eventq();
+    s_creq.done = xSemaphoreCreateBinaryStatic(&s_creq_sem);
+    ble_npl_event_init(&s_creq.ev, ctrl_ind_cb, &s_creq);
 
     nimble_port_freertos_init(host_task);
     s_init_stage = 4;
