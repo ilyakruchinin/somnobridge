@@ -20,6 +20,11 @@ PORT="${IDF_PORT:-/dev/ttyACM0}"
 if [ -e "$PORT" ]; then
     args+=(--device "$PORT")
 fi
+# The GEEK re-enumerates between ttyACM0/ttyACM1 on every reset; forward
+# every live serial node so esptool/monitor survive the flip.
+for d in /dev/ttyACM[0-9]*; do
+    [ -e "$d" ] && [ "$d" != "$PORT" ] && args+=(--device "$d")
+done
 if [ $# -eq 0 ]; then
     set -- /bin/bash
 elif [ "$1" = "exec" ]; then

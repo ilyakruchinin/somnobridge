@@ -53,6 +53,17 @@ host reboot. Have a fallback plan before running long download loops.
 
 ## BLE pairing / GATT testing (host side)
 
+**Pairing:** `./scripts/pair_host.py` pairs this host in one uninterrupted
+run — short-press the device button (`PAIRING 120S`), run the script, and
+type the 6-digit LCD PIN at the terminal prompt (~25 s). `--code-file PATH`
+polls a file instead (scripted use). Its BlueZ agent (KeyboardDisplay,
+D-Bus) answers `RequestPasskey`; `Pair()` is issued ASYNC with a running
+GLib loop — a synchronous `Pair()` blocks the loop, the agent never
+answers, and the device cancels at its 30 s SMP timeout. Use `--re-pair`
+when the device side lost the bond (reflash/NVS wipe/FORGET_PEER) —
+BlueZ's stale record must be `RemoveDevice`d first, then the device
+re-discovered (the Device1 object dies with the record).
+
 `bluetoothctl` is unreliable for exercising the control characteristic — do
 NOT trust it to tell you whether the firmware works:
 

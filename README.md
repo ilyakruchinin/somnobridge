@@ -73,13 +73,28 @@ Details: `docs/implementation-spec.md` §3–§4.
 
 ## Build & flash
 
-Docker is the only host dependency; ESP-IDF is pinned to `v5.5.5`:
+Docker is the only host dependency; ESP-IDF is pinned to `v5.5.5`.
 
 ```bash
+./scripts/idf.sh set-target esp32s3   # once per fresh checkout (creates sdkconfig)
 ./scripts/idf.sh build                # idf.py build inside espressif/idf:v5.5.5
-./scripts/idf.sh -p /dev/ttyACM0 flash
-./scripts/build-dist.sh               # merged image into dist/
+./scripts/idf.sh -p /dev/ttyACM0 flash monitor
 ```
+
+Or produce a single merged, flashable image (bootloader + partition table + app):
+
+```bash
+./scripts/build-dist.sh               # -> dist/somnobridge-<version>-merged.bin
+./scripts/build-dist.sh --clean       # full reconfigure from scratch first
+```
+
+Flash the merged image with one write at offset `0x0`:
+
+```bash
+esptool.py --chip esp32s3 -p /dev/ttyACM0 write_flash 0x0 dist/somnobridge-<version>-merged.bin
+```
+
+All data partitions (`nvs`, `phy_init`, `evidence`, `metadata`) sit **above** the app partition, outside the merged image's span, so a merged-image reflash preserves saved settings, BLE bonds, and the timing-evidence journal. `build-dist.sh` asserts this after every build and fails if the partition layout ever violates it.
 
 **GEEK flashing quirks** (details in `AGENTS.md`): the board may stay in download mode after `flash` — run any esptool op with `--after watchdog_reset` to boot the app, and never keep a serial reader open on the port while flashing. The port re-enumerates between `ttyACM0`/`ttyACM1` on reset; `/dev/serial/by-id/` is stable.
 
@@ -98,6 +113,8 @@ Docker is the only host dependency; ESP-IDF is pinned to `v5.5.5`:
 ./scripts/ble_query.py --stream-test 2097152 --pattern ramp   # add --v1 for legacy wire
 ./scripts/ble_query.py --self-test           # offline protocol self-tests
 ```
+
+`scripts/pair_host.py` pairs this host with the device in one uninterrupted run — short-press the device button (`PAIRING 120S` on the LCD), run the script, and type the 6-digit PIN shown on the device's LCD at the terminal prompt (~25 s to answer). For scripted use, `--code-file PATH` polls a file for the PIN instead. Use `--re-pair` when the device side lost the bond (reflash/NVS wipe/FORGET_PEER).
 
 Host-side pitfalls it already encodes (see `docs/ble-api.md` §8): drop backward-sequence compact frames (BlueZ double-delivers when a second process holds `StartNotify`), ignore response fragments on a completed request id, and treat the Intel AX200 as fragile under sustained notify load.
 

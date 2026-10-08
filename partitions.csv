@@ -7,8 +7,14 @@
 #  - metadata: NVS subtype, 1 MiB for drift records + load_budget ledger
 # All three NVS partitions are opened with nvs_flash_secure_init* when the
 # device is provisioned (HMAC-based NVS encryption, spec §4.2).
-nvs,      data, nvs,     0x9000,   0x6000,
-phy_init, data, phy,     0xf000,   0x1000,
+#
+# nvs/phy_init sit ABOVE the app deliberately: a merged flashable image
+# (scripts/build-dist.sh) spans 0x0..app_end and pads inter-segment gaps
+# with 0xFF, so any data partition inside that span is erased by every
+# merged-image reflash. Keep all data partitions outside the
+# bootloader+app span; build-dist.sh asserts this after every build.
 factory,  app,  factory, 0x10000,  0x400000,
 evidence, data, nvs,     ,         0x200000,
 metadata, data, nvs,     ,         0x100000,
+nvs,      data, nvs,     0x710000, 0x6000,
+phy_init, data, phy,     0x770000, 0x1000,
