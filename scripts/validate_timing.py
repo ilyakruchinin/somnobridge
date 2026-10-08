@@ -14,6 +14,7 @@ import posixpath
 import re
 import select
 import statistics
+import sys
 import tempfile
 import time
 import urllib.request
@@ -86,8 +87,14 @@ def reference(host, source_uncertainty_ms, rounds=3):
 
 def ble_connect(address):
     import dbus.mainloop.glib
-    from ble_query import SomnoBridge
+    from ble_query import SomnoBridge, find_device_address
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    if not address:
+        print("scanning for SomnoBridge...", file=sys.stderr)
+        address = find_device_address()
+        if not address:
+            sys.exit("no SomnoBridge found — pass --address explicitly")
+        print(f"found {address}", file=sys.stderr)
     dev = SomnoBridge(address)
     try:
         dev.connect()
@@ -1140,7 +1147,8 @@ def main():
     parser.add_argument("mode", choices=["history", "capture", "observe", "cycle",
                                        "analyze", "self-test"])
     parser.add_argument("--host", default="192.168.86.102")
-    parser.add_argument("--address", default="8C:FD:49:93:74:76")
+    parser.add_argument("--address", default=None,
+                        help="BLE address (default: scan for SomnoBridge)")
     parser.add_argument("--day", default="20260930")
     parser.add_argument("--timezone", default="Australia/Melbourne")
     parser.add_argument("--source-uncertainty-ms", type=float)

@@ -31,7 +31,7 @@ For implementation, **this document takes precedence where these documents or th
 | Physical cadence versus logical EDF duration | Fit physical cadence separately. Derive a sample-time scale only after verifying the record-to-flush relationship. |
 | Precision estimates versus error bounds | Publish model-qualified intervals and uncertainty components; do not label unvalidated assumptions as measured accuracy (§8). |
 | NTP path | SomnoTrace supplies authenticated BLE time exchanges. SomnoBridge does not join a home WiFi network or trust the card's HTTP clock. |
-| Open HTTP management on EZShare WiFi | No HTTP listener in normal STA operation. Setup/diagnostics are confined to a physically opened, password-protected AP. |
+| Open HTTP management on EZShare WiFi | No HTTP listener in normal STA operation. Setup/diagnostics are confined to a physically opened, short-lived open AP (§4.1). |
 
 ### 0.2 Deliberate exclusions
 
@@ -140,14 +140,14 @@ Entering SETUP MUST:
 1. Close the pairing window/cancel pending pairing, reject new live BLE work, and abort any in-flight transfer with an explicit error. An existing authorized bonded connection may remain for local status only.
 2. Set therapy UNKNOWN/stale and record an observation gap.
 3. Disconnect EZShare STA; do not operate an EZShare bridge while the portal is open.
-4. Start a WPA2-PSK AP named `SomnoBridge-Setup-XXXX` using a fresh random 12-character password, shown on the LCD. No shared/default password or open fallback.
+4. Start an open AP named `SomnoBridge-Setup-XXXX` (`XXXX` random per session). **Deliberate deviation from the usual WPA2-PSK recommendation:** the AP password was dropped for UX — the LCD is too small to transcribe a 12-character password comfortably, and the residual protection it offered is low: a motivated attacker in radio range during a short-lived, physically initiated window could observe it anyway. Security instead relies on the physical gate (long-press to open), the short session bounds below, the single-client cap, CSRF/session hardening, and the button confirmation for destructive actions. The residual risk — an in-range attacker could push a different EZShare SSID during an open setup window — is accepted; it yields at most a wrong bridge endpoint, recoverable by re-entering setup.
 5. Serve a local portal at `192.168.8.1`, with at most one WiFi client. Show the address explicitly; captive-portal detection is optional, never required for setup.
 
 Close the AP after a successful save, a runtime exit hold, or five minutes without authenticated portal activity; enforce an absolute 15-minute session limit. With no valid settings, closing setup leaves a local `Setup required — hold BOOT` screen. Credentials and bonds remain intact on timeout. A new setup session gets new AP/session secrets.
 
-The portal serves only local embedded assets, never external scripts/fonts. After joining with the unique AP password, bootstrap a random session cookie and CSRF token from the landing page. Require them on configuration/diagnostic API requests; cookie is HttpOnly and SameSite=Strict. Accept only the local Host, reject cross-origin requests, and do not enable CORS. Mutations require POST with JSON, matching Origin and a CSRF header. No configuration in URL query strings. Cap HTTP request bodies at 4 KiB, clients at one, and idle sockets at 10 seconds. Rate-limit API requests to 5/s with a burst of 10.
+The portal serves only local embedded assets, never external scripts/fonts. After joining the open AP, bootstrap a random session cookie and CSRF token from the landing page. Require them on configuration/diagnostic API requests; cookie is HttpOnly and SameSite=Strict. Accept only the local Host, reject cross-origin requests, and do not enable CORS. Mutations require POST with JSON, matching Origin and a CSRF header. No configuration in URL query strings. Cap HTTP request bodies at 4 KiB, clients at one, and idle sockets at 10 seconds. Rate-limit API requests to 5/s with a burst of 10.
 
-The AP password protects local HTTP in transit over WiFi, not end-to-end TLS. This is a deliberately local, physically initiated commissioning channel; do not present it as an internet-accessible management interface.
+The open AP carries plaintext HTTP — anyone in radio range during a setup window can observe or attempt portal traffic. This is a deliberately local, physically initiated commissioning channel; do not present it as an internet-accessible management interface, and never keep it open in normal operation.
 
 | Portal endpoint | Contract |
 |---|---|
@@ -179,9 +179,11 @@ Version 1 has no arbitrary URL, proxy destination, poll-rate slider, or user swi
 
 Use NVS's power-loss-safe blob replacement and commit before reporting `saved`. A failed commit leaves the prior valid settings usable. Validate again on boot; unknown schema, corruption, or inconsistent bond state enters a visible recoverable FAULT, not silent NVS erase. The WiFi driver MUST use RAM credential storage; `sp_config` is the only persistent WiFi-settings authority. Keep stack bond data in its encrypted NVS store and reconcile it with the authorized identity before enabling the service.
 
-**Production:** encrypt config, bonds, and the evidence NVS partition using ESP-IDF's ESP32-S3 HMAC-backed NVS encryption scheme with a unique protected per-device eFuse HMAC key. Protect the key against readout. This requires a separately approved device-provisioning operation; firmware MUST check for a provisioned key and MUST NOT automatically burn an eFuse on first boot. Missing protection yields `SECURITY_NOT_PROVISIONED`, not plaintext storage of real credentials or health data.
+**At-rest protection:** encrypt config, bonds, and the evidence NVS partition using ESP-IDF's ESP32-S3 HMAC-backed NVS encryption scheme with a unique protected per-device eFuse HMAC key when one is provisioned. Protect the key against readout. Firmware MUST check for a provisioned key and MUST NOT automatically burn an eFuse on first boot.
 
-A clearly labeled developer/test build may use ordinary NVS only for synthetic tests, must display/report `DEVELOPMENT — STORAGE UNPROTECTED`, and is not a compliant production release. Secure Boot/flash encryption for resistance to malicious firmware replacement is a separate explicitly authorized deployment choice, not something to enable irreversibly during routine development. No keys or credentials belong in repository files, fixtures, release images, or logs.
+**Deliberate deviation (shipped default `CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED=y`):** an unprovisioned board — no burned eFuse HMAC key — runs `DEV-UNPROTECTED`, storing settings, bond identity, and evidence in **plain NVS** rather than failing closed. Rationale: an `espefuse` provisioning step is a high barrier for from-source builders, and the residual exposure is modest — reading the plaintext requires physical flash access, and the EZShare link is itself plaintext HTTP. Boards provisioned with the eFuse key still take the encrypted path; the flag is only the no-key fallback. Report the state honestly (`ENCRYPTED` / `DEV-UNPROTECTED`) and set the flag `n` for a strict deployment profile, where missing protection yields `SECURITY_NOT_PROVISIONED`.
+
+Secure Boot/flash encryption for resistance to malicious firmware replacement is a separate explicitly authorized deployment choice, not something to enable irreversibly during routine development. No keys or credentials belong in repository files, fixtures, release images, or logs.
 
 Persist bonds only at enrollment/revocation and settings only at explicit saves. Do not persist catalog entries, periodic status, or a boot counter in settings NVS. Evidence is the separately bounded journal in §9.
 

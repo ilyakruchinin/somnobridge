@@ -43,7 +43,7 @@ The TF card slot is **unused** — file data streams through a bounded PSRAM rin
 
 ## What the firmware does
 
-1. **Provision** — holding BOOT enters SETUP mode: the device hosts a WPA2 setup AP (`SomnoBridge-Setup-XXXX`, random password shown on the LCD) with a configuration portal at `192.168.8.1`. You set the EZShare SSID/password there. Settings persist in NVS; destructive actions require a physical button confirmation.
+1. **Provision** — holding BOOT enters SETUP mode: the device hosts a short-lived open setup AP (`SomnoBridge-Setup-XXXX`) with a configuration portal at `192.168.8.1`. You select the EZShare SSID (scanned list) and enter its password there. Settings persist in NVS; destructive actions require a physical button confirmation.
 2. **Join** — connects to the EZShare AP as a STA with jittered backoff reconnect. An open/weak card WiFi is reported as a warning, never silently joined.
 3. **Observe** — a scheduler polls `A:\DATALOG` on a bounded budget (≈1 listing/s sustained, ~5 s cadence for hot folders), maintaining a volatile in-memory catalog of day folders and file metadata. The same parsed listing feeds therapy detection — no subsystem polls the card independently.
 4. **Estimate drift** — the AirSense clock drifts and EZShare has no usable clock, so SomnoBridge measures listing growth events and file timestamps against NTP anchors supplied by SomnoTrace over BLE, and publishes a qualified offset/drift estimate (best-effort, statistically plausible — see `docs/proposal-final.md`).
@@ -66,7 +66,7 @@ Measured on hardware (2 MiB streams, concurrent-subscriber worst case, SHA-verif
 
 - One bonded peer. LE Secure Connections + MITM passkey shown on the LCD; pairing only inside a physically opened 120 s window.
 - All characteristics gate on an encrypted link + authorized bonded identity; control/data delivery requires CCCD subscription.
-- Settings, bonds and the evidence journal live in NVS; production builds use HMAC-backed NVS encryption with a provisioned eFuse key (firmware reports `SECURITY_NOT_PROVISIONED` rather than storing plaintext).
+- Settings, bonds and the evidence journal live in NVS; boards provisioned with an eFuse HMAC key use HMAC-backed NVS encryption, unprovisioned boards run `DEV-UNPROTECTED` (plain NVS) by default — set `CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED=n` for a strict fail-closed profile.
 - No HTTP listener in normal operation — the portal only exists inside SETUP mode.
 
 Details: `docs/implementation-spec.md` §3–§4.

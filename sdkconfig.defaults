@@ -98,10 +98,13 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
-# Production: fail closed (SECURITY_NOT_PROVISIONED) when the eFuse HMAC
-# key is missing. CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED=y is the dev fallback
-# that stores settings in plain NVS — never for release builds.
-# CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED is not set
+# Unprovisioned boards (no eFuse HMAC key) store settings in plain NVS
+# rather than failing closed — keeps from-source builds usable without a
+# provisioning step. Boards WITH the key still run the encrypted path
+# (ENCRYPTED wins; this is only the no-key fallback). At-rest secrets are
+# plaintext on unprovisioned boards — accepted trade-off; flip to 'n' for
+# a strict production profile.
+CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED=y
 # LESC P-256 math at -Og takes tens of seconds and overruns the 30 s SMP
 # proc timer — compile performance, keep assertions.
 # CONFIG_COMPILER_OPTIMIZATION_DEBUG is not set

@@ -56,11 +56,60 @@ BLK_HDR = struct.Struct("<BBHII")       # stream block envelope (12 B)
 
 STREAM_WINDOW = 48 * 240                # credit grant, wire bytes
 
-DEFAULT_ADDR = "8C:FD:49:93:74:76"
+ADV_NAME_PREFIX = "SomnoBri"            # adv name is truncated to 8 chars
+                                        # (31-byte adv payload budget)
 TIMESTAMP_ALLOWANCE_US = 5000           # §8.1 provisional 5 ms
 RTT_MAX_US = 250000
 SRC_QUAL_UNC_MAX_US = 100000
 SRC_UNC_MAX_US = 500000
+
+
+def find_device_address(timeout=8.0):
+    """Resolve a SomnoBridge by service UUID or adv-name prefix.
+
+    Checks BlueZ's known devices first, then runs an active scan for
+    `timeout` seconds. Returns the address string or None."""
+    bus = dbus.SystemBus()
+    om = dbus.Interface(bus.get_object("org.bluez", "/"),
+                        "org.freedesktop.DBus.ObjectManager")
+
+    def scan_objects():
+        for _path, ifaces in om.GetManagedObjects().items():
+            d = ifaces.get("org.bluez.Device1")
+            if not d:
+                continue
+            uuids = [str(u).lower() for u in d.get("UUIDs", [])]
+            name = str(d.get("Name", d.get("Alias", "")))
+            if SVC_UUID in uuids or name.startswith(ADV_NAME_PREFIX):
+                return str(d["Address"])
+        return None
+
+    addr = scan_objects()
+    if addr:
+        return addr
+    adapter = dbus.Interface(
+        bus.get_object("org.bluez", "/org/bluez/hci0"),
+        "org.bluez.Adapter1")
+    try:
+        adapter.StartDiscovery()
+    except dbus.exceptions.DBusException:
+        pass
+    try:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            ctx = GLib.MainContext.default()
+            while ctx.pending():
+                ctx.iteration(False)
+            time.sleep(0.05)
+            addr = scan_objects()
+            if addr:
+                return addr
+        return None
+    finally:
+        try:
+            adapter.StopDiscovery()
+        except dbus.exceptions.DBusException:
+            pass
 
 
 def frame(kind, rid, offset, flags, payload=b""):
@@ -1205,8 +1254,9 @@ def main():
     ap = argparse.ArgumentParser(
         description="Query a bonded SomnoBridge over BLE (BlueZ D-Bus).",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--address", default=DEFAULT_ADDR,
-                    help=f"BLE address (default {DEFAULT_ADDR})")
+    ap.add_argument("--address", default=None,
+                    help="BLE address (default: scan for a device "
+                         "advertising the SomnoBridge service)")
     ap.add_argument("--status", action="store_true", help="GET_STATUS")
     ap.add_argument("--catalog", action="store_true", help="GET_CATALOG_STATUS")
     ap.add_argument("--days", type=int, nargs="?", const=14, default=None,
@@ -1260,6 +1310,12 @@ def main():
         args.days = 14
 
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    if not args.address:
+        print("scanning for SomnoBridge...", file=sys.stderr)
+        args.address = find_device_address()
+        if not args.address:
+            sys.exit("no SomnoBridge found — pass --address explicitly")
+        print(f"found {args.address}", file=sys.stderr)
     dev = SomnoBridge(args.address, verbose=args.verbose)
     try:
         dev.connect()
