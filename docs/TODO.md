@@ -654,3 +654,49 @@ self-heals once per boot when the partition reads but cannot write
 
 Pending: real-file throughput measurement once the therapy gate opens;
 SomnoTrace client side of wire v2 is a separate task.
+
+## PRODUCTION: development switches — DONE (both disabled 2026-10-08)
+
+Two build flags make development/testing easy but must be OFF in a
+production build. Both are now disabled in `sdkconfig` and
+`sdkconfig.defaults` (with findable comments), built, flashed, and
+verified live:
+
+- `GET_STATUS` reports `security:"ENCRYPTED"` — the eFuse HMAC key is
+  already provisioned on this board, so encrypted NVS was always in use
+  and the flag flip lost no data.
+- `paired:true`, `ble_connected:true` — the existing BLE bond survives
+  (bond keys were already in encrypted NVS); `sta_connected:true` —
+  EZShare credentials load fine.
+- `sdkconfig.h` no longer defines either `CONFIG_SOMNOBRIDGE_*` symbol.
+
+For the record, what each flag does:
+
+### 1. `CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED` — "store secrets unencrypted if no key exists"
+
+SomnoBridge stores the EZShare WiFi password and bonded BLE peer identity
+in flash (NVS). The design (spec §4.2) encrypts that storage with a key
+burned permanently into the chip's eFuse. This flag was the fallback: "if
+the eFuse key is missing, boot anyway and store settings in *plain*
+flash". With it OFF (now), a missing key fails closed — the firmware
+refuses to write settings at all (`SECURITY_NOT_PROVISIONED`).
+
+**Provisioning a NEW board:** burn the eFuse HMAC key FIRST (one-time,
+irreversible — `CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=0` → `EFUSE_BLK_KEY0`),
+then flash. A `=n` build on an unprovisioned board will refuse to save
+settings by design. A board previously running plain-NVS dev firmware
+loses its settings on first encrypted boot (setup must be redone).
+
+Also fixed in the same change: `settings.c` used the flag as a runtime C
+expression, but unset bools produce no `sdkconfig.h` define — the dev
+fallback branch is now `#ifdef`-compiled out entirely.
+
+### 2. `CONFIG_SOMNOBRIDGE_DIAG_FIXED_PASSKEY` — "pairing code is always 424242"
+
+Made BLE pairing use a fixed documented passkey so automated tests could
+pair without reading the LCD. Now OFF — pairing shows a random per-attempt
+passkey on the LCD. Re-enable only for dev: set
+`CONFIG_SOMNOBRIDGE_DIAG_FIXED_PASSKEY=y` in `sdkconfig`.
+
+**Remaining production step:** none on this board. Only note — pairing a
+*new* host now requires reading the LCD passkey (by design).

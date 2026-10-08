@@ -173,7 +173,11 @@ esp_err_t settings_init(void)
         }
         ESP_RETURN_ON_ERROR(err, TAG, "secure init");
         s_sec = SP_SEC_ENCRYPTED;
-    } else if (CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED) {
+    }
+#ifdef CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED
+    /* Kconfig bools are absent from sdkconfig.h when 'n' — the fallback
+     * must be compiled out, not just evaluate to false. */
+    else if (CONFIG_SOMNOBRIDGE_DEV_UNPROTECTED) {
         ESP_LOGW(TAG, "no eFuse HMAC key — DEV UNPROTECTED storage");
         esp_err_t err = nvs_flash_init();
         if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -183,7 +187,9 @@ esp_err_t settings_init(void)
         }
         ESP_RETURN_ON_ERROR(err, TAG, "nvs init");
         s_sec = SP_SEC_DEV_UNPROTECTED;
-    } else {
+    }
+#endif
+    else {
         ESP_LOGE(TAG, "SECURITY_NOT_PROVISIONED: eFuse HMAC key missing");
         /* Mount plain NVS anyway so the fault screen can run; every
          * persistence path refuses writes while unprovisioned. */
