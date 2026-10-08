@@ -15,3 +15,9 @@ source or binary form, must preserve the attribution:
 SomnoBridge is a separate firmware project from SomnoTrace. It is designed
 to interoperate with SomnoTrace over BLE, but it is not a fork of and is
 not derived from SomnoTrace source code.
+
+The AirSense 10/11 illustrations shown by the setup portal are AI-generated
+images produced for this project by its author; they contain no third-party
+photographic content. ResMed, AirSense, and HumidAir are trademarks of
+ResMed Pty Ltd; the illustrations are used only to identify the machine
+model during setup and imply no affiliation with or endorsement by ResMed.

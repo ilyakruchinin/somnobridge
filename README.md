@@ -43,7 +43,7 @@ The TF card slot is **unused** — file data streams through a bounded PSRAM rin
 
 ## What the firmware does
 
-1. **Provision** — holding BOOT enters SETUP mode: the device hosts a short-lived open setup AP (`SomnoBridge-Setup-XXXX`) with a configuration portal at `192.168.8.1`. You select the EZShare SSID (scanned list) and enter its password there. Settings persist in NVS; destructive actions require a physical button confirmation.
+1. **Provision** — holding BOOT enters SETUP mode: the device hosts a short-lived open setup AP (`SomnoBridge-Setup-XXXX`) with a configuration portal at `192.168.8.1`. There you pick your CPAP model (10-series stores no timezone offset; 11-series stores the machine's configured GMT offset), select the EZShare SSID (scanned list) and enter its password. Settings persist in NVS; destructive actions require a physical button confirmation.
 2. **Join** — connects to the EZShare AP as a STA with jittered backoff reconnect. An open/weak card WiFi is reported as a warning, never silently joined.
 3. **Observe** — a scheduler polls `A:\DATALOG` on a bounded budget (≈1 listing/s sustained, ~5 s cadence for hot folders), maintaining a volatile in-memory catalog of day folders and file metadata. The same parsed listing feeds therapy detection — no subsystem polls the card independently.
 4. **Estimate drift** — the AirSense clock drifts and EZShare has no usable clock, so SomnoBridge measures listing growth events and file timestamps against NTP anchors supplied by SomnoTrace over BLE, and publishes a qualified offset/drift estimate (best-effort, statistically plausible — see `docs/proposal-final.md`).

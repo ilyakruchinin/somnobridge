@@ -171,7 +171,7 @@ Persist settings as one versioned, validated NVS blob in namespace `sp_config`, 
 | `allow_open_wifi` | boolean, false |
 | `ezshare_bssid` | optional selected MAC; null means no BSSID lock |
 | `http_host_ipv4` | optional IPv4 in the associated STA subnet; null uses its DHCP gateway |
-| `as10_tz` | validated POSIX TZ rule, ≤96 ASCII bytes, initial `UTC0` |
+| `as10_tz` | validated POSIX TZ rule, ≤96 ASCII bytes, initial `UTC0`. The portal's machine selector maps ResMed 10-series to `UTC0` (no offset — the AS10 clock is set by hand) and ResMed 11-series to the machine's configured GMT offset |
 | `timezone_confirmed` | boolean, false until user confirms this represents the AS10 clock |
 | `lcd_brightness` | integer 1–100, initial 30 |
 
