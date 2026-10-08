@@ -54,6 +54,20 @@ void           netw_refresh_rssi(void);  /* STA RSSI poll (~1 Hz)    */
 /* Setup AP credentials — generated per session (spec §4.1). */
 void netw_ap_credentials(char ssid[33], char pass[16]);
 
+/* Scan result entry (setup AP mode only). */
+typedef struct {
+    char ssid[33];
+    int8_t rssi;
+    bool open;      /* no auth required */
+} netw_ap_t;
+
+/**
+ * Blocking scan of surrounding APs while the setup AP is up (APSTA).
+ * Deduplicates by SSID (strongest RSSI kept), skips hidden networks and
+ * the setup AP itself, strongest first. Returns count, or -1 on error.
+ */
+int netw_wifi_scan(netw_ap_t *out, int cap);
+
 /* Portal destructive-action queue + timeouts (spec §4.1):
  * actions arrive via POST /api/action and execute only after a
  * physical button confirm — the app loop owns that pairing.        */

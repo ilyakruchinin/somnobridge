@@ -103,30 +103,159 @@ static esp_err_t read_body(httpd_req_t *r, char *buf, size_t cap)
 
 /* ---------------- handlers ---------------- */
 
+/* Served straight from flash: no %s substitution. The CSRF token is
+ * fetched by the page from /api/config (cookie-protected), which keeps
+ * the same CSRF guarantee without a RAM copy of the page. */
 static const char INDEX_HTML[] =
-    "<!doctype html><meta charset=utf-8><title>SomnoBridge setup</title>"
-    "<style>body{font-family:monospace;max-width:34em;margin:2em auto}"
-    "label{display:block;margin:.6em 0}input{width:100%%}"
-    "button{margin:.4em 0;padding:.5em 1em}</style>"
-    "<h1>SomnoBridge setup</h1>"
-    "<form id=f><label>EZShare SSID<input name=ssid required></label>"
-    "<label>Password<input name=pass type=password></label>"
-    "<label><input name=open type=checkbox style=width:auto> "
-    "open network (no password)</label>"
-    "<label>AS10 timezone (POSIX)<input name=tz value=UTC0></label>"
-    "<button>Save &amp; connect</button></form>"
-    "<p id=m></p>"
-    "<script>"
-    "const C='%s';"
-    "f.onsubmit=e=>{e.preventDefault();"
-    "fetch('/api/config',{method:'POST',headers:{'Content-Type':"
-    "'application/json','X-SomnoBridge-CSRF':C},body:JSON.stringify({"
-    "ezshare_ssid:f.ssid.value,ezshare_password:f.pass.value,"
-    "allow_open_wifi:f.open.checked,as10_tz:f.tz.value,"
-    "timezone_confirmed:true})}).then(r=>r.json()).then(j=>{"
-    "m.textContent=j.ok?'Saved — device is connecting to the card.':'Error: '"
-    "+(j.error||'unknown')})};"
-    "</script>";
+"<!doctype html><html><head><meta charset=utf-8>"
+"<meta name=viewport content='width=device-width,initial-scale=1'>"
+"<title>SomnoBridge setup</title><style>"
+":root{--ac:#4f7cff;--ok:#1a9e55;--err:#d33}"
+"*{box-sizing:border-box}"
+"body{font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;"
+"background:#eef1f6;margin:0;min-height:100vh;display:flex;"
+"align-items:flex-start;justify-content:center;padding:24px 12px}"
+".card{background:#fff;border-radius:14px;"
+"box-shadow:0 6px 24px rgba(30,40,70,.12);max-width:420px;width:100%;"
+"padding:28px 26px}"
+"h1{font-size:1.35em;margin:0 0 2px}"
+".sub{color:#68738a;font-size:.85em;margin-bottom:18px}"
+"label{display:block;font-weight:600;font-size:.85em;margin:14px 0 4px;color:#2a3145}"
+"input[type=text],input[type=password],select{width:100%;padding:10px 12px;"
+"border:1px solid #c9d1e0;border-radius:8px;font-size:1em;background:#fbfcfe}"
+"input:focus,select:focus{outline:none;border-color:var(--ac);"
+"box-shadow:0 0 0 3px rgba(79,124,255,.15)}"
+"button{background:var(--ac);color:#fff;border:0;border-radius:8px;"
+"padding:11px 16px;font-size:1em;font-weight:600;width:100%;margin-top:18px;cursor:pointer}"
+"button:disabled{opacity:.5;cursor:default}"
+"button.ghost{background:#e8edf7;color:#2a3145;font-weight:500;width:auto;"
+"margin:0;padding:8px 14px;font-size:.85em}"
+"#aps{margin-top:8px;border:1px solid #dfe5f0;border-radius:8px;"
+"max-height:210px;overflow-y:auto}"
+".ap{padding:9px 12px;display:flex;justify-content:space-between;"
+"align-items:center;gap:8px;cursor:pointer;border-bottom:1px solid #eef1f6}"
+".ap:hover{background:#f2f6ff}.ap.sel{background:#e7efff}"
+".ap .n{font-weight:600;font-size:.95em;word-break:break-all}"
+".ap .m{color:#68738a;font-size:.78em;white-space:nowrap}"
+".badge{font-size:.7em;padding:2px 7px;border-radius:10px;font-weight:700}"
+".b-sec{background:#e3f5ea;color:var(--ok)}"
+".b-open{background:#fdf0e3;color:#b96a00}"
+".chk{display:flex;align-items:center;gap:8px;font-weight:500;font-size:.9em;margin-top:12px}"
+".chk input{width:auto}"
+"#msg{margin-top:14px;font-size:.9em;min-height:1.2em}"
+"#msg.ok{color:var(--ok)}#msg.err{color:var(--err)}"
+".spin{display:inline-block;width:14px;height:14px;border:2px solid #c9d1e0;"
+"border-top-color:var(--ac);border-radius:50%;animation:r .7s linear infinite;"
+"vertical-align:-2px;margin-right:6px}"
+"@keyframes r{to{transform:rotate(360deg)}}"
+".hint{font-weight:400;color:#68738a;font-size:.78em;margin-top:3px}"
+"input[type=range]{width:100%;accent-color:var(--ac)}"
+"</style></head><body><div class=card>"
+"<h1>SomnoBridge</h1>"
+"<div class=sub>Setup &mdash; connect to your EZShare card</div>"
+"<label>WiFi network (EZShare card)</label>"
+"<button class=ghost id=scanbtn type=button onclick=doScan()>Scan networks</button>"
+"<div id=aps></div>"
+"<label for=ssid>Network name (SSID)</label>"
+"<input id=ssid type=text maxlength=32 autocomplete=off "
+"placeholder='Select a scanned network or type the name'>"
+"<label for=pass>Password</label>"
+"<input id=pass type=password maxlength=64 autocomplete=new-password>"
+"<label class=chk><input id=open type=checkbox> Open network (no password)</label>"
+"<label for=tz>Machine time zone (GMT offset)</label>"
+"<select id=tz></select>"
+"<div class=hint>Whole hours only, matching the machine: AirSense 11 offers "
+"GMT&minus;12&hellip;GMT+14 in its settings menu. AirSense 10 has no "
+"timezone setting &mdash; it is the local time you set on the machine; "
+"update it after daylight-saving changes.</div>"
+"<label for=bright>LCD brightness <span id=bv></span></label>"
+"<input id=bright type=range min=1 max=100>"
+"<button id=save type=button onclick=save()>Save &amp; connect</button>"
+"<div id=msg></div>"
+"</div><script>"
+"const $=i=>document.getElementById(i);let CSRF='';"
+/* AS11 menu: GMT-12..GMT+14, 1-hour steps only; AS10 has no TZ setting
+ * (manual clock). Half-hour zones are reachable via the custom field. */
+"const ZONES=[[-12,0,'Baker Island'],[-11,0,'American Samoa'],"
+"[-10,0,'Hawaii'],[-9,0,'Alaska'],[-8,0,'Los Angeles, Vancouver'],"
+"[-7,0,'Denver, Calgary'],[-6,0,'Chicago, Mexico City'],"
+"[-5,0,'New York, Toronto'],[-4,0,'Santiago, Halifax'],"
+"[-3,0,'Sao Paulo, Buenos Aires'],[-2,0,'South Georgia'],"
+"[-1,0,'Azores, Cape Verde'],[0,0,'UTC'],"
+"[1,0,'Berlin, Paris, Madrid'],[2,0,'Athens, Cairo, Johannesburg'],"
+"[3,0,'Moscow, Istanbul, Riyadh'],[4,0,'Dubai, Baku'],"
+"[5,0,'Karachi, Tashkent'],[6,0,'Dhaka, Almaty'],"
+"[7,0,'Bangkok, Jakarta, Hanoi'],[8,0,'Beijing, Singapore, Perth'],"
+"[9,0,'Tokyo, Seoul'],[10,0,'Sydney, Melbourne'],"
+"[11,0,'Solomon Islands'],[12,0,'Auckland, Wellington'],[13,0,'Tonga'],"
+"[14,0,'Kiritimati']];"
+/* POSIX TZ sign is inverted (west-positive): UTC+2 -> "UTC-2" */
+"function posix(off){if(!off)return 'UTC0';const s=off>0?'-':'+';"
+"const a=Math.abs(off),h=Math.floor(a/60),m=a%60;"
+"return 'UTC'+s+h+(m?':'+m:'');}"
+/* parse a stored fixed-offset POSIX rule -> minutes EAST of UTC */
+"function parseTz(v){if(v==='UTC0'||v==='GMT0')return 0;"
+"const m=/^[A-Za-z]{3,}([+-])(\\d{1,2})(?::(\\d{1,2}))?$/.exec(v||'');"
+"if(!m)return null;return (m[1]==='+'?-1:1)*((+m[2])*60+(+m[3]||0));}"
+"function fillTz(cur){const t=$('tz');const coff=parseTz(cur);let match=false;"
+"ZONES.forEach(z=>{const off=z[0]*60+z[1],v=posix(off);"
+"const o=document.createElement('option');o.value=v;"
+/* label matches the AS11 menu: GMT-12 .. GMT+/-0 .. GMT+14 */
+"const l='GMT'+(off===0?'+/-0':(off>0?'+':'-')+Math.abs(off/60))+"
+"' \\u2014 '+z[2];"
+"o.textContent=l;if(coff!==null&&off===coff){o.selected=true;match=true;}"
+"t.appendChild(o);});"
+/* stored rule outside the fixed list (e.g. a legacy value): show it as-is */
+"if(!match&&cur){const o=document.createElement('option');o.value=cur;"
+"o.textContent='Stored: '+cur;o.selected=true;t.insertBefore(o,t.firstChild);}}"
+"function pwState(){$('pass').disabled=$('open').checked;}"
+"function doScan(){const b=$('scanbtn');b.disabled=true;"
+"b.innerHTML='<span class=spin></span>Scanning\\u2026';"
+"fetch('/api/scan').then(r=>r.json()).then(j=>{"
+"const box=$('aps');box.innerHTML='';const L=j.aps||[];"
+"if(!L.length){box.innerHTML='<div class=ap><span class=n style=color:#68738a>"
+"No networks found \\u2014 try again or type the name</span></div>';}"
+"L.forEach(a=>{const d=document.createElement('div');d.className='ap';"
+"const n=document.createElement('span');n.className='n';n.textContent=a.ssid;"
+"const m=document.createElement('span');m.className='m';"
+"const bd=document.createElement('span');"
+"bd.className='badge '+(a.open?'b-open':'b-sec');"
+"bd.textContent=a.open?'OPEN':'SECURED';"
+"m.appendChild(bd);m.appendChild(document.createTextNode(' '+a.rssi+' dBm'));"
+"d.appendChild(n);d.appendChild(m);"
+"d.onclick=()=>{document.querySelectorAll('.ap').forEach(x=>x.classList.remove('sel'));"
+"d.classList.add('sel');$('ssid').value=a.ssid;$('open').checked=!!a.open;pwState();};"
+"box.appendChild(d);});})"
+".catch(()=>{$('msg').textContent='Scan failed';$('msg').className='err';})"
+".finally(()=>{b.disabled=false;b.textContent='Scan networks';});}"
+"function save(){"
+"const b={ezshare_ssid:$('ssid').value.trim(),allow_open_wifi:$('open').checked,"
+"as10_tz:$('tz').value,"
+"timezone_confirmed:true,lcd_brightness:+$('bright').value};"
+"if($('pass').value)b.ezshare_password=$('pass').value;"
+"if($('open').checked)b.clear_password=true;"
+"$('save').disabled=true;$('msg').textContent='Saving\\u2026';$('msg').className='';"
+"fetch('/api/config',{method:'POST',"
+"headers:{'Content-Type':'application/json','X-SomnoBridge-CSRF':CSRF},"
+"body:JSON.stringify(b)}).then(r=>r.json()).then(j=>{"
+"if(j.ok){$('msg').className='ok';"
+"$('msg').textContent='Saved \\u2014 device is connecting to the card. "
+"The setup network will close.';}"
+"else{$('msg').className='err';$('msg').textContent='Error: '+(j.error||'unknown');"
+"$('save').disabled=false;}})"
+".catch(()=>{$('msg').className='err';$('msg').textContent='Save failed';"
+"$('save').disabled=false;});}"
+"fetch('/api/config').then(r=>r.json()).then(j=>{CSRF=j.csrf||'';"
+"$('ssid').value=j.ezshare_ssid||'';"
+"if(j.password_set)$('pass').placeholder='\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022"
+"  (saved \\u2014 leave blank to keep)';"
+"$('open').checked=!!j.allow_open_wifi;"
+"$('bright').value=j.lcd_brightness||30;"
+"$('bv').textContent='('+$('bright').value+'%)';"
+"fillTz(j.as10_tz||'UTC0');pwState();doScan();});"
+"$('bright').addEventListener('input',()=>$('bv').textContent='('+$('bright').value+'%)');"
+"$('open').addEventListener('change',pwState);"
+"</script></body></html>";
 
 static esp_err_t on_index(httpd_req_t *r)
 {
@@ -146,10 +275,50 @@ static esp_err_t on_index(httpd_req_t *r)
              "sp_sess=%s; HttpOnly; SameSite=Strict", s_sess);
     httpd_resp_set_hdr(r, "Set-Cookie", setc);
     httpd_resp_set_type(r, "text/html");
+    return httpd_resp_send(r, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
 
-    char page[sizeof(INDEX_HTML) + 48];
-    snprintf(page, sizeof(page), INDEX_HTML, s_csrf);
-    return httpd_resp_send(r, page, HTTPD_RESP_USE_STRLEN);
+static size_t json_esc(char *dst, size_t cap, const char *src)
+{
+    size_t o = 0;
+    for (; *src && o + 7 < cap; src++) {
+        unsigned char c = (unsigned char)*src;
+        if (c == '"' || c == '\\') {
+            dst[o++] = '\\';
+            dst[o++] = (char)c;
+        } else if (c < 0x20) {
+            o += (size_t)snprintf(dst + o, cap - o, "\\u%04x", c);
+        } else {
+            dst[o++] = (char)c;
+        }
+    }
+    dst[o] = '\0';
+    return o;
+}
+
+static esp_err_t on_scan(httpd_req_t *r)
+{
+    touch();
+    if (!cookie_ok(r)) {
+        return send_json(r, 403, "{\"ok\":false,\"error\":\"auth\"}");
+    }
+    static netw_ap_t aps[20];       /* httpd handlers run serially */
+    static char json[2048];
+    int n = netw_wifi_scan(aps, 20);
+    if (n < 0) {
+        return send_json(r, 500, "{\"ok\":false,\"error\":\"scan\"}");
+    }
+    size_t o = (size_t)snprintf(json, sizeof(json), "{\"ok\":true,\"aps\":[");
+    for (int i = 0; i < n && o < sizeof(json) - 96; i++) {
+        char esc[100];
+        json_esc(esc, sizeof(esc), aps[i].ssid);
+        o += (size_t)snprintf(json + o, sizeof(json) - o,
+                              "%s{\"ssid\":\"%s\",\"rssi\":%d,\"open\":%s}",
+                              i ? "," : "", esc, aps[i].rssi,
+                              aps[i].open ? "true" : "false");
+    }
+    snprintf(json + o, sizeof(json) - o, "]}");
+    return send_json(r, 200, json);
 }
 
 static esp_err_t on_get_config(httpd_req_t *r)
@@ -160,12 +329,14 @@ static esp_err_t on_get_config(httpd_req_t *r)
     }
     sp_settings_t s;
     settings_load(&s);
-    char json[384];
+    char json[448];
     snprintf(json, sizeof(json),
-             "{\"ok\":true,\"ezshare_ssid\":\"%s\",\"password_set\":%s,"
+             "{\"ok\":true,\"csrf\":\"%s\",\"ezshare_ssid\":\"%s\","
+             "\"password_set\":%s,"
              "\"allow_open_wifi\":%s,\"bssid_lock\":%s,"
              "\"as10_tz\":\"%s\",\"timezone_confirmed\":%s,"
              "\"lcd_brightness\":%u,\"security\":\"%s\"}",
+             s_csrf,
              s.magic_valid ? s.ezshare_ssid : "",
              (s.magic_valid && s.ezshare_password[0]) ? "true" : "false",
              s.allow_open_wifi ? "true" : "false",
@@ -328,6 +499,7 @@ esp_err_t setup_portal_start(void)
           .handler = on_get_config },
         { .uri = "/api/config",  .method = HTTP_POST,
           .handler = on_post_config },
+        { .uri = "/api/scan",    .method = HTTP_GET,  .handler = on_scan },
         { .uri = "/api/status",  .method = HTTP_GET,  .handler = on_status },
         { .uri = "/api/action",  .method = HTTP_POST, .handler = on_action },
     };

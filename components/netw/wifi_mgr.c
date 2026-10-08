@@ -3,6 +3,7 @@
  * Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
  * GPLv3+ — see LICENSE and NOTICE.
  */
+#include <stdlib.h>
 #include <string.h>
 
 #include "netw.h"
@@ -249,7 +250,7 @@ esp_err_t netw_enter_ap(void)
     w.ap.channel = 6;
     w.ap.beacon_interval = 100;
 
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), TAG, "ap mode");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "ap mode");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &w), TAG, "ap cfg");
     ESP_RETURN_ON_ERROR(ensure_wifi_started(), TAG, "ap start");
     set_mode(NETW_MODE_AP);
@@ -262,6 +263,70 @@ esp_err_t netw_enter_ap(void)
     portal_note_start();             /* absolute 15-min window (§4.1) */
     dns_server_start();              /* captive-portal redirection    */
     return setup_portal_start();
+}
+
+int netw_wifi_scan(netw_ap_t *out, int cap)
+{
+    if (netw_mode() != NETW_MODE_AP || !out || cap <= 0) {
+        return -1;
+    }
+    wifi_scan_config_t sc = { .show_hidden = false };
+    if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
+        return -1;
+    }
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n > (uint16_t)(cap * 3)) {
+        n = (uint16_t)(cap * 3);
+    }
+    wifi_ap_record_t *recs = malloc(n * sizeof(*recs));
+    if (!recs) {
+        esp_wifi_clear_ap_list();
+        return -1;
+    }
+    uint16_t got = n;
+    esp_err_t err = esp_wifi_scan_get_ap_records(&got, recs);
+    if (err != ESP_OK) {
+        free(recs);
+        return -1;
+    }
+    int cnt = 0;
+    for (uint16_t i = 0; i < got && cnt < cap; i++) {
+        char ssid[33] = { 0 };
+        memcpy(ssid, recs[i].ssid, sizeof(recs[i].ssid));
+        if (!ssid[0] || !strcmp(ssid, s_ap_ssid)) {
+            continue;   /* hidden or our own setup AP */
+        }
+        int dup = -1;
+        for (int k = 0; k < cnt; k++) {
+            if (!strcmp(out[k].ssid, ssid)) {
+                dup = k;
+                break;
+            }
+        }
+        if (dup >= 0) {
+            if (recs[i].rssi > out[dup].rssi) {
+                out[dup].rssi = recs[i].rssi;
+            }
+            continue;
+        }
+        strncpy(out[cnt].ssid, ssid, sizeof(out[cnt].ssid) - 1);
+        out[cnt].ssid[sizeof(out[cnt].ssid) - 1] = '\0';
+        out[cnt].rssi = recs[i].rssi;
+        out[cnt].open = recs[i].authmode == WIFI_AUTH_OPEN;
+        cnt++;
+    }
+    free(recs);
+    for (int a = 0; a < cnt - 1; a++) {          /* strongest first */
+        for (int b = a + 1; b < cnt; b++) {
+            if (out[b].rssi > out[a].rssi) {
+                netw_ap_t t = out[a];
+                out[a] = out[b];
+                out[b] = t;
+            }
+        }
+    }
+    return cnt;
 }
 
 esp_err_t netw_leave_ap(void)

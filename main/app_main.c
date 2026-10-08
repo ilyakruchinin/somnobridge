@@ -107,6 +107,17 @@ static void show_setup_ap(void)
     }
 }
 
+/* leave AP mode: rows 12/13 carried AP credentials — clear them or
+ * they stay on screen under the status message                    */
+static void leave_setup(const char *msg)
+{
+    lcd_ui_row(11, msg, 1);
+    lcd_ui_row(12, "", 0);
+    lcd_ui_row(13, "", 0);
+    netw_leave_ap();
+    ble_svc_resume();
+}
+
 static void ui_tick(void)
 {
     const therapy_status_t *t = therapy_status();
@@ -186,6 +197,9 @@ void app_main(void)
     bool provisioned = err == ESP_OK && settings_load(&cfg) == ESP_OK &&
                        cfg.magic_valid;
     drift_timezone_set(cfg.as10_tz, cfg.timezone_confirmed);
+    if (provisioned) {
+        board_backlight_set(cfg.lcd_brightness);
+    }
     lcd_ui_rowf(2, 0, "CFG:%s SEC:%.3s",
                 provisioned ? "OK" : "NONE", settings_security_label());
     heap_ck("settings");
@@ -298,9 +312,7 @@ void app_main(void)
             /* enter setup AP (§4.1) — stays until portal timeout or
              * second long press exits                               */
             if (netw_mode() == NETW_MODE_AP) {
-                lcd_ui_row(11, "LEAVING SETUP", 1);
-                netw_leave_ap();
-                ble_svc_resume();
+                leave_setup("LEAVING SETUP");
             } else {
                 netw_enter_ap();
                 ble_svc_suspend();
@@ -331,9 +343,7 @@ void app_main(void)
         if (netw_mode() == NETW_MODE_AP &&
             (portal_idle_us() > 5LL * 60 * 1000000 ||
              portal_age_us() > 15LL * 60 * 1000000)) {
-            lcd_ui_row(11, "SETUP TIMEOUT", 1);
-            netw_leave_ap();
-            ble_svc_resume();
+            leave_setup("SETUP TIMEOUT");
             if (settings_load(&cfg) == ESP_OK && cfg.magic_valid) {
                 netw_enter_sta(&cfg);
             }
@@ -343,10 +353,9 @@ void app_main(void)
         if (portal_saved_flag && netw_mode() == NETW_MODE_AP) {
             portal_saved_flag = false;
             if (settings_load(&cfg) == ESP_OK && cfg.magic_valid) {
-                lcd_ui_row(11, "SAVED - JOINING", 1);
                 drift_timezone_set(cfg.as10_tz, cfg.timezone_confirmed);
-                netw_leave_ap();
-                ble_svc_resume();
+                board_backlight_set(cfg.lcd_brightness);
+                leave_setup("SAVED - JOINING");
                 netw_enter_sta(&cfg);
                 provisioned = true;
             }

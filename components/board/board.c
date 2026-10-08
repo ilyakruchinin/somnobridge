@@ -6,6 +6,7 @@
 #include "board.h"
 
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
 #include "esp_lcd_panel_io.h"
@@ -52,18 +53,32 @@ void board_lcd_wait_done(void)
 #define BTN_LONG_US         (3000 * 1000)
 #define POLL_PERIOD_US      (20 * 1000)
 
+/* Backlight: LEDC PWM, active-high */
+#define BL_LEDC_MODE        LEDC_LOW_SPEED_MODE
+#define BL_LEDC_TIMER       LEDC_TIMER_0
+#define BL_LEDC_CHANNEL     LEDC_CHANNEL_0
+#define BL_LEDC_FREQ_HZ     5000
+#define BL_LEDC_RES         LEDC_TIMER_8_BIT   /* duty 0..255 */
+
 esp_err_t board_init(void)
 {
-    /* Backlight: plain GPIO, active-high */
-    gpio_config_t bl = {
-        .pin_bit_mask = 1ULL << BOARD_PIN_LCD_BL,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+    ledc_timer_config_t blt = {
+        .speed_mode = BL_LEDC_MODE,
+        .duty_resolution = BL_LEDC_RES,
+        .timer_num = BL_LEDC_TIMER,
+        .freq_hz = BL_LEDC_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
     };
-    ESP_RETURN_ON_ERROR(gpio_config(&bl), TAG, "bl cfg");
-    gpio_set_level(BOARD_PIN_LCD_BL, 0);
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&blt), TAG, "bl timer");
+    ledc_channel_config_t blc = {
+        .gpio_num = BOARD_PIN_LCD_BL,
+        .speed_mode = BL_LEDC_MODE,
+        .channel = BL_LEDC_CHANNEL,
+        .timer_sel = BL_LEDC_TIMER,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_RETURN_ON_ERROR(ledc_channel_config(&blc), TAG, "bl channel");
 
     /* BOOT button: input, pull-up, active low */
     gpio_config_t btn = {
@@ -143,8 +158,14 @@ esp_err_t board_init(void)
 
 void board_backlight_set(uint8_t percent)
 {
-    gpio_set_level(BOARD_PIN_LCD_BL, percent > 0);
-    /* TODO: LEDC PWM for intermediate brightness — v1 binary on/off. */
+    if (percent > 100) {
+        percent = 100;
+    }
+    /* perceived brightness is ~log — square the input so the slider
+     * feels linear at the low end */
+    uint32_t d = (uint32_t)percent * percent * 255 / 10000;
+    ledc_set_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL, d);
+    ledc_update_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL);
 }
 
 board_btn_event_t board_button_poll(void)
