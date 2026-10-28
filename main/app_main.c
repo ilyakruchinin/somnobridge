@@ -43,6 +43,11 @@ static void heap_ck(const char *tag)
 /* set by the setup portal when new config is committed (setup_portal.c) */
 volatile bool portal_saved_flag;
 
+/* set by a BLE SET_CONFIG op (ble_ops.c) — same meaning as
+ * portal_saved_flag but the app is not in AP mode, so the loop below
+ * re-enters STA directly instead of leaving setup first.            */
+volatile bool ble_cfg_saved_flag;
+
 /* while the BLE PIN screen is up the status tick must not redraw rows —
  * set on ble_svc_pin_visible(), cleared (with a chrome repaint) once the
  * pairing attempt ends                                            */
@@ -313,6 +318,20 @@ void app_main(void)
              * second long press exits                               */
             if (netw_mode() == NETW_MODE_AP) {
                 leave_setup("LEAVING SETUP");
+                /* One press is the whole fresh-bridge gesture: resume
+                 * BLE, join the card if config already exists (e.g. it
+                 * was pushed over BLE earlier), and — when nobody is
+                 * bonded yet — open the 120 s pairing window so the
+                 * same physical press both proves presence and invites
+                 * the new peer.                                      */
+                if (settings_load(&cfg) == ESP_OK && cfg.magic_valid) {
+                    netw_enter_sta(&cfg);
+                    provisioned = true;
+                }
+                if (!ble_svc_peer_bonded() &&
+                    ble_svc_open_pairing() == ESP_OK) {
+                    lcd_ui_row(11, "PAIRING 120S", 1);
+                }
             } else {
                 netw_enter_ap();
                 ble_svc_suspend();
@@ -346,6 +365,22 @@ void app_main(void)
             leave_setup("SETUP TIMEOUT");
             if (settings_load(&cfg) == ESP_OK && cfg.magic_valid) {
                 netw_enter_sta(&cfg);
+            }
+        }
+
+        /* BLE-committed config (paired path): apply immediately —
+         * the link stays up while STA re-joins the (possibly new)
+         * EZShare card.                                              */
+        if (ble_cfg_saved_flag) {
+            ble_cfg_saved_flag = false;
+            if (settings_load(&cfg) == ESP_OK && cfg.magic_valid) {
+                drift_timezone_set(cfg.as10_tz, cfg.timezone_confirmed);
+                board_backlight_set(cfg.lcd_brightness);
+                if (netw_mode() != NETW_MODE_AP) {
+                    lcd_ui_row(11, "SAVED - JOINING", 1);
+                    netw_enter_sta(&cfg);
+                    provisioned = true;
+                }
             }
         }
 

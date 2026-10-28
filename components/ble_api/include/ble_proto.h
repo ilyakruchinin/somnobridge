@@ -107,6 +107,13 @@ uint16_t blep_build_cframe(uint8_t *out, uint16_t out_cap,
 #define OP_STREAM_TEST       "STREAM_TEST"
 #define OP_GET_DRIFT         "GET_DRIFT"
 #define OP_GET_EVIDENCE      "GET_EVIDENCE"
+/* Provisioning over BLE (§4 alternative to the setup-AP portal): the
+ * SomnoTrace portal mirrors these so the card can be configured in the
+ * same flow as pairing, without AP mode. */
+#define OP_GET_CONFIG        "GET_CONFIG"
+#define OP_SET_CONFIG        "SET_CONFIG"
+#define OP_WIFI_SCAN         "WIFI_SCAN"
+#define OP_EZSHARE_CHECK     "EZSHARE_CHECK"
 
 /* ---- error codes (spec §10.2) ---- */
 #define EC_BAD_REQUEST        "BAD_REQUEST"

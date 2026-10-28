@@ -1393,6 +1393,7 @@ static void ble_stream_task(void *arg)
                 "\"sha_us\":%lld,\"http_header_us\":%lld,"
                 "\"http_read_us\":%lld,\"http_sink_us\":%lld,"
                 "\"http_reads\":%lu,\"http_form\":%u,"
+                "\"frames\":%lu,"
                 "\"blocks\":{\"raw\":%lu,\"def\":%lu,\"d16\":%lu},"
                 "\"completion_allowed\":%s,\"error\":\"%s\"}",
                 transport_ok ? "true" : "false",
@@ -1412,6 +1413,7 @@ static void ble_stream_task(void *arg)
                 (long long)s_stream.fetch_obs.sink_us,
                 (unsigned long)s_stream.fetch_obs.read_calls,
                 (unsigned)s_stream.fetch_obs.download_form,
+                (unsigned long)s_frames_sent,
                 (unsigned long)(s_stream.v2 ? stc_raw_blocks() : 0),
                 (unsigned long)(s_stream.v2 ? stc_def_blocks() : 0),
                 (unsigned long)(s_stream.v2 ? stc_d16_blocks() : 0),
@@ -1641,6 +1643,199 @@ static void op_get_drift(uint32_t rid, cJSON *args)
 #undef DJSON
 }
 
+/* ---------------- provisioning ops (§4 over BLE, no AP needed) --------
+ * The SomnoTrace portal drives these right after pairing so the card can
+ * be configured in the same flow — the setup AP remains as the physical
+ * fallback. Authorization is the same gate every op rides (bonded peer),
+ * which is strictly stronger than the open-AP portal's CSRF model.      */
+
+/* app_main watches this like portal_saved_flag but outside AP mode: on a
+ * BLE-sourced SET_CONFIG it reloads settings and re-enters STA.        */
+extern volatile bool ble_cfg_saved_flag;
+
+static void op_get_config(uint32_t rid, cJSON *args)
+{
+    (void)args;
+    sp_settings_t s;
+    settings_load(&s);
+    char inner[384];
+    snprintf(inner, sizeof(inner),
+             "{\"ezshare_ssid\":\"%s\",\"password_set\":%s,"
+             "\"allow_open_wifi\":%s,\"bssid_lock\":%s,"
+             "\"as10_tz\":\"%s\",\"timezone_confirmed\":%s,"
+             "\"lcd_brightness\":%u,\"security\":\"%s\"}",
+             s.magic_valid ? s.ezshare_ssid : "",
+             (s.magic_valid && s.ezshare_password[0]) ? "true" : "false",
+             s.allow_open_wifi ? "true" : "false",
+             s.bssid_lock ? "true" : "false",
+             s.magic_valid ? s.as10_tz : "UTC0",
+             s.timezone_confirmed ? "true" : "false",
+             s.lcd_brightness, settings_security_label());
+    send_ok(rid, OP_GET_CONFIG, inner);
+}
+
+static void op_set_config(uint32_t rid, cJSON *args)
+{
+    if (!args) {
+        send_error(rid, OP_SET_CONFIG, EC_BAD_REQUEST);
+        return;
+    }
+    sp_settings_t s;
+    settings_load(&s);                  /* keep unchanged fields      */
+    s.schema = SP_SETTINGS_SCHEMA;
+    s.magic_valid = 1;
+    cJSON *v;
+    if ((v = cJSON_GetObjectItem(args, "ezshare_ssid")) &&
+        cJSON_IsString(v)) {
+        snprintf(s.ezshare_ssid, sizeof(s.ezshare_ssid), "%s",
+                 v->valuestring);
+    }
+    if ((v = cJSON_GetObjectItem(args, "ezshare_password")) &&
+        cJSON_IsString(v)) {
+        snprintf(s.ezshare_password, sizeof(s.ezshare_password), "%s",
+                 v->valuestring);      /* omitted -> keep old         */
+    }
+    if (cJSON_IsTrue(cJSON_GetObjectItem(args, "clear_password"))) {
+        s.ezshare_password[0] = '\0';
+    }
+    if ((v = cJSON_GetObjectItem(args, "allow_open_wifi"))) {
+        s.allow_open_wifi = cJSON_IsTrue(v);
+    }
+    if ((v = cJSON_GetObjectItem(args, "as10_tz")) &&
+        cJSON_IsString(v)) {
+        snprintf(s.as10_tz, sizeof(s.as10_tz), "%s", v->valuestring);
+    }
+    if ((v = cJSON_GetObjectItem(args, "timezone_confirmed"))) {
+        s.timezone_confirmed = cJSON_IsTrue(v);
+    }
+    if ((v = cJSON_GetObjectItem(args, "lcd_brightness")) &&
+        cJSON_IsNumber(v)) {
+        s.lcd_brightness = (uint8_t)v->valueint;
+    }
+    esp_err_t err = settings_save(&s);
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        send_error(rid, OP_SET_CONFIG, EC_SECURITY_NOT_PROVISIONED);
+        return;
+    }
+    if (err != ESP_OK) {
+        send_error(rid, OP_SET_CONFIG, EC_BAD_REQUEST);
+        return;
+    }
+    /* A new card invalidates the persisted drift SOT the same way the
+     * AP portal path does (U6).                                       */
+    drift_sot_invalidate();
+    jrn_put("config", "\"e\":\"settings_saved_ble\"");
+    ble_cfg_saved_flag = true;          /* app loop re-enters STA      */
+    send_ok(rid, OP_SET_CONFIG, "{\"saved\":true}");
+}
+
+/* Scan + probe are multi-second jobs — off the NimBLE host task (which
+ * also has to service indications). send_ok/send_error are queue-backed,
+ * so the worker may reply directly.                                   */
+typedef struct {
+    uint32_t rid;
+    char     op[20];
+    bool     try_default;
+    char     ssid[33];
+} prov_job_t;
+
+static void prov_worker(void *p)
+{
+    prov_job_t *j = p;
+
+    if (!strcmp(j->op, OP_WIFI_SCAN)) {
+        netw_ap_t aps[12];
+        int n = netw_scan_anywhere(aps, 12);
+        if (n < 0) {
+            send_error(j->rid, j->op, EC_RESOURCE_LIMIT);
+        } else {
+            char *buf = malloc(1400);
+            if (!buf) {
+                send_error(j->rid, j->op, EC_RESOURCE_LIMIT);
+            } else {
+                size_t o = (size_t)snprintf(buf, 1400, "{\"aps\":[");
+                for (int i = 0; i < n && o + 96 < 1400; i++) {
+                    o += (size_t)snprintf(buf + o, 1400 - o,
+                                          "%s{\"ssid\":\"", i ? "," : "");
+                    json_append_escaped(buf, 1400, &o, aps[i].ssid);
+                    o += (size_t)snprintf(buf + o, 1400 - o,
+                                          "\",\"rssi\":%d,\"open\":%s}",
+                                          aps[i].rssi,
+                                          aps[i].open ? "true" : "false");
+                }
+                snprintf(buf + o, 1400 - o, "]}");
+                send_ok(j->rid, j->op, buf);
+                free(buf);
+            }
+        }
+    } else {                            /* OP_EZSHARE_CHECK */
+        /* Detect an insecure EZShare: the factory card name is
+         * "ez Share" — open AP is directly insecure; a secured one is
+         * probed with the factory default password ("88888888") when
+         * requested, since joining is the only way to know it works.  */
+        const char *target = j->ssid[0] ? j->ssid : "ez Share";
+        netw_ap_t aps[16];
+        int n = netw_scan_anywhere(aps, 16);
+        const netw_ap_t *hit = NULL;
+        for (int i = 0; i < n; i++) {
+            if (!strcmp(aps[i].ssid, target)) {
+                hit = &aps[i];
+                break;
+            }
+        }
+        bool joined_default = false;
+        if (hit && !hit->open && j->try_default) {
+            bool ok = false;
+            if (netw_probe_creds(target, "88888888", 9000, &ok) == ESP_OK) {
+                joined_default = ok;
+            }
+        }
+        char inner[256];
+        snprintf(inner, sizeof(inner),
+                 "{\"found\":%s,\"ssid\":\"%.32s\",\"rssi\":%d,"
+                 "\"open\":%s,\"default_pass_works\":%s,"
+                 "\"insecure\":%s}",
+                 hit ? "true" : "false",
+                 hit ? hit->ssid : target,
+                 hit ? hit->rssi : 0,
+                 hit && hit->open ? "true" : "false",
+                 joined_default ? "true" : "false",
+                 (hit && hit->open) || joined_default ? "true" : "false");
+        send_ok(j->rid, j->op, inner);
+    }
+    free(j);
+    vTaskDelete(NULL);
+}
+
+static bool prov_op_start(uint32_t rid, const char *op, cJSON *args)
+{
+    prov_job_t *j = calloc(1, sizeof(*j));
+    if (!j) {
+        send_error(rid, op, EC_RESOURCE_LIMIT);
+        return false;
+    }
+    j->rid = rid;
+    snprintf(j->op, sizeof(j->op), "%s", op);
+    if (args) {
+        cJSON *v;
+        if ((v = cJSON_GetObjectItem(args, "try_default"))) {
+            j->try_default = cJSON_IsTrue(v);
+        }
+        if ((v = cJSON_GetObjectItem(args, "ssid")) && cJSON_IsString(v)) {
+            snprintf(j->ssid, sizeof(j->ssid), "%s", v->valuestring);
+        }
+    }
+    /* Same core as ble_stream: Wi-Fi work must not compete with the
+     * NimBLE host + controller on core 0.                             */
+    if (xTaskCreatePinnedToCore(prov_worker, "prov_op", 6144, j, 7,
+                                NULL, 1) != pdPASS) {
+        free(j);
+        send_error(rid, op, EC_RESOURCE_LIMIT);
+        return false;
+    }
+    return true;
+}
+
 /* ---------------- write dispatch ---------------- */
 
 int ble_ops_on_write(uint16_t conn, const uint8_t *data, uint16_t len)
@@ -1702,6 +1897,10 @@ int ble_ops_on_write(uint16_t conn, const uint8_t *data, uint16_t len)
         else if (!strcmp(opn, OP_GET_DRIFT)) op_get_drift(rid, args);
         else if (!strcmp(opn, OP_GET_EVIDENCE)) op_get_evidence(rid, args);
         else if (!strcmp(opn, OP_STREAM_TEST)) op_stream_test(rid, args);
+        else if (!strcmp(opn, OP_GET_CONFIG)) op_get_config(rid, args);
+        else if (!strcmp(opn, OP_SET_CONFIG)) op_set_config(rid, args);
+        else if (!strcmp(opn, OP_WIFI_SCAN) ||
+                 !strcmp(opn, OP_EZSHARE_CHECK)) prov_op_start(rid, opn, args);
         else send_error(rid, "?", EC_UNSUPPORTED_OP);
         cJSON_Delete(j);
         return 0;
