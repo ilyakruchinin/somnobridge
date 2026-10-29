@@ -530,6 +530,13 @@ void      drift_card_fw_note(const char *fw); /* diagnostic only      */
 #define DRIFT_FB_ADV_MS        500         /* required fallback margin */
 #define DRIFT_USABLE_HALF_MS   5000        /* nothing beyond this      */
 #define DRIFT_CUR_REF_MAX_US   (180LL*1000*1000) /* current ref age   */
+/* Persisted-record plausibility gate (NVS load): a device-clock offset
+ * beyond 24 h or a reference timestamp that is not epoch-milliseconds
+ * can only come from a corrupted or wrong-domain record (e.g. uptime
+ * written where UTC was required). Such a record is poisoned — it must
+ * never be restored as a usable fallback, no matter its CRC.          */
+#define DRIFT_PLAUSIBLE_MS     (24LL*3600*1000)
+#define DRIFT_REF_MIN_MS       1577836800000LL   /* 2020-01-01 UTC     */
 /* Session-end save gate is wider than the live-window gate: OUT is
  * declared ~125 s of quiet + clean rounds after the last growth, and
  * the newest bracketed reference may predate the pause by up to one

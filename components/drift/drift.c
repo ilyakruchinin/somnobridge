@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "drift.h"
@@ -2144,6 +2145,11 @@ static bool sot_record_sane(const sot_v2_blob_t *b,
            b->encoding <= DRIFT_ENC_ROUNDED &&
            b->lo_ms <= b->hi_ms && b->half_ms >= 0 &&
            b->ref_ms != 0 && b->comp_ms != 0 &&
+           llabs(b->drift_ms) <= DRIFT_PLAUSIBLE_MS &&
+           b->lo_ms >= -DRIFT_PLAUSIBLE_MS &&
+           b->hi_ms <= DRIFT_PLAUSIBLE_MS &&
+           b->ref_ms >= DRIFT_REF_MIN_MS &&
+           b->comp_ms >= DRIFT_REF_MIN_MS &&
            b->rsv1[0] <= DRIFT_CACHE_CHARACTERIZED &&
            b->rsv1[1] <= DRIFT_VIS_CHARACTERIZED &&
            b->cache_us <= 10000000 && b->latency_lo_us >= 0 &&
@@ -2256,6 +2262,8 @@ static esp_err_t sot_load_legacy(nvs_handle_t h)
     }
     if (want != sizeof(b) || b.magic != SOT_MAGIC || b.version != 1 ||
         b.lo_ms > b.hi_ms || b.half_ms < 0 ||
+        llabs(b.drift_ms) > DRIFT_PLAUSIBLE_MS ||
+        b.ref_ms < DRIFT_REF_MIN_MS || b.comp_ms < DRIFT_REF_MIN_MS ||
         esp_crc32_le(0, (const uint8_t *)&b,
                      offsetof(sot_v1_blob_t, crc32)) != b.crc32) {
         ESP_LOGW(TAG, "legacy drift_sot blob invalid — ignored");
@@ -2360,6 +2368,11 @@ static bool fb_record_sane(const fb_blob_t *b)
            b->lo_ms <= b->hi_ms && b->half_ms >= 0 &&
            b->half_ms <= DRIFT_SAVE_GOOD_MS &&
            b->ref_ms != 0 && b->comp_ms != 0 &&
+           llabs(b->drift_ms) <= DRIFT_PLAUSIBLE_MS &&
+           b->lo_ms >= -DRIFT_PLAUSIBLE_MS &&
+           b->hi_ms <= DRIFT_PLAUSIBLE_MS &&
+           b->ref_ms >= DRIFT_REF_MIN_MS &&
+           b->comp_ms >= DRIFT_REF_MIN_MS &&
            b->rsv1[0] <= DRIFT_CACHE_CHARACTERIZED &&
            b->rsv1[1] <= DRIFT_VIS_CHARACTERIZED &&
            b->cache_us <= 10000000 && b->latency_lo_us >= 0 &&
