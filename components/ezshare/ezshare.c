@@ -52,6 +52,7 @@ static void canon_to_fdir(const char *canon, char *out, size_t cap)
 }
 
 static esp_http_client_handle_t open_get(const char *url, bool is_file,
+                                         const char *range,
                                          ezw_obs_t *obs)
 {
     esp_http_client_config_t cfg = {
@@ -83,6 +84,9 @@ static esp_http_client_handle_t open_get(const char *url, bool is_file,
     /* Request freshness; card may ignore — we never rely on it (§11.2). */
     esp_http_client_set_header(c, "Cache-Control", "no-cache");
     esp_http_client_set_header(c, "Pragma", "no-cache");
+    if (range) {
+        esp_http_client_set_header(c, "Range", range);
+    }
     if (esp_http_client_open(c, 0) != ESP_OK) {
         ESP_LOGW(TAG, "open failed url=%.96s", url);
         esp_http_client_cleanup(c);
@@ -128,7 +132,7 @@ esp_err_t ezs_list_dir(const char *canon_dir,
     }
 
     obs->req_start_us = esp_timer_get_time();
-    esp_http_client_handle_t c = open_get(url, false, obs);
+    esp_http_client_handle_t c = open_get(url, false, NULL, obs);
     if (!c) {
         obs->resp_end_us = esp_timer_get_time();
         obs->transport = ESP_FAIL;
@@ -213,7 +217,7 @@ esp_err_t ezs_client_version(char *buf, size_t cap, ezw_obs_t *obs)
              (unsigned long)s_card_ip & 255);
 
     obs->req_start_us = esp_timer_get_time();
-    esp_http_client_handle_t c = open_get(url, false, obs);
+    esp_http_client_handle_t c = open_get(url, false, NULL, obs);
     if (!c) {
         obs->resp_end_us = esp_timer_get_time();
         return ESP_FAIL;
@@ -230,6 +234,158 @@ esp_err_t ezs_client_version(char *buf, size_t cap, ezw_obs_t *obs)
     }
     esp_http_client_cleanup(c);
     return obs->http_status == 200 ? ESP_OK : ESP_FAIL;
+}
+
+/* ---------------- raw path GET (diagnostics/admin) ---------------- */
+
+esp_err_t ezs_get_raw_range(const char *path, long range_from,
+                            char *buf, size_t cap,
+                            int *status_out, ezw_obs_t *obs)
+{
+    memset(obs, 0, sizeof(*obs));
+    if (!path || path[0] != '/' || !buf || cap < 2)
+        return ESP_ERR_INVALID_ARG;
+    char url[224];
+    snprintf(url, sizeof(url), "http://%lu.%lu.%lu.%lu%s",
+             (unsigned long)(s_card_ip >> 24),
+             (unsigned long)(s_card_ip >> 16) & 255,
+             (unsigned long)(s_card_ip >> 8) & 255,
+             (unsigned long)s_card_ip & 255, path);
+
+    char rg[32];
+    const char *rp = NULL;
+    if (range_from > 0) {
+        snprintf(rg, sizeof(rg), "bytes=%ld-", range_from);
+        rp = rg;
+    }
+    obs->req_start_us = esp_timer_get_time();
+    esp_http_client_handle_t c = open_get(url, false, rp, obs);
+    if (!c) {
+        obs->resp_end_us = esp_timer_get_time();
+        return ESP_FAIL;
+    }
+    obs->http_status = esp_http_client_get_status_code(c);
+    if (status_out) *status_out = obs->http_status;
+    size_t got = 0;
+    int r = 0;
+    while ((r = esp_http_client_read(c, buf + got, cap - 1 - got)) > 0) {
+        got += (size_t)r;
+        if (got >= cap - 1) break;         /* truncation is reported   */
+    }
+    buf[got] = '\0';
+    obs->resp_end_us = esp_timer_get_time();
+    obs->body_bytes = got;
+    obs->transport = r < 0 ? ESP_FAIL : ESP_OK;
+    esp_http_client_cleanup(c);
+    return r < 0 ? ESP_FAIL : ESP_OK;
+}
+
+esp_err_t ezs_get_raw(const char *path, char *buf, size_t cap,
+                      int *status_out, ezw_obs_t *obs)
+{
+    return ezs_get_raw_range(path, 0, buf, cap, status_out, obs);
+}
+
+/* ---------------- admin form ---------------- */
+
+/* Extract value="..." for the hidden input whose id= is `id_attr`
+ * (the config page echoes the current values as oldAuth/oldNick/
+ * oldChannel hidden inputs). */
+static bool admin_field_value(const char *page, const char *id_attr,
+                              char *out, size_t cap)
+{
+    const char *p = strstr(page, id_attr);
+    if (!p) return false;
+    p = strstr(p, "value=\"");
+    if (!p) return false;
+    p += 7;
+    const char *e = strchr(p, '"');
+    if (!e || (size_t)(e - p) >= cap) return false;
+    memcpy(out, p, (size_t)(e - p));
+    out[e - p] = '\0';
+    return true;
+}
+
+ezs_admin_err_t ezs_admin_change_wifi_pass(const char *admin_pass,
+                                           const char *ssid,
+                                           const char *new_wifi_pass)
+{
+    if (!s_card_ip || !admin_pass || !ssid || !ssid[0] ||
+        !new_wifi_pass || strlen(new_wifi_pass) < 8) {
+        return EZS_ADMIN_ARG;
+    }
+    /* The body buffer is heap — this runs on the small prov_op stack. */
+    char *buf = malloc(4096);
+    if (!buf) return EZS_ADMIN_TRANSPORT;
+
+    int  status = 0;
+    ezw_obs_t obs;
+    char path[384];
+    char enc[3][72];
+    ezs_admin_err_t ret = EZS_ADMIN_TRANSPORT;
+
+    /* Verified against the real card UI (config.js):
+     *   sendurl login -> /config?password= arm -> /config?auth=.. stage
+     *   -> /config?reset=1 commit. The stage call alone returns
+     *   "config_success" but does nothing — reset=1 applies.         */
+    ezp_urlencode(admin_pass, enc[0], sizeof(enc[0]));
+    snprintf(path, sizeof(path),
+             "/publicdir/sendurl?client=1&password=%s&time=%lld",
+             enc[0], esp_timer_get_time() / 1000);
+    if (ezs_get_raw(path, buf, 4096, &status, &obs) != ESP_OK ||
+        status != 200) {
+        goto out;
+    }
+    if (strstr(buf, "<clientLogin>-2") || strstr(buf, "<clientlogin>-2")) {
+        ret = EZS_ADMIN_BUSY;
+        goto out;
+    }
+    if (!strstr(buf, "<clientLogin>1") && !strstr(buf, "<clientlogin>1")) {
+        ret = EZS_ADMIN_AUTH;
+        goto out;
+    }
+
+    /* Arm the write session exactly like the browser's login-form
+     * navigation (GET /config with the form fields). The reply is the
+     * config page itself — mine its hidden inputs so unchanged fields
+     * are echoed back verbatim on the stage call.                    */
+    snprintf(path, sizeof(path), "/config?password=%s&back_href=&vtype=1",
+             enc[0]);
+    if (ezs_get_raw(path, buf, 4096, &status, &obs) != ESP_OK ||
+        status != 200) {
+        goto out;
+    }
+    {
+        char auth[40], nick[40], chan[8];
+        snprintf(auth, sizeof(auth), "%s", admin_pass);
+        snprintf(nick, sizeof(nick), "%s", ssid);
+        snprintf(chan, sizeof(chan), "1");
+        admin_field_value(buf, "id=oldAuth", auth, sizeof(auth));
+        admin_field_value(buf, "id=oldNick", nick, sizeof(nick));
+        admin_field_value(buf, "id=oldChannel", chan, sizeof(chan));
+
+        ezp_urlencode(auth, enc[0], sizeof(enc[0]));
+        ezp_urlencode(nick, enc[1], sizeof(enc[1]));
+        ezp_urlencode(new_wifi_pass, enc[2], sizeof(enc[2]));
+        snprintf(path, sizeof(path),
+                 "/config?auth=%s&ssid=%s&pass=%s&channel=%s&time=%lld",
+                 enc[0], enc[1], enc[2], chan,
+                 esp_timer_get_time() / 1000);
+        if (ezs_get_raw(path, buf, 4096, &status, &obs) != ESP_OK ||
+            status != 200) {
+            ret = EZS_ADMIN_REJECTED;
+            goto out;
+        }
+        /* Commit — the card reboots its AP and drops every client, so
+         * a mid-read transport error still means "applied".           */
+        snprintf(path, sizeof(path), "/config?reset=1&time=%lld",
+                 esp_timer_get_time() / 1000);
+        ezs_get_raw(path, buf, 4096, &status, &obs);
+        ret = EZS_ADMIN_OK;
+    }
+out:
+    free(buf);
+    return ret;
 }
 
 /* ---------------- /download ---------------- */
@@ -264,7 +420,7 @@ static esp_http_client_handle_t dl_get(const char *url, ezw_obs_t *obs)
         esp_http_client_cleanup(s_dl_client);
         s_dl_client = NULL;
     }
-    s_dl_client = open_get(url, true, obs);
+    s_dl_client = open_get(url, true, NULL, obs);
     return s_dl_client;
 }
 

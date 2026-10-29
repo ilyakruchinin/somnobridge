@@ -114,6 +114,8 @@ uint16_t blep_build_cframe(uint8_t *out, uint16_t out_cap,
 #define OP_SET_CONFIG        "SET_CONFIG"
 #define OP_WIFI_SCAN         "WIFI_SCAN"
 #define OP_EZSHARE_CHECK     "EZSHARE_CHECK"
+#define OP_EZSHARE_ADMIN     "EZSHARE_ADMIN"
+#define OP_CARD_GET          "CARD_GET"     /* temporary diagnostic    */
 
 /* ---- error codes (spec §10.2) ---- */
 #define EC_BAD_REQUEST        "BAD_REQUEST"

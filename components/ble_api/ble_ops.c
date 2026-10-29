@@ -1737,13 +1737,105 @@ typedef struct {
     char     op[20];
     bool     try_default;
     char     ssid[33];
+    char     path[96];
+    long     range_from;
+    char     new_pass[64];
+    char     admin_pass[17];
 } prov_job_t;
 
 static void prov_worker(void *p)
 {
     prov_job_t *j = p;
 
-    if (!strcmp(j->op, OP_WIFI_SCAN)) {
+    if (!strcmp(j->op, OP_CARD_GET)) {
+        /* Temporary diagnostic: raw GET of a card path while joined —
+         * used to capture the undocumented admin form endpoints.      */
+        ezw_obs_t obs;
+        char *body = malloc(6144);
+        if (!body) {
+            send_error(j->rid, j->op, EC_RESOURCE_LIMIT);
+        } else {
+            int status = 0;
+            esp_err_t r = ezs_get_raw_range(j->path[0] ? j->path : "/",
+                                            j->range_from,
+                                            body, 6144, &status, &obs);
+            if (r != ESP_OK) {
+                send_error(j->rid, j->op, EC_HTTP_ERROR);
+            } else {
+                char *inner = malloc(7000);
+                if (!inner) {
+                    send_error(j->rid, j->op, EC_RESOURCE_LIMIT);
+                } else {
+                    size_t o = (size_t)snprintf(inner, 7000,
+                                        "{\"status\":%d,\"body\":\"",
+                                        status);
+                    json_append_escaped(inner, 7000, &o, body);
+                    snprintf(inner + o, 7000 - o, "\"}");
+                    send_ok(j->rid, j->op, inner);
+                    free(inner);
+                }
+            }
+            free(body);
+        }
+    } else if (!strcmp(j->op, OP_EZSHARE_ADMIN)) {
+        /* Change the card's own Wi-Fi password through its admin form,
+         * then adopt the new password locally and rejoin. The bridge
+         * must already be joined (the caller just saved+tested creds). */
+        sp_settings_t s;
+        size_t pl = strlen(j->new_pass);
+        if (pl < 8 || pl > 63 ||
+            settings_load(&s) != ESP_OK || !s.magic_valid) {
+            send_error(j->rid, j->op, EC_BAD_REQUEST);
+        } else {
+            ESP_LOGI("ble", "EZSHARE_ADMIN: admin flow starting");
+            ezs_admin_err_t ar = ezs_admin_change_wifi_pass(
+                j->admin_pass[0] ? j->admin_pass : "admin",
+                s.ezshare_ssid, j->new_pass);
+            ESP_LOGI("ble", "EZSHARE_ADMIN: admin flow -> %d", (int)ar);
+            if (ar != EZS_ADMIN_OK) {
+                send_error(j->rid, j->op,
+                           ar == EZS_ADMIN_BUSY ? "ADMIN_BUSY" :
+                           ar == EZS_ADMIN_AUTH ? "AUTH_FAILED" :
+                           ar == EZS_ADMIN_ARG  ? "NOT_JOINED" :
+                                                  EC_HTTP_ERROR);
+            } else {
+                /* The card is rebooting its AP; persist the new
+                 * password so the app loop rejoins with it, then wait
+                 * for STA to come back.                            */
+                snprintf(s.ezshare_password, sizeof(s.ezshare_password),
+                         "%s", j->new_pass);
+                bool saved = settings_save(&s) == ESP_OK;
+                if (saved) {
+                    jrn_put("config", "\"e\":\"card_pass_changed\"");
+                    ble_cfg_saved_flag = true;
+                }
+                /* The card reboots its AP (~10-15 s). A true rejoin is
+                 * drop -> connect, not "still connected from before". */
+                vTaskDelay(pdMS_TO_TICKS(3000));   /* AP reboot gap   */
+                bool dropped = false, rejoined = false;
+                const int64_t end =
+                    esp_timer_get_time() + 18LL * 1000 * 1000;
+                while (esp_timer_get_time() < end) {
+                    bool c = netw_status()->sta_connected;
+                    if (!c) {
+                        dropped = true;
+                    } else if (dropped) {
+                        rejoined = true;
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(400));
+                }
+                ESP_LOGI("ble", "EZSHARE_ADMIN: dropped=%d rejoined=%d",
+                         dropped, rejoined);
+                char inner[128];
+                snprintf(inner, sizeof(inner),
+                         "{\"changed\":true,\"saved\":%s,\"rejoined\":%s}",
+                         saved ? "true" : "false",
+                         rejoined ? "true" : "false");
+                send_ok(j->rid, j->op, inner);
+            }
+        }
+    } else if (!strcmp(j->op, OP_WIFI_SCAN)) {
         netw_ap_t aps[12];
         int n = netw_scan_anywhere(aps, 12);
         if (n < 0) {
@@ -1824,6 +1916,23 @@ static bool prov_op_start(uint32_t rid, const char *op, cJSON *args)
         if ((v = cJSON_GetObjectItem(args, "ssid")) && cJSON_IsString(v)) {
             snprintf(j->ssid, sizeof(j->ssid), "%s", v->valuestring);
         }
+        if ((v = cJSON_GetObjectItem(args, "path")) && cJSON_IsString(v)) {
+            snprintf(j->path, sizeof(j->path), "%s", v->valuestring);
+        }
+        if ((v = cJSON_GetObjectItem(args, "range_from")) &&
+            cJSON_IsNumber(v)) {
+            j->range_from = v->valueint;
+        }
+        if ((v = cJSON_GetObjectItem(args, "wifi_password")) &&
+            cJSON_IsString(v)) {
+            snprintf(j->new_pass, sizeof(j->new_pass), "%s",
+                     v->valuestring);
+        }
+        if ((v = cJSON_GetObjectItem(args, "admin_password")) &&
+            cJSON_IsString(v)) {
+            snprintf(j->admin_pass, sizeof(j->admin_pass), "%s",
+                     v->valuestring);
+        }
     }
     /* Same core as ble_stream: Wi-Fi work must not compete with the
      * NimBLE host + controller on core 0.                             */
@@ -1900,7 +2009,9 @@ int ble_ops_on_write(uint16_t conn, const uint8_t *data, uint16_t len)
         else if (!strcmp(opn, OP_GET_CONFIG)) op_get_config(rid, args);
         else if (!strcmp(opn, OP_SET_CONFIG)) op_set_config(rid, args);
         else if (!strcmp(opn, OP_WIFI_SCAN) ||
-                 !strcmp(opn, OP_EZSHARE_CHECK)) prov_op_start(rid, opn, args);
+                 !strcmp(opn, OP_EZSHARE_CHECK) ||
+                 !strcmp(opn, OP_EZSHARE_ADMIN) ||
+                 !strcmp(opn, OP_CARD_GET)) prov_op_start(rid, opn, args);
         else send_error(rid, "?", EC_UNSUPPORTED_OP);
         cJSON_Delete(j);
         return 0;
