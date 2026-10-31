@@ -52,6 +52,50 @@ esp_err_t ezs_list_dir(const char *canon_dir,
 esp_err_t ezs_client_version(char *buf, size_t cap, ezw_obs_t *obs);
 
 /**
+ * Raw GET of an arbitrary card path (diagnostics / admin pages).
+ * `path` must start with '/'. Body is read into `buf` (NUL-terminated,
+ * truncated at cap-1); the HTTP status is returned via `status_out`.
+ * Returns ESP_OK when the transport succeeded (any HTTP status).
+ */
+esp_err_t ezs_get_raw(const char *path, char *buf, size_t cap,
+                      int *status_out, ezw_obs_t *obs);
+
+/** Same as ezs_get_raw plus an optional `Range: bytes=<from>-` request
+ *  header (range_from <= 0 disables it) — lets a bounded diagnostic
+ *  buffer page through files larger than the buffer.                 */
+esp_err_t ezs_get_raw_range(const char *path, long range_from,
+                            char *buf, size_t cap,
+                            int *status_out, ezw_obs_t *obs);
+
+/**
+ * Change the card's own Wi-Fi password through its admin form
+ * (captured live from the real card UI — config.js):
+ *   1. GET /publicdir/sendurl?client=1&password=<admin> — marks this
+ *      client IP as admin; <clientLogin>1</clientLogin> = ok,
+ *      -2 = another admin session is online.
+ *   2. GET /config?password=<admin>&back_href=&vtype=1 — the browser's
+ *      login-form navigation; arms the write session and returns the
+ *      config page (hidden oldAuth/oldNick/oldChannel inputs echo the
+ *      current values, which are sent back unchanged).
+ *   3. GET /config?auth=..&ssid=..&pass=..&channel=.. — stages the
+ *      config; replies "config_success" but applies NOTHING by itself.
+ *   4. GET /config?reset=1 — commits; the card reboots its AP and the
+ *      connection dropping mid-read is expected.
+ * Requires the bridge to be joined already (s_card_ip set).
+ */
+typedef enum {
+    EZS_ADMIN_OK = 0,       /* submitted — AP will restart            */
+    EZS_ADMIN_ARG,          /* bad arguments / not joined             */
+    EZS_ADMIN_TRANSPORT,    /* card unreachable / read failure        */
+    EZS_ADMIN_AUTH,         /* admin password rejected                */
+    EZS_ADMIN_BUSY,         /* another admin session is online        */
+    EZS_ADMIN_REJECTED      /* config submit failed                   */
+} ezs_admin_err_t;
+ezs_admin_err_t ezs_admin_change_wifi_pass(const char *admin_pass,
+                                           const char *ssid,
+                                           const char *new_wifi_pass);
+
+/**
  * GET /download — streams the body through `sink`.
  * sink is called with response chunks; return false from sink to abort.
  *

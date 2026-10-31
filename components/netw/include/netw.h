@@ -68,6 +68,23 @@ typedef struct {
  */
 int netw_wifi_scan(netw_ap_t *out, int cap);
 
+/**
+ * Blocking scan in ANY mode — STA/DOWN included (the setup-AP path is
+ * netw_wifi_scan). Starts the radio + STA interface if needed and leaves
+ * Wi-Fi in the state it found it. Returns count, or -1 on error.
+ */
+int netw_scan_anywhere(netw_ap_t *out, int cap);
+
+/**
+ * Probe whether `ssid` joins with `pass` — used to test the factory
+ * default EZShare password without committing it. Temporarily drops the
+ * current STA link, tries association+DHCP for up to timeout_ms, then
+ * restores the previous driver config/link. Storage is RAM-backed, so
+ * nothing is persisted. out_ok=false on association failure.
+ */
+esp_err_t netw_probe_creds(const char *ssid, const char *pass,
+                           int timeout_ms, bool *out_ok);
+
 /* Portal destructive-action queue + timeouts (spec §4.1):
  * actions arrive via POST /api/action and execute only after a
  * physical button confirm — the app loop owns that pairing.        */

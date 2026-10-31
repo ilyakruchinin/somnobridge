@@ -327,9 +327,22 @@ guides, hacker notes.
   192.168.4.1). Default admin password `admin`.
 - Settable fields: SSID, WiFi password, admin password, **WiFi channel
   1–13** (default CH11).
-- The form's exact submit URL and field names are **not publicly
-  documented**. Capture them once from our card's firmware version
-  (M7).
+- Admin flow **captured live** (help.js + config.js from the card):
+  1. `GET /publicdir/sendurl?client=1&password=<admin>` — marks the
+     client IP as admin; `<clientLogin>1</clientLogin>` ok, `-2` means
+     another admin session is online.
+  2. `GET /config?password=<admin>&back_href=&vtype=1` — the browser's
+     login-form navigation (method=get drops the action query and sends
+     the form fields); arms the write session and returns the config
+     page (hidden inputs `oldAuth`/`oldNick`/`oldPass`/`oldChannel`
+     echo the current values — send them back unchanged).
+  3. `GET /config?auth=<admin>&ssid=<ssid>&pass=<wifi>&channel=<n>`
+     — stages the config; replies `config_success` **but applies
+     nothing** by itself.
+  4. `GET /config?reset=1` — commits; the card reboots its AP (clients
+     drop; the AP is back on air in ~10–15 s).
+  Implemented as `ezs_admin_change_wifi_pass()` → BLE op
+  `EZSHARE_ADMIN` (verified end-to-end against the live card).
 
 How it would work, without the user doing anything:
 
