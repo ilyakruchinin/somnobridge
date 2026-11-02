@@ -187,7 +187,7 @@ static void ui_setup_draw(void)
     } else {
         lcd_ui_row(3, "PW: (open network)", 0);
     }
-    lcd_ui_row(5, "OPEN http://192.168.4.1", 0);
+    lcd_ui_row(5, "OPEN http://192.168.8.1", 0);
     lcd_ui_row(6, "BTN: CONFIRM  HOLD: EXIT", 0);
     if (notice[0]) {
         lcd_ui_row(7, notice, 1);
