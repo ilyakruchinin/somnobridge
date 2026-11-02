@@ -131,17 +131,18 @@ esp_err_t board_init(void)
 
     esp_lcd_panel_reset(s_panel);
     esp_lcd_panel_init(s_panel);
-    /* Native portrait scan: 135x240 window at (52,40) in panel RAM,
-     * no mirroring, colors inverted. On this unit the un-mirrored
-     * scan is a 180-degree-rotated view of the nominal orientation:
-     * row 0 sits at the USB end and text reads normally with the
-     * device held USB-connector-up. */
+    /* Landscape scan (240x135 window at (40,52) in panel RAM), no
+     * mirroring, colors inverted. On this unit the un-mirrored scan is
+     * a 180-degree-rotated view of the nominal orientation: row 0 sits
+     * at the USB end and text reads normally with the device held
+     * USB-connector-up. */
     esp_lcd_panel_mirror(s_panel, false, false);
     esp_lcd_panel_invert_color(s_panel, true);
     esp_lcd_panel_disp_on_off(s_panel, true);
 
     /* ST7789 RAM survives resets — clear the whole 240x320 buffer so
-     * stale frames from previous boots don't ghost through the window. */
+     * stale frames from previous boots don't ghost through the window.
+     * Must run before swap_xy: the RAM is still addressed natively. */
     {
         static uint16_t black[240 * 16];
         for (int y = 0; y < 320; y += 16) {
@@ -149,7 +150,13 @@ esp_err_t board_init(void)
             board_lcd_wait_done();
         }
     }
-    esp_lcd_panel_set_gap(s_panel, 52, 40);
+    esp_lcd_panel_swap_xy(s_panel, true);
+    /* MV|MX: MV alone transposes the frame, which leaves the image
+     * mirrored along the short axis (top bar lands at the bottom).
+     * MX flips the column-address order back, keeping x=0 at the USB
+     * end. The driver composes bits via its cached madctl_val. */
+    esp_lcd_panel_mirror(s_panel, true, false);
+    esp_lcd_panel_set_gap(s_panel, 40, 52);
 
     board_backlight_set(30);
     ESP_LOGI(TAG, "board ready (lcd %ux%u)", BOARD_LCD_HRES, BOARD_LCD_VRES);

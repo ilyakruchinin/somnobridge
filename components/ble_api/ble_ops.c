@@ -1450,6 +1450,26 @@ void ble_svc_stream_abort(uint32_t request_id, const char *why)
     }
 }
 
+/* LCD status: percent of the current transfer, -1 when idle. The
+ * denominator is the exact Content-Length once known, else the
+ * listing-derived size — good enough for an activity indicator. */
+int ble_svc_stream_percent(void)
+{
+    if (!atomic_load(&s_stream.active)) {
+        return -1;
+    }
+    uint64_t total = s_stream.src_clen > 0
+        ? (uint64_t)s_stream.src_clen : s_stream.src_size;
+    if (total == 0) {
+        return 0;
+    }
+    uint64_t sent = s_stream.sent;
+    if (sent >= total) {
+        return 100;
+    }
+    return (int)(sent * 100 / total);
+}
+
 /* ---------------- time sync (§8.1 / §10.4) ---------------- */
 
 static void on_time_request(uint32_t rid, const uint8_t *pl, uint16_t n)
@@ -1868,6 +1888,14 @@ static void prov_worker(void *p)
         const char *target = j->ssid[0] ? j->ssid : "ez Share";
         netw_ap_t aps[16];
         int n = netw_scan_anywhere(aps, 16);
+        if (n < 0) {
+            /* a failed scan is not "card absent" — say so, or the
+             * portal reports a phantom invisible card */
+            send_error(j->rid, j->op, EC_RESOURCE_LIMIT);
+            free(j);
+            vTaskDelete(NULL);
+            return;
+        }
         const netw_ap_t *hit = NULL;
         for (int i = 0; i < n; i++) {
             if (!strcmp(aps[i].ssid, target)) {
@@ -1875,23 +1903,48 @@ static void prov_worker(void *p)
                 break;
             }
         }
+        /* Two independent questions:
+         *  - is the card insecure (open, or the factory password works)?
+         *  - do the credentials we just SAVED actually join it?
+         * The second one is what the user needs after Save & Test —
+         * without it a wrong saved password looks like success.       */
         bool joined_default = false;
-        if (hit && !hit->open && j->try_default) {
+        bool saved_ok = false, saved_known = false;
+        sp_settings_t cfg;
+        bool have_saved = settings_load(&cfg) == ESP_OK && cfg.magic_valid &&
+                          cfg.ezshare_ssid[0];
+        if (hit && !hit->open && have_saved && cfg.ezshare_password[0]) {
             bool ok = false;
-            if (netw_probe_creds(target, "88888888", 9000, &ok) == ESP_OK) {
-                joined_default = ok;
+            if (netw_probe_creds(cfg.ezshare_ssid, cfg.ezshare_password,
+                                 8000, &ok) == ESP_OK) {
+                saved_ok = ok;
+                saved_known = true;
             }
         }
-        char inner[256];
+        if (hit && !hit->open && j->try_default) {
+            bool is_default = have_saved &&
+                              !strcmp(cfg.ezshare_password, "88888888");
+            if (is_default && saved_known) {
+                joined_default = saved_ok;   /* same credentials already */
+            } else {
+                bool ok = false;
+                if (netw_probe_creds(target, "88888888", 8000, &ok)
+                        == ESP_OK) {
+                    joined_default = ok;
+                }
+            }
+        }
+        char inner[320];
         snprintf(inner, sizeof(inner),
                  "{\"found\":%s,\"ssid\":\"%.32s\",\"rssi\":%d,"
                  "\"open\":%s,\"default_pass_works\":%s,"
-                 "\"insecure\":%s}",
+                 "\"saved_pass_works\":%s,\"insecure\":%s}",
                  hit ? "true" : "false",
                  hit ? hit->ssid : target,
                  hit ? hit->rssi : 0,
                  hit && hit->open ? "true" : "false",
                  joined_default ? "true" : "false",
+                 saved_known ? (saved_ok ? "true" : "false") : "null",
                  (hit && hit->open) || joined_default ? "true" : "false");
         send_ok(j->rid, j->op, inner);
     }

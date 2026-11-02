@@ -12,6 +12,7 @@
 #include "board.h"
 #include "catalog.h"
 #include "drift.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
@@ -48,10 +49,73 @@ volatile bool portal_saved_flag;
  * re-enters STA directly instead of leaving setup first.            */
 volatile bool ble_cfg_saved_flag;
 
-/* while the BLE PIN screen is up the status tick must not redraw rows —
- * set on ble_svc_pin_visible(), cleared (with a chrome repaint) once the
- * pairing attempt ends                                            */
-static bool s_pin_up;
+/* ---------------- LCD status UI (landscape 240x135) ---------------- */
+
+#define UI_GREEN   LCD_RGB(0, 255, 120)
+#define UI_AMBER   LCD_RGB(255, 190, 0)
+#define UI_RED     LCD_RGB(255, 70, 70)
+#define UI_BLUE    LCD_RGB(80, 180, 255)   /* BT/session — light blue  */
+#define UI_BLUE_D  LCD_RGB(70, 120, 180)   /* bonded, idle             */
+#define UI_GREY    LCD_RGB(200, 200, 200)
+#define UI_MID     LCD_RGB(140, 140, 140)
+#define UI_DIM     LCD_RGB(80, 80, 80)
+
+/* boot/runtime faults that must stay visible on the status line */
+enum { FAULT_WIFI = 1, FAULT_BLE = 2, FAULT_SCHED = 4, FAULT_CARD = 8 };
+static uint8_t s_fault;
+
+/* transient message (portal actions, config commits): highest-priority
+ * status line until it expires */
+static struct {
+    char     text[32];
+    uint16_t color;
+    int64_t  until_us;
+} s_notice;
+
+/* redraw guards: a full frame costs ~20 ms of SPI, so each screen
+ * repaints only when its composed state changes */
+static char s_status_key[96];
+static char s_setup_key[96];
+static bool s_pin_was_up;
+
+static void ui_invalidate(void)
+{
+    s_status_key[0] = '\0';
+    s_setup_key[0] = '\0';
+}
+
+static void ui_notice(const char *text, uint16_t color, int seconds)
+{
+    snprintf(s_notice.text, sizeof(s_notice.text), "%s", text);
+    s_notice.color = color;
+    s_notice.until_us = esp_timer_get_time() + (int64_t)seconds * 1000000;
+}
+
+/* boot splash doubles as a boot progress bar */
+static void ui_splash(int percent)
+{
+    static bool drawn;
+    if (!drawn) {
+        lcd_ui_clear();
+        lcd_ui_text_center(38, 2, UI_GREEN, "SOMNOBRIDGE");
+        lcd_ui_text_center(78, 1, UI_GREY,
+                           esp_app_get_description()->version);
+        drawn = true;
+    }
+    lcd_ui_progress(40, 104, 160, 8, percent, UI_GREEN);
+}
+
+/* "-8m 34.3s" — drift rounded to 0.1 s */
+static void fmt_drift(char *out, size_t n, int64_t ms)
+{
+    int64_t a = ms < 0 ? -ms : ms;
+    int64_t tenths = (a + 50) / 100;
+    snprintf(out, n, "%c%lldm %lld.%llds",
+             ms < 0 ? '-' : '+',
+             (long long)(tenths / 600),
+             (long long)((tenths % 600) / 10),
+             (long long)(tenths % 10));
+}
 
 static void on_wifi_link(bool up, uint32_t ip)
 {
@@ -71,22 +135,22 @@ static void run_portal_action(int act)
     switch (act) {
     case PORTAL_ACTION_FORGET_PEER:
         ble_svc_forget_peer();          /* app identity + bond store  */
-        lcd_ui_row(11, "PEER FORGOTTEN", 1);
+        ui_notice("PEER FORGOTTEN", UI_GREEN, 15);
         jrn_put("event", "\"e\":\"forget_peer\"");
         break;
     case PORTAL_ACTION_RESET_SETTINGS:
         settings_clear();               /* EZShare cfg, keeps peer    */
         drift_sot_invalidate();         /* card may change (U6)       */
-        lcd_ui_row(11, "SETTINGS RESET", 1);
+        ui_notice("SETTINGS RESET", UI_GREEN, 15);
         jrn_put("event", "\"e\":\"reset_settings\"");
         break;
     case PORTAL_ACTION_CLEAR_EVIDENCE:
         jrn_erase_all();
-        lcd_ui_row(11, "EVIDENCE CLEARED", 1);
+        ui_notice("EVIDENCE CLEARED", UI_GREEN, 15);
         break;
     case PORTAL_ACTION_REBUILD_CATALOG:
         cat_init();                     /* volatile: drops all state  */
-        lcd_ui_row(11, "CATALOG CLEARED", 1);
+        ui_notice("CATALOG CLEARED", UI_GREEN, 15);
         jrn_put("event", "\"e\":\"rebuild_catalog\"");
         break;
     default:
@@ -99,77 +163,142 @@ static void card_task(void *arg)
     sched_run_forever();
 }
 
-static void show_setup_ap(void)
+/* setup AP screen: the credentials are the only thing the user needs
+ * while the portal is up (5 min idle / 15 min absolute, §4.1) */
+static void ui_setup_draw(void)
 {
     char ssid[33], pass[16];
-    lcd_ui_row(11, "SETUP MODE", 1);
     netw_ap_credentials(ssid, pass);
-    lcd_ui_rowf(12, 1, "AP:%s", ssid);
+    int64_t now = esp_timer_get_time();
+    const char *notice = (s_notice.text[0] && now < s_notice.until_us)
+        ? s_notice.text : "";
+    char key[96];
+    snprintf(key, sizeof(key), "%s|%s|%s", ssid, pass, notice);
+    if (strcmp(key, s_setup_key) == 0) {
+        return;
+    }
+    snprintf(s_setup_key, sizeof(s_setup_key), "%s", key);
+    s_status_key[0] = '\0';        /* status repaints on return */
+    lcd_ui_clear();
+    lcd_ui_row(0, "SOMNOBRIDGE SETUP", 1);
+    lcd_ui_rowf(2, 0, "AP: %s", ssid);
     if (pass[0]) {
-        lcd_ui_rowf(13, 1, "PW:%s", pass);
+        lcd_ui_rowf(3, 0, "PW: %s", pass);
     } else {
-        lcd_ui_row(13, "OPEN NETWORK", 1);
+        lcd_ui_row(3, "PW: (open network)", 0);
+    }
+    lcd_ui_row(5, "OPEN http://192.168.4.1", 0);
+    lcd_ui_row(6, "BTN: CONFIRM  HOLD: EXIT", 0);
+    if (notice[0]) {
+        lcd_ui_row(7, notice, 1);
     }
 }
 
-/* leave AP mode: rows 12/13 carried AP credentials — clear them or
- * they stay on screen under the status message                    */
+/* leave AP mode: the setup screen is redrawn as the status screen by
+ * the next tick; the notice bridges the transition */
 static void leave_setup(const char *msg)
 {
-    lcd_ui_row(11, msg, 1);
-    lcd_ui_row(12, "", 0);
-    lcd_ui_row(13, "", 0);
+    ui_notice(msg, UI_GREEN, 5);
     netw_leave_ap();
     ble_svc_resume();
 }
 
-static void ui_tick(void)
+/* normal status screen: card link + BLE session + transfer in the top
+ * bar, clock-drift hero in the middle, one status line at the bottom.
+ * Redrawn only when the composed state changes — a full frame costs
+ * ~20 ms of SPI time, so an idle screen must not blink once a second. */
+static void ui_status_draw(void)
 {
-    const therapy_status_t *t = therapy_status();
     const netw_status_t *n = netw_status();
-    lcd_ui_rowf(3, 0, "WIFI:%s %ddBm",
-                n->sta_connected ? "UP" : "DOWN", n->rssi);
-    lcd_ui_rowf(4, 0, "BLE:%s%s",
-                ble_svc_connected() ? "CONN" : "---",
-                ble_svc_authorized() ? " AUTH" : "");
-    lcd_ui_rowf(5, 0, "THER:%s%s",
-                t->state == THERAPY_IN ? "IN " :
-                t->state == THERAPY_OUT ? "OUT" : "???",
-                t->therapy_stale ? " STALE" : "");
-    lcd_ui_rowf(6, 0, "CAT:%d %s A:%d",
-                cat_folder_count(),
-                cat_catalog_complete() ? "FULL" : "PART",
-                drift_anchor_count());
-    lcd_ui_rowf(7, 0, "L8H:%lu BK:%lus",
-                (unsigned long)sched_active_8h(),
-                (unsigned long)(sched_backoff_ms() / 1000));
+    int pct = ble_svc_stream_percent();
 
-    /* D: live estimate; S: persisted source of truth (U10).
-     * Nulls render as "—" — never a fabricated value.             */
+    uint16_t bt;
+    if (ble_svc_connected() && ble_svc_authorized()) {
+        bt = UI_BLUE;                       /* SomnoTrace session live */
+    } else if (ble_svc_connected()) {
+        bt = UI_AMBER;                      /* link up, not authorized */
+    } else if (ble_svc_peer_bonded()) {
+        bt = UI_BLUE_D;                     /* paired, idle            */
+    } else {
+        static bool blink;
+        blink = !blink;
+        bt = (ble_svc_pairing_open() && blink) ? UI_AMBER : UI_DIM;
+    }
+
+    /* hero: clock-drift estimate. Nulls render as "---" — never a
+     * fabricated value (U10). */
+    char val[28];
+    char sub[40] = "";
+    uint16_t vc = UI_DIM;
     drift_record_t dr;
     if (drift_pub_get(&dr) && dr.has_drift) {
-        lcd_ui_rowf(8, 0, "D:%c%lldms +/-%lld %s",
-                    dr.clock_drift_ms >= 0 ? '+' : '-',
-                    (long long)(dr.clock_drift_ms < 0
-                        ? -dr.clock_drift_ms : dr.clock_drift_ms),
-                    (long long)dr.accuracy_half_ms,
-                    dr.tier == ACC_ACCURATE ? "ACC" :
-                    dr.tier == ACC_APPROXIMATE ? "APX" : "---");
-    } else if (drift_pub_get(NULL)) {
-        lcd_ui_row(8, "D: pending", 0);
+        fmt_drift(val, sizeof(val), dr.clock_drift_ms);
+        int64_t half = (dr.accuracy_half_ms + 50) / 100;   /* 0.1 s */
+        snprintf(sub, sizeof(sub), "+/-%lld.%llds",
+                 (long long)(half / 10), (long long)(half % 10));
+        vc = dr.tier == ACC_ACCURATE ? UI_GREEN :
+             dr.tier == ACC_APPROXIMATE ? UI_AMBER : UI_GREY;
     } else {
-        lcd_ui_row(8, "D: ---", 0);
+        drift_sot_t sot;
+        if (drift_sot_view(&sot)) {
+            fmt_drift(val, sizeof(val), sot.clock_drift_ms);
+            snprintf(sub, sizeof(sub), "LAST KNOWN");
+            vc = UI_GREY;
+        } else {
+            snprintf(val, sizeof(val), "---");
+        }
     }
-    drift_sot_t sot;
-    if (drift_sot_view(&sot)) {
-        lcd_ui_rowf(14, 0, "S:%c%lldms +/-%lld %s",
-                    sot.clock_drift_ms >= 0 ? '+' : '-',
-                    (long long)(sot.clock_drift_ms < 0
-                        ? -sot.clock_drift_ms : sot.clock_drift_ms),
-                    (long long)sot.accuracy_half_ms,
-                    sot.origin == DRIFT_SOT_NVS ? "NVS" : "RAM");
-    } else {
-        lcd_ui_row(14, "S: ---", 0);
+
+    /* status line: notice > fault > pairing > therapy > transfer */
+    const char *line = "";
+    uint16_t lc = 0xFFFF;
+    int64_t now = esp_timer_get_time();
+    static char sync_line[20];
+    if (s_notice.text[0] && now < s_notice.until_us) {
+        line = s_notice.text;
+        lc = s_notice.color;
+    } else if (s_fault) {
+        line = (s_fault & FAULT_WIFI) ? "WIFI FAIL" :
+               (s_fault & FAULT_BLE)  ? "BLE FAIL" :
+               (s_fault & FAULT_CARD) ? "CARD FAIL" : "SCHED FAIL";
+        lc = UI_RED;
+    } else if (!ble_svc_peer_bonded() && !ble_svc_connected()) {
+        line = ble_svc_pairing_open() ? "PAIRING - WAIT FOR APP"
+                                      : "HOLD BTN TO PAIR";
+        lc = UI_AMBER;
+    } else if (therapy_status()->state == THERAPY_IN) {
+        line = "THERAPY - TRANSFERS PAUSED";
+        lc = UI_BLUE;
+    } else if (pct >= 0) {
+        snprintf(sync_line, sizeof(sync_line), "SYNCING %d%%", pct);
+        line = sync_line;
+    }
+
+    char key[96];
+    snprintf(key, sizeof(key), "%d|%d|%u|%s|%s|%s|%d",
+             n->sta_connected, n->rssi / 10, (unsigned)bt,
+             val, sub, line, pct);
+    if (strcmp(key, s_status_key) == 0) {
+        return;
+    }
+    snprintf(s_status_key, sizeof(s_status_key), "%s", key);
+    s_setup_key[0] = '\0';         /* setup repaints on return */
+
+    lcd_ui_clear();
+    lcd_ui_wifi_bars(8, 5, n->rssi, n->sta_connected);
+    lcd_ui_bt_rune(40, 5, bt);
+    if (pct >= 0) {
+        lcd_ui_sync(BOARD_LCD_HRES - 8, 7, UI_BLUE, pct);
+    }
+    lcd_ui_rect(0, 24, BOARD_LCD_HRES, 1, LCD_RGB(60, 60, 60));
+
+    lcd_ui_text_center(30, 1, UI_GREY, "CLOCK DRIFT");
+    lcd_ui_text_center(46, 2, vc, val);
+    if (sub[0]) {
+        lcd_ui_text_center(84, 1, UI_MID, sub);
+    }
+    if (line[0]) {
+        lcd_ui_text_center(112, 1, lc, line);
     }
 }
 
@@ -190,9 +319,7 @@ void app_main(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "board_init failed: %s", esp_err_to_name(err));
     }
-    lcd_ui_clear();
-    lcd_ui_headline("SOMNOBRIDGE");
-    lcd_ui_row(1, "BOOT OK", 0);
+    ui_splash(15);
     heap_ck("board");
 
     /* 1. settings/security first — NVS must be up before the journal
@@ -205,8 +332,7 @@ void app_main(void)
     if (provisioned) {
         board_backlight_set(cfg.lcd_brightness);
     }
-    lcd_ui_rowf(2, 0, "CFG:%s SEC:%.3s",
-                provisioned ? "OK" : "NONE", settings_security_label());
+    ui_splash(35);
     heap_ck("settings");
 
     /* 2. evidence journal (may run degraded without security cfg)     */
@@ -215,6 +341,7 @@ void app_main(void)
         ESP_LOGW(TAG, "journal degraded: %s", esp_err_to_name(err));
     }
     jrn_put("event", "\"e\":\"boot\"");
+    ui_splash(50);
     heap_ck("journal");
 
     /* 3. volatile catalog + therapy FSM + scheduler                  */
@@ -222,7 +349,7 @@ void app_main(void)
     err = sched_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "sched_init failed");
-        lcd_ui_row(9, "SCHED FAIL", 1);
+        s_fault |= FAULT_SCHED;
     }
     heap_ck("sched");
     drift_reset();
@@ -250,7 +377,7 @@ void app_main(void)
             != pdPASS) {
         sched_note_task_created(false);
         ESP_LOGE(TAG, "card task create failed");
-        lcd_ui_row(9, "CARD TASK FAIL", 1);
+        s_fault |= FAULT_CARD;
         char rec[96];
         snprintf(rec, sizeof(rec),
                  "\"e\":\"card_task_fail\",\"int_free\":%lu,"
@@ -275,20 +402,18 @@ void app_main(void)
     err = ble_svc_init();
     if (err == ESP_OK) {
         ble_svc_advertise();
-        if (!ble_svc_peer_bonded()) {
-            lcd_ui_row(10, "PRESS BTN: PAIR", 0);
-        }
     } else {
         ESP_LOGE(TAG, "ble_svc_init failed");
-        lcd_ui_row(10, "BLE FAIL", 1);
+        s_fault |= FAULT_BLE;
     }
+    ui_splash(70);
     heap_ck("ble");
 
     /* 5. WiFi — STA with stored config, or fall back to setup AP     */
     err = netw_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "netw_init failed");
-        lcd_ui_row(9, "WIFI FAIL", 1);
+        s_fault |= FAULT_WIFI;
     }
     netw_set_link_cb(on_wifi_link);
     if (provisioned) {
@@ -297,8 +422,9 @@ void app_main(void)
         /* unconfigured: straight to setup AP so the user can pair    */
         netw_enter_ap();
         ble_svc_suspend();           /* give the setup AP the radio   */
-        show_setup_ap();
+        ui_setup_draw();
     }
+    ui_splash(90);
     heap_ck("netw");
 
 #if !defined(CONFIG_HEAP_POISONING_DISABLED)
@@ -330,12 +456,12 @@ void app_main(void)
                 }
                 if (!ble_svc_peer_bonded() &&
                     ble_svc_open_pairing() == ESP_OK) {
-                    lcd_ui_row(11, "PAIRING 120S", 1);
+                    ui_notice("PAIRING 120S", UI_AMBER, 5);
                 }
             } else {
                 netw_enter_ap();
                 ble_svc_suspend();
-                show_setup_ap();
+                ui_setup_draw();
             }
         } else if (ev == BOARD_BTN_SHORT) {
             /* in AP mode a press confirms the pending portal action
@@ -353,7 +479,7 @@ void app_main(void)
                 run_portal_action(pend);
             } else if (!ble_svc_peer_bonded()) {
                 if (ble_svc_open_pairing() == ESP_OK) {
-                    lcd_ui_row(11, "PAIRING 120S", 1);
+                    ui_notice("PAIRING 120S", UI_AMBER, 5);
                 }
             }
         }
@@ -377,7 +503,7 @@ void app_main(void)
                 drift_timezone_set(cfg.as10_tz, cfg.timezone_confirmed);
                 board_backlight_set(cfg.lcd_brightness);
                 if (netw_mode() != NETW_MODE_AP) {
-                    lcd_ui_row(11, "SAVED - JOINING", 1);
+                    ui_notice("SAVED - JOINING", UI_GREEN, 10);
                     netw_enter_sta(&cfg);
                     provisioned = true;
                 }
@@ -436,19 +562,24 @@ void app_main(void)
             ble_svc_pairing_tick(now);   /* 120-s window / 60-s try   */
             netw_refresh_rssi();
             if (ble_svc_pin_visible()) {
-                s_pin_up = true;        /* PIN screen owns the LCD    */
-                char code[8];
+                char code[8];           /* PIN screen owns the LCD    */
                 if (ble_svc_pin_take_request(code, sizeof(code))) {
                     lcd_ui_pin_screen("BLE PAIRING", code,
                                       "TYPE PIN IN APP");
                 }
-            } else {
-                if (s_pin_up) {         /* PIN closed — repaint chrome */
-                    s_pin_up = false;
-                    lcd_ui_clear();
-                    lcd_ui_headline("SOMNOBRIDGE");
+                s_pin_was_up = true;
+            } else if (netw_mode() == NETW_MODE_AP) {
+                if (s_pin_was_up) {
+                    s_pin_was_up = false;
+                    ui_invalidate();
                 }
-                ui_tick();
+                ui_setup_draw();
+            } else {
+                if (s_pin_was_up) {
+                    s_pin_was_up = false;
+                    ui_invalidate();
+                }
+                ui_status_draw();
             }
         }
         esp_task_wdt_reset();

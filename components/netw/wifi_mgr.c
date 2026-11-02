@@ -32,6 +32,7 @@ static char           s_ap_pass[16];
 static bool           s_wifi_started;
 static TaskHandle_t   s_reconn_task;
 static volatile bool  s_probe_active;   /* netw_probe_creds owns the radio */
+static volatile bool  s_scan_active;    /* scan owns the radio: no reconnect */
 
 /* Reconnect backoff ladder (spec §4.3): 1,2,4,8,16,30,60 s, ±10% jitter */
 static const uint32_t s_backoff_ms[] = {
@@ -70,6 +71,10 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id,
                  MAC2STR(ev->mac), (unsigned)ev->aid, ev->reason,
                  (unsigned long)esp_get_free_internal_heap_size());
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        /* reason is the only way to tell bad credentials (202 AUTH_FAIL
+         * / 15 handshake timeout) from a card that is off (201)        */
+        wifi_event_sta_disconnected_t *ev = data;
+        ESP_LOGW(TAG, "sta disconnected reason=%u", (unsigned)ev->reason);
         s_st.sta_connected = false;
         s_st.ezshare_reachable = false;
         if (s_link_cb && !s_probe_active) {
@@ -106,7 +111,7 @@ static void reconn_task(void *arg)
     int step = 0;
     for (;;) {
         if (s_st.mode == NETW_MODE_STA && !s_st.sta_connected &&
-            !s_probe_active) {
+            !s_probe_active && !s_scan_active) {
             esp_wifi_connect();
             vTaskDelay(pdMS_TO_TICKS(10000));
             if (!s_st.sta_connected) {
@@ -357,7 +362,21 @@ int netw_scan_anywhere(netw_ap_t *out, int cap)
     if (prev != WIFI_MODE_STA) {
         esp_wifi_set_mode(WIFI_MODE_STA);
     }
+    s_scan_active = true;
     int cnt = collect_aps(out, cap, NULL);
+    if (cnt < 0 && !s_st.sta_connected) {
+        /* esp_wifi_scan_start() is rejected while the station is
+         * CONNECTING — exactly the state the reconnect task parks the
+         * radio in after bad credentials. Cancel the attempt, scan,
+         * then let the reconnect ladder resume. */
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(80));
+        cnt = collect_aps(out, cap, NULL);
+        if (cnt >= 0) {
+            esp_wifi_connect();
+        }
+    }
+    s_scan_active = false;
     if (!was_started) {
         wifi_stop();
     } else if (prev != WIFI_MODE_STA) {

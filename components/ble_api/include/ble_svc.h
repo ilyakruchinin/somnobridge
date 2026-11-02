@@ -66,6 +66,10 @@ bool      ble_svc_control_subscribed(void);
 uint16_t  ble_svc_att_mtu(void);
 uint16_t  ble_svc_conn_handle(void);
 
+/* LCD status: outbound stream progress in percent, -1 when idle.
+ * 0 means "busy, size not known yet". */
+int       ble_svc_stream_percent(void);
+
 #ifdef __cplusplus
 }
 #endif

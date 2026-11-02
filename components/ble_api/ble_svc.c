@@ -386,6 +386,14 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
                 d.sec_state.bonded && !s_have_peer) {
                 bond_to_peer(&d);
             }
+            /* The link is encrypted: whatever the PIN was for, it is
+             * answered. A *known* peer re-pairing (bond already in NVS)
+             * never reaches bond_to_peer, so hide it here too — else
+             * the LCD stays on the PIN screen for good. */
+            if (s_pairing_open) {
+                s_pairing_open = false;   /* window closes on success */
+            }
+            ble_svc_hide_pin();
         } else if (s_pairing_open) {
             /* failed pairing attempt counts toward the 3-try limit
              * and a stalled attempt expires after 60 s (§3.1)        */
@@ -452,7 +460,14 @@ bool ble_svc_pairing_open(void) { return s_pairing_open; }
  * call ~1 Hz from the app loop                                       */
 void ble_svc_pairing_tick(int64_t now_us)
 {
+    /* a PIN that is still up must expire even if the window already
+     * closed by another path — otherwise it owns the LCD forever */
     if (!s_pairing_open) {
+        if (s_pairing_attempt_us &&
+            now_us - s_pairing_attempt_us > 60LL * 1000 * 1000) {
+            s_pairing_attempt_us = 0;
+            ble_svc_hide_pin();
+        }
         return;
     }
     if (now_us > s_pairing_deadline_us) {
