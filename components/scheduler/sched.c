@@ -533,8 +533,12 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
         r->err = ezs_list_dir("A:\\DATALOG", r->entries,
                               &r->n_entries, &r->obs);
         if (r->err == ESP_OK) {
-            cat_feed_parent(r->entries, r->n_entries, now);
+            esp_err_t fe = cat_feed_parent(r->entries, r->n_entries, now);
             obs_success(true);
+            if (fe != ESP_OK) {
+                s_round_failed = true;
+                ESP_LOGW(TAG, "parent feed failed: %d", (int)fe);
+            }
         } else {
             s_round_failed = true;
             obs_success(false);
@@ -560,13 +564,22 @@ static void exec_job(const qjob_t *j, sched_result_t *r)
             svc_note(r->obs.req_start_us, r->obs.resp_end_us);
             cat_diff_t diff;
             memset(&diff, 0, sizeof(diff));
-            cat_feed_day(j->dir, r->entries, r->n_entries,
-                         r->obs.req_start_us ? r->obs.req_start_us : now,
-                         &diff);
-            if (diff.n_events > 0) {
-                /* a RESIDENT->RESIDENT write, not a baseline relist —
-                 * diff.changed alone also fires on a folder's first
-                 * listing, which emits no events and is not growth   */
+            esp_err_t fe = cat_feed_day(j->dir, r->entries, r->n_entries,
+                                        r->obs.req_start_us
+                                            ? r->obs.req_start_us : now,
+                                        &diff);
+            if (fe != ESP_OK) {
+                /* HTTP succeeded but the catalog did not: a failed feed
+                 * must not refresh liveness or count as an observation. */
+                r->err = fe;
+                s_round_failed = true;
+                cat_mark_folder_stale(j->dir);
+                obs_success(true);
+                ESP_LOGW(TAG, "day %s feed failed: %d", j->dir, (int)fe);
+                break;
+            }
+            if (diff_has_write(&diff)) {
+                /* NEW/GREW/SHRUNK/STAMP are writes; GONE alone is not. */
                 s_round_growth = true;
                 therapy_on_growth(now);   /* relevant write (§7.1) —
                     * stamp-only changes count identically (U3)       */
@@ -778,7 +791,10 @@ static void plan_cover(int64_t now)
     sched_job_t p = { .kind = JOB_PARENT, .prio = 3,
                       .deadline_us = now + COVER_PERIOD_US,
                       .required = true };
-    sched_submit(&p);
+    if (sched_submit(&p) != ESP_OK) {
+        s_round_failed = true;
+        ESP_LOGW(TAG, "cover: parent submit failed");
+    }
 
     char hot[4][CAT_DAY_STR];
     int nh = cat_hot_days(hot, 4);
@@ -790,7 +806,10 @@ static void plan_cover(int64_t now)
                           .deadline_us = now + COVER_PERIOD_US,
                           .required = true };
         copy_bounded(d.dir, CAT_DAY_STR, hot[i]);
-        sched_submit(&d);
+        if (sched_submit(&d) != ESP_OK) {
+            s_round_failed = true;
+            ESP_LOGW(TAG, "cover: %s submit failed", hot[i]);
+        }
     }
 }
 
@@ -805,13 +824,21 @@ static void plan_cold(int64_t now)
         return;
     }
     s_next_cold_us = now + COLD_PERIOD_US;
-    char q[8][CAT_DAY_STR];
-    int n = cat_scan_queue(q, 8);
+    int cap = cat_folder_count();
+    if (cap < 1) cap = 1;
+    char (*q)[CAT_DAY_STR] =
+        heap_caps_malloc((size_t)cap * CAT_DAY_STR,
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!q) q = malloc((size_t)cap * CAT_DAY_STR);
+    if (!q) return;
+    int n = cat_scan_queue(q, cap);
     if (n > 0) {
         sched_job_t d = { .kind = JOB_DAY, .prio = 6 };
         strncpy(d.dir, q[0], CAT_DAY_STR);
-        sched_submit(&d);
+        if (sched_submit(&d) != ESP_OK)
+            ESP_LOGW(TAG, "cold: %s submit failed", q[0]);
     }
+    free(q);
 }
 
 /* ---------------- task ---------------- */

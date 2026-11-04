@@ -157,6 +157,7 @@ int cat_day_entries(const char day[CAT_DAY_STR],
                     cat_file_t *out, int cap);
 cat_folder_state_t cat_day_state(const char day[CAT_DAY_STR]);
 int64_t cat_day_last_scan(const char day[CAT_DAY_STR]);
+bool cat_day_stale(const char day[CAT_DAY_STR]);
 
 /** Look up one file's live tuple (name match is exact). */
 bool cat_find_file(const char day[CAT_DAY_STR], const char *name,

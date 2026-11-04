@@ -531,6 +531,56 @@ static void test_catalog(void)
     CHECK(nh >= 2, "hot set nonempty");
 }
 
+static void test_catalog_capacity(void)
+{
+    cat_init();
+    ezs_entry_t parent[12];
+    for (int i = 0; i < 12; i++) {
+        char day[9];
+        snprintf(day, sizeof(day), "202401%02d", i + 1);
+        parent[i] = mk(day, 0, NULL, true);
+    }
+    CHECK(cat_feed_parent(parent, 12, 1000) == ESP_OK,
+          "capacity parent feed");
+
+    ezs_entry_t *files = calloc(512, sizeof(*files));
+    CHECK(files != NULL, "capacity file array");
+    if (!files) return;
+    for (int i = 0; i < 512; i++) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "F%03d.edf", i);
+        files[i] = mk(nm, 1000 + (uint64_t)i, "2024-01-01 00:00:00", false);
+    }
+    for (int d = 0; d < 12; d++) {
+        char day[9];
+        snprintf(day, sizeof(day), "202401%02d", d + 1);
+        CHECK(cat_feed_day(day, files, 512, 2000 + d, NULL) == ESP_OK,
+              "capacity day feed");
+    }
+    CHECK(cat_psram_used() <= CAT_PS_BUDGET,
+          "capacity stays within the PSRAM budget");
+    CHECK(cat_state() != CAT_READY,
+          "capacity pressure is not reported READY");
+    CHECK(cat_incomplete_count() > 0,
+          "capacity pressure is exposed as incomplete");
+    free(files);
+    cat_init();
+}
+
+static void test_catalog_gone_reconcile(void)
+{
+    cat_init();
+    ezs_entry_t p[1] = { mk("20240101", 0, NULL, true) };
+    CHECK(cat_feed_parent(p, 1, 1) == ESP_OK, "gone-reconcile parent");
+    CHECK(cat_day_state("20240101") == CAT_FOLDER_UNSCANNED,
+          "parent adds an unscanned day");
+    CHECK(cat_feed_parent(NULL, 0, 2) == ESP_OK,
+          "empty complete parent listing");
+    CHECK(cat_day_state("20240101") == CAT_FOLDER_GONE,
+          "unscanned disappeared day becomes GONE");
+    cat_init();
+}
+
 static void test_catalog_reset(void)
 {
     ezs_entry_t parent[] = {
@@ -556,8 +606,8 @@ static void test_catalog_reset(void)
               cat_feed_day("20240102", files, 1, 3000, NULL) == ESP_OK &&
               cat_feed_day("20240101", NULL, 0, 4000, NULL) == ESP_OK,
               "resident, directory-filtered, and empty folders populated");
-        CHECK(cat_psram_used() == 4 * (int)sizeof(cat_file_t) &&
-              cat_catalog_complete(), "resident capacity accurately accounted");
+        CHECK(cat_psram_used() == 3 * (int)sizeof(cat_file_t) &&
+              cat_catalog_complete(), "file-only resident capacity accounted");
         CHECK(cat_day_entries("20240103", snapshot, 2) == 2,
               "entries copied before reset");
         cat_mark_folder_stale("20240102");
@@ -2500,6 +2550,8 @@ int main(void)
     test_parser();
     test_paths();
     test_catalog();
+    test_catalog_capacity();
+    test_catalog_gone_reconcile();
     test_catalog_reset();
 #ifdef CAT_HOST_THREADS
     test_catalog_concurrent_reset();

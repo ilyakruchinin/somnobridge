@@ -174,12 +174,14 @@ static void refresh_state(void)
             }
         }
     }
-    if (unresident == 0 && known > 0) {
+    if (s_psram_used > CAT_PS_BUDGET || s_nfolders >= CAT_MAX_FOLDERS) {
+        /* A full table or an over-budget resident set is a capacity
+         * failure even when every known folder happens to be resident. */
+        s_state = CAT_INCOMPLETE;
+    } else if (unresident == 0 && known > 0) {
         s_state = CAT_READY;
     } else if (unresident > 0 && s_nfolders > 0) {
-        /* INCOMPLETE only when the budget, not laziness, is the cause */
-        s_state = (s_psram_used >= CAT_PS_BUDGET)
-                      ? CAT_INCOMPLETE : CAT_SCANNING;
+        s_state = CAT_SCANNING;
     } else {
         s_state = CAT_SCANNING;
     }
@@ -238,13 +240,23 @@ esp_err_t cat_feed_parent(const ezs_entry_t *entries, int n,
                           int64_t now_us)
 {
     LOCK();
-    /* mark every non-GONE folder as candidate-GONE; revive those seen */
-    bool seen[CAT_MAX_FOLDERS] = {0};
-    int known = 0;
+    /* Preflight the table so a full catalog cannot be partially mutated. */
+    int new_folders = 0;
     for (int i = 0; i < n; i++) {
-        if (!entries[i].is_dir || !ezs_is_valid_day(entries[i].name)) {
+        if (!entries[i].is_dir || !ezs_is_valid_day(entries[i].name))
             continue;
-        }
+        if (!find(entries[i].name)) new_folders++;
+    }
+    if (s_nfolders + new_folders > CAT_MAX_FOLDERS) {
+        UNLOCK();
+        return ESP_ERR_NO_MEM;
+    }
+    /* Mark every seen folder, including newly added ones, so the absence
+     * pass can reconcile unscanned folders that disappeared. */
+    bool seen[CAT_MAX_FOLDERS] = {0};
+    for (int i = 0; i < n; i++) {
+        if (!entries[i].is_dir || !ezs_is_valid_day(entries[i].name))
+            continue;
         cat_folder_t *f = find(entries[i].name);
         if (!f) {
             f = add_folder(entries[i].name);
@@ -252,28 +264,17 @@ esp_err_t cat_feed_parent(const ezs_entry_t *entries, int n,
                 UNLOCK();
                 return ESP_ERR_NO_MEM;
             }
-        } else {
-            int idx = (int)(f - s_folders);
-            seen[idx] = true;
-            if (f->state == CAT_FOLDER_GONE) {
-                f->state = CAT_FOLDER_UNSCANNED;
-            }
         }
-        known++;
+        int idx = (int)(f - s_folders);
+        seen[idx] = true;
+        if (f->state == CAT_FOLDER_GONE) {
+            f->state = CAT_FOLDER_UNSCANNED;
+        }
     }
-    /* folders absent from a good parent listing -> GONE */
+    /* A complete parent listing proves absence, including for folders
+     * that were never scanned; a raced/partial listing must not. */
     for (int i = 0; i < s_nfolders; i++) {
-        if (!seen[i] && s_folders[i].state != CAT_FOLDER_GONE &&
-            s_folders[i].state != CAT_FOLDER_UNSCANNED) {
-            /* keep UNSCANNED ones too — parent may have raced */
-        }
-        if (!seen[i] && find(s_folders[i].day) &&
-            s_folders[i].state == CAT_FOLDER_RESIDENT &&
-            s_folders[i].last_scan_us > 0) {
-            /* only demote folders that were ever confirmed present    */
-        }
-        if (!seen[i] && s_folders[i].state != CAT_FOLDER_UNSCANNED &&
-            s_folders[i].last_scan_us > 0) {
+        if (!seen[i] && s_folders[i].state != CAT_FOLDER_GONE) {
             CAT_LOG("parent: %s not seen -> GONE (was state=%d)",
                     s_folders[i].day, (int)s_folders[i].state);
             s_folders[i].state = CAT_FOLDER_GONE;
@@ -295,7 +296,7 @@ esp_err_t cat_feed_parent(const ezs_entry_t *entries, int n,
             LOCK();
         }
     }
-    (void)known; (void)now_us;
+    (void)now_us;
     refresh_state();
     UNLOCK();
     return ESP_OK;
@@ -335,13 +336,18 @@ esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
     if (diff) {
         memset(diff, 0, sizeof(*diff));
     }
-    /* build new entry set in scratch first (atomic replace, §5.2) */
+    /* Count file rows first: directory rows must not reserve file slots. */
+    int nf_count = 0;
+    for (int i = 0; i < n; i++) {
+        if (!entries[i].is_dir) nf_count++;
+    }
     cat_file_t *nf = NULL;
-    if (n > 0) {
-        nf = cat_alloc((size_t)n * sizeof(cat_file_t));
+    if (nf_count > 0) {
+        nf = cat_alloc((size_t)nf_count * sizeof(cat_file_t));
         if (!nf) {
             CAT_LOG("feed %s: alloc %u B failed (psram_used=%d)",
-                     day, (unsigned)(n * sizeof(cat_file_t)), cat_psram_used());
+                     day, (unsigned)(nf_count * sizeof(cat_file_t)),
+                     cat_psram_used());
             return ESP_ERR_NO_MEM;
         }
     }
@@ -377,10 +383,43 @@ esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
     if (diff) {
         diff->prev_scan_us = f->last_scan_us;
     }
+    /* Preflight the resident budget: evict cold folders before replacing
+     * the snapshot, and fail without publishing a partial/over-budget
+     * catalog.  The just-fed folder is never its own victim. */
+    int old_cap = f->files ? f->n_cap : 0;
+    int need = nf_count - old_cap;
+    if (need > 0) {
+        while (s_psram_used + need * (int)sizeof(cat_file_t) >
+               CAT_PS_BUDGET) {
+            cat_folder_t *victim = NULL;
+            for (int i = 0; i < s_nfolders; i++) {
+                cat_folder_t *c = &s_folders[i];
+                if (c == f || c->state != CAT_FOLDER_RESIDENT || c->hot ||
+                    c->active ||
+                    (victim && c->last_scan_us >= victim->last_scan_us)) {
+                    continue;
+                }
+                victim = c;
+            }
+            if (!victim) break;
+            free_files(victim);
+            victim->state = CAT_FOLDER_EVICTED;
+        }
+        if (s_psram_used + need * (int)sizeof(cat_file_t) >
+            CAT_PS_BUDGET) {
+            UNLOCK();
+            free(nf);
+            CAT_LOG("feed %s: budget exhausted (used=%d need=%d)",
+                    day, s_psram_used, need * (int)sizeof(cat_file_t));
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     /* diff the resident set against the new listing; every tuple
      * difference is an update event (size, stamp, membership — U3)  */
     bool changed = (f->state != CAT_FOLDER_RESIDENT) ||
                    (w != f->n_files);
+    bool write_seen = false;
     if (f->state == CAT_FOLDER_RESIDENT) {
         for (int i = 0; i < w; i++) {
             const cat_file_t *old = NULL;
@@ -393,6 +432,7 @@ esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
             if (!old) {
                 if (diff) diff_emit(diff, CAT_EV_NEW, NULL, &nf[i]);
                 changed = true;
+                write_seen = true;
                 continue;
             }
             bool stamp_diff =
@@ -401,6 +441,7 @@ esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
                  strcmp(nf[i].timestamp_raw, old->timestamp_raw));
             if (nf[i].size != old->size || stamp_diff) {
                 changed = true;
+                write_seen = true;
                 if (!diff) {
                     continue;
                 }
@@ -421,43 +462,27 @@ esp_err_t cat_feed_day(const char day[CAT_DAY_STR],
             if (gone) {
                 if (diff) diff_emit(diff, CAT_EV_GONE, &f->files[j], NULL);
                 changed = true;
+                /* GONE alone is a membership change, not a write: do not
+                 * mark the folder active or open a therapy session. */
             }
         }
     }
-    if (changed) {
-        f->active = true;         /* a folder that ever wrote stays hot */
-        if (diff) {
-            diff->changed = true;
-        }
+    if (write_seen) {
+        f->active = true;         /* a folder that actually wrote stays hot */
     }
-    /* budget enforcement: evict oldest cold folders if over ceiling */
+    if (changed && diff) {
+        diff->changed = true;
+    }
     free_files(f);
     f->files = nf;
-    f->n_cap = n;
-    s_psram_used += n * (int)sizeof(cat_file_t);
+    f->n_cap = nf_count;
+    s_psram_used += nf_count * (int)sizeof(cat_file_t);
     f->n_files = w;
     f->state = CAT_FOLDER_RESIDENT;
     f->stale = false;
     f->err_count = 0;
     f->last_scan_us = now_us ? now_us : now_stub();
 
-    while (s_psram_used > CAT_PS_BUDGET) {
-        /* evict oldest non-hot non-active RESIDENT folder */
-        cat_folder_t *victim = NULL;
-        for (int i = 0; i < s_nfolders; i++) {
-            cat_folder_t *c = &s_folders[i];
-            if (c->state == CAT_FOLDER_RESIDENT && !c->hot &&
-                !c->active &&
-                (!victim || c->last_scan_us < victim->last_scan_us)) {
-                victim = c;
-            }
-        }
-        if (!victim) {
-            break;                    /* over-budget on hot data      */
-        }
-        free_files(victim);
-        victim->state = CAT_FOLDER_EVICTED;
-    }
     refresh_state();
     UNLOCK();
     return ESP_OK;
@@ -525,6 +550,8 @@ int cat_incomplete_count(void)
             c++;
         }
     }
+    if (s_psram_used > CAT_PS_BUDGET || s_nfolders >= CAT_MAX_FOLDERS)
+        c++;                    /* capacity failure sentinel          */
     UNLOCK();
     return c;
 }
@@ -636,6 +663,18 @@ int64_t cat_day_last_scan(const char day[CAT_DAY_STR])
     }
     UNLOCK();
     return t;
+}
+
+bool cat_day_stale(const char day[CAT_DAY_STR])
+{
+    bool stale = false;
+    LOCK();
+    cat_folder_t *f = find(day);
+    if (f) {
+        stale = f->stale;
+    }
+    UNLOCK();
+    return stale;
 }
 
 bool cat_find_file(const char day[CAT_DAY_STR], const char *name,

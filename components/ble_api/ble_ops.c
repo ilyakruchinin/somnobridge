@@ -119,17 +119,33 @@ static void scan_done_cb(const sched_result_t *r, void *ctx)
 /* Append `in` at *o as a JSON string body, escaping \ and ".
  * Card paths are Windows-style ("A:\DATALOG\20260930") so raw
  * backslashes would otherwise make the response invalid JSON. */
-static void json_append_escaped(char *buf, size_t cap, size_t *o,
+static bool json_append_escaped(char *buf, size_t cap, size_t *o,
                                 const char *in)
 {
-    for (; in && *in && *o + 3 < cap; in++) {
+    static const char hex[] = "0123456789abcdef";
+    for (; in && *in; in++) {
         unsigned char c = (unsigned char)*in;
+        size_t need = (c == '\\' || c == '"') ? 2 : (c < 0x20 ? 6 : 1);
+        if (*o + need >= cap) {
+            if (*o < cap) buf[*o] = '\0';
+            return false;
+        }
         if (c == '\\' || c == '"') {
             buf[(*o)++] = '\\';
+            buf[(*o)++] = (char)c;
+        } else if (c < 0x20) {
+            buf[(*o)++] = '\\';
+            buf[(*o)++] = 'u';
+            buf[(*o)++] = '0';
+            buf[(*o)++] = '0';
+            buf[(*o)++] = hex[c >> 4];
+            buf[(*o)++] = hex[c & 0xf];
+        } else {
+            buf[(*o)++] = (char)c;
         }
-        buf[(*o)++] = (char)c;
     }
-    buf[*o] = '\0';
+    if (*o < cap) buf[*o] = '\0';
+    return true;
 }
 
 /* Outbound JSON responses are handed to a worker task rather than sent
@@ -401,25 +417,40 @@ static void op_list_recent(uint32_t rid, cJSON *args)
         send_error(rid, OP_LIST_RECENT_DAYS, EC_BAD_REQUEST);
         return;
     }
-    char days[64][CAT_DAY_STR];
-    int nd = cat_list_days(days, 64);
-    /* take newest n */
-    if (nd > n) nd = n;
-    char *buf = malloc(64 * 11 + 256);
-    if (!buf) { send_error(rid, OP_LIST_RECENT_DAYS, EC_RESOURCE_LIMIT); return; }
-    strcpy(buf, "{\"days\":[");
-    for (int i = 0; i < nd; i++) {
-        strcat(buf, "\"");
-        strcat(buf, days[i]);
-        strcat(buf, "\"");
-        if (i + 1 < nd) strcat(buf, ",");
+    int total = cat_folder_count();
+    if (total < 1) total = 1;
+    char (*days)[CAT_DAY_STR] = malloc((size_t)total * CAT_DAY_STR);
+    if (!days) {
+        send_error(rid, OP_LIST_RECENT_DAYS, EC_RESOURCE_LIMIT);
+        return;
     }
-    strcat(buf, "],\"catalog_complete\":");
-    strcat(buf, cat_catalog_complete() ? "true" : "false");
-    strcat(buf, ",\"hot_ready\":");
-    strcat(buf, cat_hot_ready() ? "true" : "false");
-    strcat(buf, "}");
+    int nd = cat_list_days(days, total);
+    /* take newest n after the complete set is sorted */
+    if (nd > n) nd = n;
+    size_t cap = (size_t)total * 11 + 256;
+    char *buf = malloc(cap);
+    if (!buf) {
+        free(days);
+        send_error(rid, OP_LIST_RECENT_DAYS, EC_RESOURCE_LIMIT);
+        return;
+    }
+    size_t o = (size_t)snprintf(buf, cap, "{\"days\":[");
+    for (int i = 0; i < nd; i++) {
+        o += (size_t)snprintf(buf + o, cap - o, "\"%s\"%s", days[i],
+                              i + 1 < nd ? "," : "");
+    }
+    o += (size_t)snprintf(buf + o, cap - o,
+             "],\"catalog_complete\":%s,\"hot_ready\":%s}",
+             cat_catalog_complete() ? "true" : "false",
+             cat_hot_ready() ? "true" : "false");
+    if (o + 3 > 8191) {
+        free(days);
+        free(buf);
+        send_error(rid, OP_LIST_RECENT_DAYS, EC_RESOURCE_LIMIT);
+        return;
+    }
     send_ok(rid, OP_LIST_RECENT_DAYS, buf);
+    free(days);
     free(buf);
 }
 
@@ -447,7 +478,10 @@ static void op_list_day(uint32_t rid, cJSON *args)
         return;
     }
     /* serialize under a response view (bounded) */
-    cat_file_t *files = malloc((n ? n : 1) * sizeof(cat_file_t));
+    cat_file_t *files = heap_caps_malloc((size_t)(n ? n : 1) *
+                                         sizeof(cat_file_t),
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!files) files = malloc((size_t)(n ? n : 1) * sizeof(cat_file_t));
     if (!files) { send_error(rid, OP_LIST_DAY, EC_RESOURCE_LIMIT); return; }
     int copied = cat_day_entries(day, files, n);
     if (copied < 0 || copied > n) {
@@ -457,20 +491,49 @@ static void op_list_day(uint32_t rid, cJSON *args)
     }
     n = copied;
 
-    size_t cap = 1024 + (size_t)n * 256;
-    char *buf = malloc(cap);
+    size_t cap = 1024 + (size_t)n * 700;
+    char *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = malloc(cap);
     if (!buf) { free(files); send_error(rid, OP_LIST_DAY, EC_RESOURCE_LIMIT); return; }
-    int o = snprintf(buf, cap, "{\"day\":\"%s\",\"folder_stale\":false,"
+    size_t o = (size_t)snprintf(buf, cap,
+                     "{\"day\":\"%s\",\"folder_stale\":%s,"
                      "\"scan_age_us\":\"%lld\",\"files\":[",
-                     day, (long long)cat_day_last_scan(day));
-    for (int i = 0; i < n && o < (int)cap - 200; i++) {
-        o += snprintf(buf + o, cap - o,
-            "{\"name\":\"%s\",\"size\":\"%llu\",\"ts\":%s%s%s}%s",
-            files[i].name, (unsigned long long)files[i].size,
-            files[i].has_timestamp ? "\"" : "",
-            files[i].has_timestamp ? files[i].timestamp_raw : "null",
-            files[i].has_timestamp ? "\"" : "",
-            i + 1 < n ? "," : "");
+                     day, cat_day_stale(day) ? "true" : "false",
+                     (long long)cat_day_last_scan(day));
+    int i = 0;
+    for (; i < n && o + 700 < cap; i++) {
+        o += (size_t)snprintf(buf + o, cap - o, "{\"name\":\"");
+        if (!json_append_escaped(buf, cap, &o, files[i].name)) {
+            free(files); free(buf);
+            send_error(rid, OP_LIST_DAY, EC_RESOURCE_LIMIT);
+            return;
+        }
+        o += (size_t)snprintf(buf + o, cap - o,
+                              "\",\"size\":\"%llu\",\"ts\":",
+                              (unsigned long long)files[i].size);
+        if (files[i].has_timestamp) {
+            o += (size_t)snprintf(buf + o, cap - o, "\"");
+            if (!json_append_escaped(buf, cap, &o, files[i].timestamp_raw)) {
+                free(files); free(buf);
+                send_error(rid, OP_LIST_DAY, EC_RESOURCE_LIMIT);
+                return;
+            }
+            o += (size_t)snprintf(buf + o, cap - o, "\"");
+        } else {
+            o += (size_t)snprintf(buf + o, cap - o, "null");
+        }
+        o += (size_t)snprintf(buf + o, cap - o, "}%s",
+                              i + 1 < n ? "," : "");
+    }
+    if (i < n) {
+        free(files); free(buf);
+        send_error(rid, OP_LIST_DAY, EC_RESOURCE_LIMIT);
+        return;
+    }
+    if (o + 3 > 8191) {
+        free(files); free(buf);
+        send_error(rid, OP_LIST_DAY, EC_RESOURCE_LIMIT);
+        return;
     }
     snprintf(buf + o, cap - o, "]}");
     send_ok(rid, OP_LIST_DAY, buf);
@@ -485,6 +548,10 @@ static void op_list_dir(uint32_t rid, cJSON *args)
     cJSON *v = cJSON_GetObjectItem(args, "directory");
     if (!v || !cJSON_IsString(v)) {
         send_error(rid, OP_LIST_DIRECTORY, EC_BAD_REQUEST);
+        return;
+    }
+    if (s_stream.active) {
+        send_error(rid, OP_LIST_DIRECTORY, EC_BUSY);
         return;
     }
     if (!therapy_status()->transfer_allowed) {
@@ -514,31 +581,54 @@ static void op_list_dir(uint32_t rid, cJSON *args)
                    obs.parse != EZS_OK ? EC_PARSE_ERROR : EC_TIMEOUT);
         return;
     }
-    size_t cap = 1024 + (size_t)n * 256;
+    size_t cap = 1024 + (size_t)n * 700;
     char *buf = malloc(cap);
     if (!buf) { free(ents); send_error(rid, OP_LIST_DIRECTORY, EC_RESOURCE_LIMIT); return; }
     size_t o = (size_t)snprintf(buf, cap, "{\"directory\":\"");
     char ldir[280];
     ezp_canon_to_logical(canon, ldir, sizeof(ldir));
-    json_append_escaped(buf, cap, &o, ldir);
+    if (!json_append_escaped(buf, cap, &o, ldir)) {
+        free(ents); free(buf);
+        send_error(rid, OP_LIST_DIRECTORY, EC_RESOURCE_LIMIT);
+        return;
+    }
     o += (size_t)snprintf(buf + o, cap - o, "\",\"files\":[");
-    for (int i = 0; i < n && o + 256 < cap; i++) {
+    int i = 0;
+    for (; i < n && o + 700 < cap; i++) {
         if (ents[i].is_dir) continue;
         o += (size_t)snprintf(buf + o, cap - o, "{\"name\":\"");
-        json_append_escaped(buf, cap, &o, ents[i].name);
+        if (!json_append_escaped(buf, cap, &o, ents[i].name)) {
+            free(ents); free(buf);
+            send_error(rid, OP_LIST_DIRECTORY, EC_RESOURCE_LIMIT);
+            return;
+        }
         o += (size_t)snprintf(buf + o, cap - o,
                               "\",\"size\":\"%llu\",\"ts\":",
                               (unsigned long long)ents[i].size);
         if (ents[i].has_timestamp) {
             o += (size_t)snprintf(buf + o, cap - o, "\"");
-            json_append_escaped(buf, cap, &o, ents[i].timestamp_raw);
+            if (!json_append_escaped(buf, cap, &o, ents[i].timestamp_raw)) {
+                free(ents); free(buf);
+                send_error(rid, OP_LIST_DIRECTORY, EC_RESOURCE_LIMIT);
+                return;
+            }
             o += (size_t)snprintf(buf + o, cap - o, "\"");
         } else {
             o += (size_t)snprintf(buf + o, cap - o, "null");
         }
         o += (size_t)snprintf(buf + o, cap - o, "},");
     }
+    if (i < n) {
+        free(ents); free(buf);
+        send_error(rid, OP_LIST_DIRECTORY, EC_RESOURCE_LIMIT);
+        return;
+    }
     if (o > 0 && buf[o-1] == ',') o--;      /* trim trailing comma */
+    if (o + 3 > 8191) {
+        free(ents); free(buf);
+        send_error(rid, OP_LIST_DIRECTORY, EC_RESOURCE_LIMIT);
+        return;
+    }
     snprintf(buf + o, cap - o, "]}");
     send_ok(rid, OP_LIST_DIRECTORY, buf);
     free(ents);
@@ -585,22 +675,36 @@ static void op_prepare_days(uint32_t rid, cJSON *args)
         }
         memcpy(seen[cnt], day, CAT_DAY_STR);
         cnt++;
-        int64_t last = cat_day_last_scan(day);
-        bool fresh = last &&
-            (esp_timer_get_time() - last) <= 90LL * 1000 * 1000;
-        if (!fresh) {
-            sched_job_t j = { .kind = JOB_DAY, .prio = 1,
-                              .deadline_us = esp_timer_get_time() +
-                                            20LL * 1000 * 1000,
-                              .required = true };
-            strncpy(j.dir, day, CAT_DAY_STR);
-            j.dir[CAT_DAY_STR - 1] = '\0';
-            sched_submit(&j);
-            queued = true;
+        cat_folder_state_t st = cat_day_state(day);
+        const char *status;
+        if (st == CAT_FOLDER_GONE) {
+            status = "gone";
+        } else {
+            int64_t last = cat_day_last_scan(day);
+            bool fresh = st == CAT_FOLDER_RESIDENT &&
+                         !cat_day_stale(day) && last &&
+                         (esp_timer_get_time() - last) <= 90LL * 1000 * 1000;
+            if (fresh) {
+                status = "fresh";
+            } else {
+                sched_job_t j = { .kind = JOB_DAY, .prio = 1,
+                                  .deadline_us = esp_timer_get_time() +
+                                                20LL * 1000 * 1000,
+                                  .required = true };
+                strncpy(j.dir, day, CAT_DAY_STR);
+                j.dir[CAT_DAY_STR - 1] = '\0';
+                esp_err_t se = sched_submit(&j);
+                if (se == ESP_OK) {
+                    status = "queued";
+                    queued = true;
+                } else {
+                    status = se == ESP_ERR_NO_MEM ? "busy" : "error";
+                }
+            }
         }
         o += (size_t)snprintf(inner + o, 2048 - o,
                               "{\"day\":\"%s\",\"status\":\"%s\"},",
-                              day, fresh ? "fresh" : "queued");
+                              day, status);
     }
     if (o && inner[o - 1] == ',') {
         o--;
@@ -655,10 +759,20 @@ static void op_get_file(uint32_t rid, cJSON *args)
             send_error(rid, OP_GET_FILE, EC_PATH_INVALID);
             return;
         }
+        cat_folder_state_t st = cat_day_state(day);
+        if (st == CAT_FOLDER_GONE) {
+            send_error(rid, OP_GET_FILE, EC_NOT_FOUND);
+            return;
+        }
+        if (st == CAT_FOLDER_UNSCANNED || st == CAT_FOLDER_EVICTED) {
+            send_error(rid, OP_GET_FILE, EC_NOT_SCANNED);
+            return;
+        }
         /* refresh source folder via catalog (the scheduler feeds it);
-         * require the resident listing to be fresh (<=90 s)          */
+         * require a non-stale resident listing fresh within 90 s. */
         int64_t last = cat_day_last_scan(day);
-        if (esp_timer_get_time() - last > 90LL * 1000 * 1000) {
+        if (cat_day_stale(day) || !last ||
+            esp_timer_get_time() - last > 90LL * 1000 * 1000) {
             sched_job_t j = { .kind = JOB_DAY, .prio = 1,
                               .deadline_us = esp_timer_get_time() +
                                             10LL * 1000 * 1000,
@@ -726,6 +840,21 @@ static void op_get_file(uint32_t rid, cJSON *args)
             return;
         }
     }
+    cJSON *et = cJSON_GetObjectItem(args, "expected_timestamp_raw");
+    if (et) {
+        /* Omitted and explicit null are different contracts: null means
+         * "the listing had no timestamp", not "do not compare". */
+        bool want_null = cJSON_IsNull(et);
+        const char *want = cJSON_GetStringValue(et);
+        bool match = want_null
+            ? !s_stream.has_src_stamp
+            : (want && s_stream.has_src_stamp &&
+               strcmp(want, s_stream.src_stamp) == 0);
+        if (!match) {
+            send_error(rid, OP_GET_FILE, EC_SOURCE_CHANGED);
+            return;
+        }
+    }
 
     /* STREAM_BEGIN (heap: this runs on the NimBLE host task, whose
      * stack must stay small) */
@@ -733,34 +862,54 @@ static void op_get_file(uint32_t rid, cJSON *args)
      * opts in — an unmodified v1 client keeps the legacy stream.
      * Must precede the STREAM_BEGIN payload below, which reports it. */
     s_stream.v2 = cJSON_IsTrue(cJSON_GetObjectItem(args, "v2"));
-    char *begin = malloc(640);
+    char *begin = malloc(2048);
     if (!begin) {
         send_error(rid, OP_GET_FILE, EC_RESOURCE_LIMIT);
         return;
     }
-    size_t bo = (size_t)snprintf(begin, 640,
+    size_t bo = (size_t)snprintf(begin, 2048,
         "{\"stream_type\":\"file\",\"directory\":\"");
     char ldir[280];
     ezp_canon_to_logical(canon, ldir, sizeof(ldir));
-    json_append_escaped(begin, 640, &bo, ldir);
-    bo += (size_t)snprintf(begin + bo, 640 - bo, "\",\"name\":\"");
-    json_append_escaped(begin, 640, &bo, nv->valuestring);
-    bo += (size_t)snprintf(begin + bo, 640 - bo,
+    if (!json_append_escaped(begin, 2048, &bo, ldir)) {
+        free(begin);
+        send_error(rid, OP_GET_FILE, EC_RESOURCE_LIMIT);
+        return;
+    }
+    bo += (size_t)snprintf(begin + bo, 2048 - bo, "\",\"name\":\"");
+    if (!json_append_escaped(begin, 2048, &bo, nv->valuestring)) {
+        free(begin);
+        send_error(rid, OP_GET_FILE, EC_RESOURCE_LIMIT);
+        return;
+    }
+    bo += (size_t)snprintf(begin + bo, 2048 - bo,
         "\",\"download_name\":\"");
-    json_append_escaped(begin, 640, &bo,
-                        s_stream.dl_name[0] ? s_stream.dl_name
-                                            : nv->valuestring);
-    snprintf(begin + bo, 640 - bo,
+    if (!json_append_escaped(begin, 2048, &bo,
+                             s_stream.dl_name[0] ? s_stream.dl_name
+                                                 : nv->valuestring)) {
+        free(begin);
+        send_error(rid, OP_GET_FILE, EC_RESOURCE_LIMIT);
+        return;
+    }
+    bo += (size_t)snprintf(begin + bo, 2048 - bo,
         "\",\"listed_size\":\"%llu\",\"size_unit_shift\":%u,"
-        "\"wire\":%d,"
-        "\"source_before\":{\"size\":\"%llu\",\"ts\":%s%s%s}}",
+        "\"wire\":%d,\"source_before\":{\"size\":\"%llu\",\"ts\":",
         (unsigned long long)s_stream.src_size,
         (unsigned)s_stream.src_unit_shift,
         s_stream.v2 ? 2 : 1,
-        (unsigned long long)s_stream.src_size,
-        s_stream.has_src_stamp ? "\"" : "",
-        s_stream.has_src_stamp ? s_stream.src_stamp : "null",
-        s_stream.has_src_stamp ? "\"" : "");
+        (unsigned long long)s_stream.src_size);
+    if (s_stream.has_src_stamp) {
+        bo += (size_t)snprintf(begin + bo, 2048 - bo, "\"");
+        if (!json_append_escaped(begin, 2048, &bo, s_stream.src_stamp)) {
+            free(begin);
+            send_error(rid, OP_GET_FILE, EC_RESOURCE_LIMIT);
+            return;
+        }
+        bo += (size_t)snprintf(begin + bo, 2048 - bo, "\"");
+    } else {
+        bo += (size_t)snprintf(begin + bo, 2048 - bo, "null");
+    }
+    snprintf(begin + bo, 2048 - bo, "}}");
     s_stream.cancelled = false;
     s_stream.http_only = false;
     s_stream.http_first_form = 0;
@@ -1560,6 +1709,22 @@ static void on_time_commit(uint32_t rid, const uint8_t *pl, uint16_t n)
 
 static void op_get_drift(uint32_t rid, cJSON *args)
 {
+    /* A day-specific query is only answered when the live/last session
+     * actually belongs to that day.  Without per-session history the
+     * bridge must return unavailable rather than apply a global record
+     * to an unrelated day. */
+    cJSON *dv = args ? cJSON_GetObjectItem(args, "day") : NULL;
+    if (dv) {
+        if (!cJSON_IsString(dv) || !ezs_is_valid_day(dv->valuestring)) {
+            send_error(rid, OP_GET_DRIFT, EC_BAD_REQUEST);
+            return;
+        }
+        drift_session_t *ls = drift_last();
+        if (!ls || !ls->day[0] || strcmp(ls->day, dv->valuestring) != 0) {
+            send_error(rid, OP_GET_DRIFT, EC_METADATA_UNAVAILABLE);
+            return;
+        }
+    }
     /* Legacy readers get the qualified-only source_of_truth. A new
      * reader must explicitly ask for the best-available view before a
      * provisional persisted record is exposed to it.                 */
