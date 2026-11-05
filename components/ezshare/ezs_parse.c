@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "ezs_parse.h"
 #include "ezs_path.h"
@@ -557,6 +558,14 @@ ezs_err_t ezs_parse_dir(const char *body,
 
         if (*n_out >= EZS_ENTRIES_MAX) {
             return EZS_ERR_LIMIT;
+        }
+        /* Two aliases for the same card entry are ambiguous: never pick
+         * one silently.  Compare case-insensitively because FAT names
+         * are case-insensitive for policy purposes. */
+        for (int i = 0; i < *n_out; i++) {
+            if (strcasecmp(entries[i].name, e.name) == 0) {
+                return EZS_ERR_MALFORMED;
+            }
         }
         entries[(*n_out)++] = e;
     }

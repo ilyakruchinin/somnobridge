@@ -274,7 +274,7 @@ static const char *k_listing =
     "<a href=\"download?fname=STR.edf&fdir=..\">STR.edf</a>\r\n"
     "   2026- 9-30   13:57:44           1KB   "
     "<a href=\"http://192.168.4.1/download?file=DATALOG%5C20240101%5C202609~1.EDF\">"
-    " STR.edf</a>\r\n"
+    " 20240101_235752_STR.edf</a>\r\n"
     "   2026- 9-30   14: 9:52          72KB   "
     "<a href=\"http://192.168.4.1/download?file=DATALOG%5C20240101%5C202609~5.EDF\">"
     " 20240101_235752_BRP.edf</a>\r\n"
@@ -295,7 +295,7 @@ static void test_parser(void)
               "dir row + trimmed name");
         CHECK(!strcmp(e[1].name, "STR.edf") && e[1].size == 1234,
               "fname= form keeps raw bytes");
-        CHECK(!strcmp(e[2].name, "STR.edf") && e[2].size == 1024,
+        CHECK(!strcmp(e[2].name, "20240101_235752_STR.edf") && e[2].size == 1024,
               "?file= form: KB size + alias from link text");
         CHECK(!strcmp(e[3].name, "20240101_235752_BRP.edf") &&
               e[3].size == 72 * 1024, "72KB row");
@@ -351,6 +351,14 @@ static void test_parser(void)
         "<pre> 2024-01-01 00:00:00 10 "
         "<a href=\"http://evil/x\">x.bin</a></pre>";
     CHECK(ezs_parse_dir(evil, e, &n) != EZS_OK, "external link rejected");
+
+    const char *dup =
+        "<pre>2024-01-01 00:00:00 10 "
+        "<a href=\"download?fname=STR.edf&fdir=..\">STR.edf</a>\n"
+        "2024-01-01 00:00:00 10 "
+        "<a href=\"download?fname=str.edf&fdir=..\">str.edf</a></pre>";
+    CHECK(ezs_parse_dir(dup, e, &n) == EZS_ERR_MALFORMED,
+          "duplicate alias rejected");
 }
 
 /* ---------------- path canonicalizer ---------------- */
