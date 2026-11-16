@@ -327,7 +327,7 @@ static void ui_status_draw(void)
         char ver[64];
         snprintf(ver, sizeof(ver), "%s", esp_app_get_description()->version);
         ver[BOARD_LCD_COLS] = '\0';
-        lcd_ui_text_center(112, 1, UI_GREY, ver);
+        lcd_ui_text_center(112, 1, UI_BLUE, ver);
     }
 }
 
