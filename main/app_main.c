@@ -274,31 +274,60 @@ static void ui_status_draw(void)
         line = sync_line;
     }
 
+    /* The key must describe what is actually drawn, not the raw sensor.
+     * The Wi-Fi indicator has only four levels, so bucketing RSSI at
+     * 10 dBm repainted the whole frame for pixel-identical output. */
+    int bars = !n->sta_connected ? 0 :
+               n->rssi >= -60 ? 4 : n->rssi >= -70 ? 3 :
+               n->rssi >= -80 ? 2 : 1;
+
     char key[96];
     snprintf(key, sizeof(key), "%d|%d|%u|%s|%s|%s|%d",
-             n->sta_connected, n->rssi / 10, (unsigned)bt,
+             n->sta_connected, bars, (unsigned)bt,
              val, sub, line, pct);
     if (strcmp(key, s_status_key) == 0) {
         return;
     }
+    /* An empty key means ui_invalidate() ran — a screen transition is the
+     * only time the frame needs clearing. Every element below paints its
+     * own background, so a value change updates in place: no black frame,
+     * and therefore no visible flicker. */
+    bool fresh = s_status_key[0] == '\0';
     snprintf(s_status_key, sizeof(s_status_key), "%s", key);
     s_setup_key[0] = '\0';         /* setup repaints on return */
 
-    lcd_ui_clear();
+    if (fresh) {
+        lcd_ui_clear();
+    }
     lcd_ui_wifi_bars(8, 5, n->rssi, n->sta_connected);
     lcd_ui_bt_rune(40, 5, bt);
+    /* lcd_ui_sync paints only lit pixels, so band the whole indicator
+     * area first — a finished transfer must not leave its "%" behind. */
+    lcd_ui_rect(BOARD_LCD_HRES - 72, 4, 72, 16, 0x0000);
     if (pct >= 0) {
         lcd_ui_sync(BOARD_LCD_HRES - 8, 7, UI_BLUE, pct);
     }
     lcd_ui_rect(0, 24, BOARD_LCD_HRES, 1, LCD_RGB(60, 60, 60));
 
     lcd_ui_text_center(30, 1, UI_GREY, "CLOCK DRIFT");
+    /* These strings can shrink ("-0.5s" -> "---") and the text helper only
+     * erases its own width, so band each row at full width first. */
+    lcd_ui_rect(0, 46, BOARD_LCD_HRES, 32, 0x0000);
     lcd_ui_text_center(46, 2, vc, val);
+    lcd_ui_rect(0, 84, BOARD_LCD_HRES, 16, 0x0000);
     if (sub[0]) {
         lcd_ui_text_center(84, 1, UI_MID, sub);
     }
+    lcd_ui_rect(0, 112, BOARD_LCD_HRES, 16, 0x0000);
     if (line[0]) {
         lcd_ui_text_center(112, 1, lc, line);
+    } else {
+        /* Idle: the status line has nothing to report, so show the build.
+         * esp_app_desc_t.version is 32 bytes; the panel holds 30 glyphs. */
+        char ver[64];
+        snprintf(ver, sizeof(ver), "%s", esp_app_get_description()->version);
+        ver[BOARD_LCD_COLS] = '\0';
+        lcd_ui_text_center(112, 1, UI_GREY, ver);
     }
 }
 
