@@ -39,6 +39,23 @@ docker run --rm "${args[@]}" "$IMAGE" bash -ec '
         idf.py set-target esp32s3
     fi
     idf.py build
+    # Version guard: CMake resolves PROJECT_VER only at configure time, so
+    # an incremental build after tagging can silently repackage a stale
+    # esp_app_desc version (e.g. a beta5-dirty binary inside an rc1-named
+    # image — the filename below uses the host-side describe, not the
+    # embedded one). Parse the descriptor back out of the app binary and
+    # refuse to merge on mismatch. esp_app_desc_t layout: magic(4) +
+    # secure_version(4) + reserv1(8) + version[32] @ 0x30 in the app image.
+    APP_VER=$(python3 -c "
+d = open(\"build/somnobridge.bin\",\"rb\").read()
+assert d[0x20:0x24] == b\"\\x32\\x54\\xcd\\xab\", \"missing esp_app_desc marker\"
+print(d[0x30:0x50].split(b\"\\0\")[0].decode())
+")
+    if [ "$2" != "unknown" ] && [ "$APP_VER" != "$2" ]; then
+        echo "ERROR: embedded app version [$APP_VER] != dist version [$2]" >&2
+        echo "       stale build/ — rerun with --clean" >&2
+        exit 1
+    fi
     # Guard: a merged image spans 0x0..app_end and pads inter-segment gaps
     # with 0xFF — any data partition inside that span would be erased by
     # every merged reflash.
