@@ -234,7 +234,16 @@ static void ble_tx_task(void *arg)
     tx_msg_t m;
     for (;;) {
         if (xQueueReceive(s_txq, &m, portMAX_DELAY) == pdTRUE) {
-            send_json_now(m.rid, m.json, m.len);
+            size_t sent = send_json_now(m.rid, m.json, m.len);
+            /* A short write means the response died mid-fragment — the
+             * peer only learns of it via its own timeout.  Say so loudly:
+             * silent truncation is indistinguishable from a dropped
+             * request in the peer's log. */
+            if (sent != m.len) {
+                ESP_LOGW("ble", "ctrl response truncated rid=%lu off=%u/%u",
+                         (unsigned long)m.rid, (unsigned)sent,
+                         (unsigned)m.len);
+            }
             free(m.json);
         }
     }
@@ -1410,10 +1419,16 @@ static void ble_stream_task(void *arg)
                 (unsigned long)(s_stream.v2 ? stc_d16_blocks() : 0),
                 transport_ok ? "true" : "false",
                 transport_ok ? "ok" : "journal_error");
-            send_stream_end(s_stream.request_id, "STREAM_END", end);
+            uint32_t end_rid = s_stream.request_id;
+            /* Release the gate before STREAM_END goes out: the send
+             * retries plus the duplicate at +300 ms would otherwise hold
+             * the client's next GET_FILE in a BUSY window — and any
+             * stream admitted inside that window must not see our
+             * flags cleared under it. */
             s_stream.is_evidence = false;
             s_stream.is_test = false;
             s_stream.active = false;
+            send_stream_end(end_rid, "STREAM_END", end);
             continue;
         }
 
@@ -1529,6 +1544,12 @@ static void ble_stream_task(void *arg)
             s_stream.hdr_cap = NULL;
         }
 
+        uint32_t end_rid = s_stream.request_id;
+        uint64_t done_raw = s_stream.raw_bytes;
+        uint64_t done_sent = s_stream.sent;
+        unsigned long done_stall = s_stream.stall_ms;
+        unsigned long done_retry = s_stream.retry_ms;
+        bool done_v2 = s_stream.v2;
         {
             char end[1024];
             snprintf(end, sizeof(end),
@@ -1567,21 +1588,23 @@ static void ble_stream_task(void *arg)
                 (unsigned long)(s_stream.v2 ? stc_def_blocks() : 0),
                 (unsigned long)(s_stream.v2 ? stc_d16_blocks() : 0),
                 completion ? "true" : "false", reason);
-            send_stream_end(s_stream.request_id, "STREAM_END", end);
+            /* Release the gate before STREAM_END goes out: the send
+             * retries plus the duplicate at +300 ms would otherwise hold
+             * the client's next GET_FILE in a BUSY window. */
+            s_stream.active = false;
+            send_stream_end(end_rid, "STREAM_END", end);
         }
         ESP_LOGI("ble", "stream done raw=%llu wire=%llu stack_hwm=%u "
                  "stall_ms=%lu retry_ms=%lu enc_ms=%lu "
                  "blk r%lu/d%lu/d16%lu",
-                 (unsigned long long)s_stream.raw_bytes,
-                 (unsigned long long)s_stream.sent,
+                 (unsigned long long)done_raw,
+                 (unsigned long long)done_sent,
                  (unsigned)uxTaskGetStackHighWaterMark(NULL),
-                 (unsigned long)s_stream.stall_ms,
-                 (unsigned long)s_stream.retry_ms,
-                 (unsigned long)(s_stream.v2 ? stc_encode_ms() : 0),
-                 (unsigned long)(s_stream.v2 ? stc_raw_blocks() : 0),
-                 (unsigned long)(s_stream.v2 ? stc_def_blocks() : 0),
-                 (unsigned long)(s_stream.v2 ? stc_d16_blocks() : 0));
-        s_stream.active = false;
+                 done_stall, done_retry,
+                 (unsigned long)(done_v2 ? stc_encode_ms() : 0),
+                 (unsigned long)(done_v2 ? stc_raw_blocks() : 0),
+                 (unsigned long)(done_v2 ? stc_def_blocks() : 0),
+                 (unsigned long)(done_v2 ? stc_d16_blocks() : 0));
         continue;
 
 finish_fail:
